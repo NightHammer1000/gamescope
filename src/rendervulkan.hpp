@@ -158,7 +158,7 @@ public:
 		VkImageType imageType;
 	};
 
-	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
+	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr, std::shared_ptr<gamescope::IBackendScanoutBuffer> pScanoutBuffer = nullptr );
 	bool BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format );
 
 	uint32_t IncRef();
@@ -248,6 +248,12 @@ private:
 	EStreamColorspace m_streamColorspace = k_EStreamColorspace_Unknown;
 
 	struct wlr_dmabuf_attributes m_dmabuf = {};
+
+	// Set when the underlying memory was allocated by the backend (GBM on
+	// the DRM backend) and imported into Vulkan, rather than allocated by
+	// Vulkan. Keeps the backend allocation alive for the texture's lifetime;
+	// aliasing textures (eg. the partial-overlay output images) share it.
+	std::shared_ptr<gamescope::IBackendScanoutBuffer> m_pScanoutBuffer;
 };
 
 struct vec2_t

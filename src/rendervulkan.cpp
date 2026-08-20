@@ -2023,9 +2023,12 @@ static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
 	}
 }
 
-bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+static std::vector<uint64_t> GetExternalScanoutModifiers( std::span<const uint32_t> drmFormats, const CVulkanTexture::createFlags &flags );
+
+bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb, std::shared_ptr<gamescope::IBackendScanoutBuffer> pScanoutBuffer )
 {
 	m_pBackendFb = std::move( pBackendFb );
+	m_pScanoutBuffer = std::move( pScanoutBuffer );
 	m_drmFormat = drmFormat;
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
 
@@ -2048,8 +2051,49 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	}
 
-	if ( flags.bFlippable == true )
+	// If the backend allocates scanout buffers itself (GBM on the DRM
+	// backend), route flippable allocations through it and import the
+	// result, so scanout memory gets the placement the display hardware
+	// needs (NVIDIA requires physically contiguous vidmem, which its
+	// Vulkan driver does not provide for exported images).
+	// Output images are handled in vulkan_make_output_images_external
+	// (they alias two formats in one buffer); skip them here so a failed
+	// external attempt there falls back to pure Vulkan allocation.
+	wlr_dmabuf_attributes externalScanoutAttrs = {};
+	if ( flags.bFlippable && pDMA == nullptr && m_pScanoutBuffer == nullptr &&
+	     !flags.bOutputImage && !flags.bMappable && pExistingImageToReuseMemory == nullptr &&
+	     flags.imageType == VK_IMAGE_TYPE_2D && depth == 1 &&
+	     GetBackend()->SupportsExternalScanoutBuffers() && g_device.supportsModifiers() )
 	{
+		const uint32_t uFormats[1] = { drmFormat };
+		std::vector<uint64_t> modifiers = GetExternalScanoutModifiers( uFormats, flags );
+		if ( flags.bLinear )
+		{
+			if ( gamescope::Algorithm::Contains( modifiers, uint64_t( DRM_FORMAT_MOD_LINEAR ) ) )
+				modifiers = { DRM_FORMAT_MOD_LINEAR };
+			else
+				modifiers.clear();
+		}
+
+		if ( !modifiers.empty() )
+			m_pScanoutBuffer = GetBackend()->CreateScanoutBuffer( width, height, drmFormat, modifiers, flags.bLinear );
+
+		if ( m_pScanoutBuffer )
+		{
+			externalScanoutAttrs = *m_pScanoutBuffer->GetDmabufAttributes();
+			pDMA = &externalScanoutAttrs;
+		}
+		else
+		{
+			vk_log.debugf( "External scanout buffer unavailable for format 0x%x, using Vulkan allocation", drmFormat );
+		}
+	}
+
+	if ( flags.bFlippable == true && pDMA == nullptr )
+	{
+		// Flippable images we allocate ourselves get exported to the backend.
+		// A flippable image created from an existing dmabuf (eg. a
+		// backend-allocated scanout buffer) is imported instead.
 		flags.bExportable = true;
 	}
 
@@ -2490,13 +2534,43 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		m_dmabuf = dmabuf;
 	}
-
-	if ( flags.bFlippable == true )
+	else if ( pDMA != nullptr && flags.bFlippable == true )
 	{
-		m_pBackendFb = GetBackend()->ImportDmabufToBackend( &m_dmabuf );
+		// Flippable image backed by an external (backend-allocated) dmabuf:
+		// keep our own copy of the attributes for pipewire/screenshots and
+		// for fbid creation. We own these fds; they are closed by
+		// wlr_dmabuf_attributes_finish in ~CVulkanTexture.
+		m_dmabuf = *pDMA;
+		m_dmabuf.n_planes = 0;
+		for ( int i = 0; i < pDMA->n_planes; i++ )
+		{
+			m_dmabuf.fd[i] = dup( pDMA->fd[i] );
+			if ( m_dmabuf.fd[i] < 0 )
+			{
+				vk_log.errorf_errno( "dup failed" );
+				return false;
+			}
+			m_dmabuf.n_planes = i + 1;
+		}
 	}
 
-	bool bHasAlpha = pDMA ? DRMFormatHasAlpha( pDMA->format ) : true;
+	if ( flags.bFlippable == true && m_pBackendFb == nullptr )
+	{
+		m_pBackendFb = GetBackend()->ImportDmabufToBackend( &m_dmabuf );
+		if ( pDMA != nullptr && m_pBackendFb == nullptr )
+		{
+			// For external scanout buffers the whole point is scanning out;
+			// fail so the caller can fall back to Vulkan allocation.
+			vk_log.errorf( "Failed to import external scanout buffer to backend" );
+			return false;
+		}
+	}
+
+	// Self-allocated scanout buffers (m_pScanoutBuffer) must behave exactly like
+	// the export path above: X-channel formats map to alpha-bearing VkFormats
+	// with identity swizzle, and storage usage stays allowed. Only genuinely
+	// client-imported buffers take the SWIZZLE_ONE/no-storage handling.
+	bool bHasAlpha = ( pDMA && !m_pScanoutBuffer ) ? DRMFormatHasAlpha( pDMA->format ) : true;
 
 	if (!bHasAlpha )
 	{
@@ -3284,6 +3358,145 @@ bool vulkan_remake_swapchain( void )
 	return bRet;
 }
 
+// Modifiers that (a) the backend can scan out for every format in drmFormats,
+// and (b) Vulkan can create + import a dmabuf image with, using the usage
+// implied by the given createFlags, for every format in drmFormats.
+// This is the "plane ∩ renderer" intersection other compositors (eg. KWin)
+// use when allocating scanout buffers through GBM, extended across all
+// formats that will alias the same buffer.
+static std::vector<uint64_t> GetExternalScanoutModifiers( std::span<const uint32_t> drmFormats, const CVulkanTexture::createFlags &flags )
+{
+	std::vector<uint64_t> modifiers;
+	if ( drmFormats.empty() )
+		return modifiers;
+
+	VkImageUsageFlags usage = 0;
+	if ( flags.bSampled )
+		usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+	if ( flags.bStorage )
+		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+	if ( flags.bColorAttachment )
+		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	if ( flags.bTransferSrc )
+		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	if ( flags.bTransferDst )
+		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+	for ( uint64_t modifier : GetBackend()->GetSupportedModifiers( drmFormats[0] ) )
+	{
+		if ( modifier == DRM_FORMAT_MOD_INVALID )
+			continue;
+
+		bool bCompatible = true;
+		for ( uint32_t drmFormat : drmFormats )
+		{
+			if ( !gamescope::Algorithm::Contains( GetBackend()->GetSupportedModifiers( drmFormat ), modifier ) )
+			{
+				bCompatible = false;
+				break;
+			}
+
+			VkImageCreateInfo imageInfo = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+				.imageType = flags.imageType,
+				.format = DRMFormatToVulkan( drmFormat, false ),
+				.mipLevels = 1,
+				.arrayLayers = 1,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+				.usage = usage,
+				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			};
+
+			std::array<VkFormat, 2> formats = {
+				DRMFormatToVulkan( drmFormat, false ),
+				DRMFormatToVulkan( drmFormat, true ),
+			};
+
+			VkImageFormatListCreateInfo formatList = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+				.viewFormatCount = (uint32_t)formats.size(),
+				.pViewFormats = formats.data(),
+			};
+
+			if ( formats[0] != formats[1] )
+			{
+				formatList.pNext = std::exchange( imageInfo.pNext, &formatList );
+				imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+			}
+
+			VkExternalImageFormatProperties externalImageProperties = {
+				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+			};
+
+			VkResult res = getModifierProps( &imageInfo, modifier, &externalImageProperties );
+			if ( res != VK_SUCCESS ||
+			     !( externalImageProperties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT ) )
+			{
+				bCompatible = false;
+				break;
+			}
+		}
+
+		if ( bCompatible )
+			modifiers.push_back( modifier );
+	}
+
+	return modifiers;
+}
+
+// Allocate the output images through the backend (GBM on DRM) and import
+// them into Vulkan, instead of allocating with Vulkan and exporting.
+// Fixes scanout on drivers that need special placement for scanout memory
+// (NVIDIA needs physical contiguity, which only its GBM path guarantees).
+static bool vulkan_make_output_images_external( VulkanOutput_t *pOutput, const CVulkanTexture::createFlags &outputImageflags )
+{
+	uint32_t uFormats[2] = { pOutput->uOutputFormat, DRM_FORMAT_INVALID };
+	size_t nFormats = 1;
+
+	const bool bOverlay = pOutput->uOutputFormatOverlay != VK_FORMAT_UNDEFINED && !kDisablePartialComposition;
+	if ( bOverlay )
+		uFormats[nFormats++] = pOutput->uOutputFormatOverlay;
+
+	std::vector<uint64_t> modifiers = GetExternalScanoutModifiers( std::span<const uint32_t>( uFormats, nFormats ), outputImageflags );
+	if ( modifiers.empty() )
+	{
+		vk_log.errorf( "No modifier is scanout-capable and Vulkan-importable for all output formats" );
+		return false;
+	}
+
+	for ( size_t i = 0; i < 3; i++ )
+	{
+		std::shared_ptr<gamescope::IBackendScanoutBuffer> pScanoutBuffer =
+			GetBackend()->CreateScanoutBuffer( g_nOutputWidth, g_nOutputHeight, pOutput->uOutputFormat, modifiers, false );
+		if ( !pScanoutBuffer )
+			return false;
+
+		// BInit never takes ownership of these attrs' fds; it dups what it keeps.
+		wlr_dmabuf_attributes attrs = *pScanoutBuffer->GetDmabufAttributes();
+
+		pOutput->outputImages[i] = new CVulkanTexture();
+		if ( !pOutput->outputImages[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, pOutput->uOutputFormat, outputImageflags, &attrs, 0, 0, nullptr, nullptr, pScanoutBuffer ) )
+			return false;
+
+		if ( bOverlay )
+		{
+			// Second import of the same buffer with the overlay format: same
+			// explicit modifier and plane layout, different (equal-bpp) view
+			// format. Replaces the VkDeviceMemory aliasing used on the
+			// Vulkan-allocated path; both textures keep the buffer alive.
+			attrs = *pScanoutBuffer->GetDmabufAttributes();
+			attrs.format = pOutput->uOutputFormatOverlay;
+
+			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
+			if ( !pOutput->outputImagesPartialOverlay[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, pOutput->uOutputFormatOverlay, outputImageflags, &attrs, 0, 0, nullptr, nullptr, pScanoutBuffer ) )
+				return false;
+		}
+	}
+
+	return true;
+}
+
 static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 {
 	CVulkanTexture::createFlags outputImageflags;
@@ -3302,6 +3515,22 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	pOutput->outputImagesPartialOverlay[0] = nullptr;
 	pOutput->outputImagesPartialOverlay[1] = nullptr;
 	pOutput->outputImagesPartialOverlay[2] = nullptr;
+
+	if ( GetBackend()->SupportsExternalScanoutBuffers() && g_device.supportsModifiers() )
+	{
+		if ( vulkan_make_output_images_external( pOutput, outputImageflags ) )
+		{
+			// Oh no.
+			pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
+			return true;
+		}
+
+		vk_log.errorf( "Failed to create backend (GBM) scanout buffers, falling back to Vulkan allocation" );
+		for ( auto &pImage : pOutput->outputImages )
+			pImage = nullptr;
+		for ( auto &pImage : pOutput->outputImagesPartialOverlay )
+			pImage = nullptr;
+	}
 
 	uint32_t uDRMFormat = pOutput->uOutputFormat;
 
