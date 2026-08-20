@@ -77,7 +77,13 @@ gamescope::ConVar<bool> cv_drm_debug_disable_color_range( "drm_debug_disable_col
 gamescope::ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_explicit_sync", false, "Force disable explicit sync on the DRM backend." );
 gamescope::ConVar<bool> cv_drm_debug_disable_in_fence_fd( "drm_debug_disable_in_fence_fd", false, "Force disable IN_FENCE_FD being set to avoid over-synchronization on the DRM backend." );
 
-gamescope::ConVar<bool> cv_drm_gbm_scanout( "drm_gbm_scanout", false, "Allocate scanout buffers with GBM and import them into Vulkan, instead of allocating with Vulkan and exporting. Fixes corrupted scanout on the NVIDIA proprietary driver, which requires physically contiguous scanout memory that only GBM allocations guarantee. Off by default; enable with env gamescope_drm_gbm_scanout=1 or via gamescopectl." );
+gamescope::ConVar<bool> cv_drm_gbm_scanout( "drm_gbm_scanout", false, "Allocate scanout buffers with GBM and import them into Vulkan, instead of allocating with Vulkan and exporting. Fixes corrupted scanout on the NVIDIA proprietary driver, which requires physically contiguous scanout memory that only GBM allocations guarantee. Off by default; enable with env gamescope_drm_gbm_scanout=1 or via gamescopectl.",
+	[]( gamescope::ConVar<bool> &cvar )
+	{
+		// Rebuild the output images with the new allocation strategy;
+		// they are otherwise only re-created on output/HDR changes.
+		g_bForceOutputImageRemake = true;
+	});
 
 gamescope::ConVar<bool> cv_drm_allow_dynamic_modes_for_external_display( "drm_allow_dynamic_modes_for_external_display", false, "Allow dynamic mode/refresh rate switching for external displays." );
 
@@ -117,9 +123,10 @@ struct drm_t {
 	bool allow_modifiers;
 	struct wlr_drm_format_set formats;
 
-	// GBM device on the KMS fd, for backend-allocated scanout buffers.
-	// Buffers keep the device alive via this shared_ptr; the deleter never
-	// touches drm->fd (gbm_device_destroy does not close the caller's fd).
+	// GBM device on a dup of the KMS fd, for backend-allocated scanout
+	// buffers. Buffers keep the device alive via this shared_ptr; the
+	// deleter destroys the device and closes its dup'd fd, so buffer
+	// teardown stays valid even after drm->fd itself is closed.
 	std::shared_ptr<struct gbm_device> gbm;
 	bool bIsNvidia = false;
 
@@ -1360,13 +1367,25 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 	}
 
 #if HAVE_GBM
-	if ( struct gbm_device *pGbmDevice = gbm_create_device( drm->fd ) )
+	// Create the GBM device on a dup of the KMS fd so buffer teardown
+	// (gbm_bo_destroy) stays valid even after wlsession_close_kms() has
+	// closed drm->fd; textures holding GBM buffers can outlive the backend
+	// on shutdown. The deleter closes the dup'd fd after the device.
+	if ( int nGbmFd = dup( drm->fd ); nGbmFd >= 0 )
 	{
-		drm->gbm = std::shared_ptr<struct gbm_device>( pGbmDevice, []( struct gbm_device *pDevice ){ gbm_device_destroy( pDevice ); } );
+		if ( struct gbm_device *pGbmDevice = gbm_create_device( nGbmFd ) )
+		{
+			drm->gbm = std::shared_ptr<struct gbm_device>( pGbmDevice, [ nGbmFd ]( struct gbm_device *pDevice ){ gbm_device_destroy( pDevice ); close( nGbmFd ); } );
+		}
+		else
+		{
+			close( nGbmFd );
+			drm_log.errorf( "Failed to create GBM device on the KMS fd. GBM scanout buffers will be unavailable." );
+		}
 	}
 	else
 	{
-		drm_log.errorf( "Failed to create GBM device on the KMS fd. GBM scanout buffers will be unavailable." );
+		drm_log.errorf_errno( "Failed to dup KMS fd for GBM. GBM scanout buffers will be unavailable." );
 	}
 
 	if ( drm->bIsNvidia && !cv_drm_gbm_scanout )
@@ -1664,9 +1683,10 @@ void finish_drm(struct drm_t *drm)
 	drm->crtcs.clear();
 	drm->connectors.clear();
 
-	// Drop our reference to the GBM device before the KMS fd is closed.
-	// Outstanding scanout buffers keep it alive via their own references;
-	// gbm_device_destroy never closes the fd it was created on.
+	// Drop our reference to the GBM device. Outstanding scanout buffers
+	// keep it alive via their own references; the device owns a dup of the
+	// KMS fd, so late gbm_bo_destroy calls stay valid after
+	// wlsession_close_kms() below.
 	drm->gbm = nullptr;
 
 

@@ -208,6 +208,11 @@ public:
 	uint32_t queueFamily = VK_QUEUE_FAMILY_IGNORED;
 
 private:
+	bool BInitInternal( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA, uint32_t contentWidth, uint32_t contentHeight, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb, std::shared_ptr<gamescope::IBackendScanoutBuffer> pScanoutBuffer, bool bAllowExternalScanout );
+	// Frees everything BInitInternal may have created, so a failed init can
+	// be retried. Also used by the destructor.
+	void ReleaseResources();
+
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
 	bool m_bOutputImage = false;
@@ -733,6 +738,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(GetImageMemoryRequirements) \
 	VK_FUNC(GetImageSubresourceLayout) \
 	VK_FUNC(GetMemoryFdKHR) \
+	VK_FUNC(GetMemoryFdPropertiesKHR) \
 	VK_FUNC(GetSemaphoreCounterValue) \
 	VK_FUNC(GetSwapchainImagesKHR) \
 	VK_FUNC(MapMemory) \

@@ -2027,6 +2027,25 @@ static std::vector<uint64_t> GetExternalScanoutModifiers( std::span<const uint32
 
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb, std::shared_ptr<gamescope::IBackendScanoutBuffer> pScanoutBuffer )
 {
+	// A retry only makes sense when the external scanout buffer was chosen
+	// internally, not handed in by the caller (who then owns the fallback).
+	const bool bCanRetryWithoutExternal = pDMA == nullptr && pScanoutBuffer == nullptr;
+
+	if ( BInitInternal( width, height, depth, drmFormat, flags, pDMA, contentWidth, contentHeight, pExistingImageToReuseMemory, std::move( pBackendFb ), std::move( pScanoutBuffer ), true ) )
+		return true;
+
+	if ( bCanRetryWithoutExternal && m_pScanoutBuffer != nullptr )
+	{
+		vk_log.errorf( "Failed to init texture from external scanout buffer, retrying with Vulkan allocation" );
+		ReleaseResources();
+		return BInitInternal( width, height, depth, drmFormat, flags, nullptr, contentWidth, contentHeight, pExistingImageToReuseMemory, nullptr, nullptr, false );
+	}
+
+	return false;
+}
+
+bool CVulkanTexture::BInitInternal( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA,  uint32_t contentWidth, uint32_t contentHeight, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb, std::shared_ptr<gamescope::IBackendScanoutBuffer> pScanoutBuffer, bool bAllowExternalScanout )
+{
 	m_pBackendFb = std::move( pBackendFb );
 	m_pScanoutBuffer = std::move( pScanoutBuffer );
 	m_drmFormat = drmFormat;
@@ -2060,7 +2079,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	// (they alias two formats in one buffer); skip them here so a failed
 	// external attempt there falls back to pure Vulkan allocation.
 	wlr_dmabuf_attributes externalScanoutAttrs = {};
-	if ( flags.bFlippable && pDMA == nullptr && m_pScanoutBuffer == nullptr &&
+	if ( bAllowExternalScanout &&
+	     flags.bFlippable && pDMA == nullptr && m_pScanoutBuffer == nullptr &&
+	     m_pBackendFb == nullptr &&
 	     !flags.bOutputImage && !flags.bMappable && pExistingImageToReuseMemory == nullptr &&
 	     flags.imageType == VK_IMAGE_TYPE_2D && depth == 1 &&
 	     GetBackend()->SupportsExternalScanoutBuffers() && g_device.supportsModifiers() )
@@ -2369,6 +2390,37 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				vk_log.errorf_errno( "dup failed" );
 				return false;
 			}
+
+			// A dmabuf import must pick a memory type from the mask
+			// vkGetMemoryFdPropertiesKHR reports for the FD, intersected
+			// with the image's memory requirements - not just any type
+			// satisfying the requirements.
+			VkMemoryFdPropertiesKHR fdProps = {
+				.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+			};
+			res = g_device.vk.GetMemoryFdPropertiesKHR( g_device.device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fdProps );
+			if ( res != VK_SUCCESS )
+			{
+				vk_errorf( res, "vkGetMemoryFdPropertiesKHR failed" );
+				close( fd );
+				return false;
+			}
+
+			const uint32_t uImportTypeBits = memRequirements.memoryTypeBits & fdProps.memoryTypeBits;
+			int32_t nImportMemoryTypeIndex = g_device.findMemoryType( properties, uImportTypeBits );
+			if ( nImportMemoryTypeIndex < 0 )
+			{
+				// Fall back to any permitted type; a valid import beats the
+				// preferred property flags.
+				nImportMemoryTypeIndex = g_device.findMemoryType( 0, uImportTypeBits );
+			}
+			if ( nImportMemoryTypeIndex < 0 )
+			{
+				vk_log.errorf( "No compatible memory type for dmabuf import" );
+				close( fd );
+				return false;
+			}
+			allocInfo.memoryTypeIndex = uint32_t( nImportMemoryTypeIndex );
 
 			// Memory already provided by pDMA
 			importMemoryInfo = {
@@ -2759,9 +2811,10 @@ CVulkanTexture::CVulkanTexture( void )
 {
 }
 
-CVulkanTexture::~CVulkanTexture( void )
+void CVulkanTexture::ReleaseResources()
 {
 	wlr_dmabuf_attributes_finish( &m_dmabuf );
+	m_dmabuf = {};
 
 	if ( m_pMappedData != nullptr && m_vkImageMemory )
 	{
@@ -2784,19 +2837,28 @@ CVulkanTexture::~CVulkanTexture( void )
 	if ( m_pBackendFb != nullptr )
 		m_pBackendFb = nullptr;
 
+	// The image is destroyed even when the memory isn't ours (aliased
+	// textures, or an init that failed before allocating memory).
+	if ( m_vkImage != VK_NULL_HANDLE )
+	{
+		g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
+		m_vkImage = VK_NULL_HANDLE;
+	}
+
 	if ( m_vkImageMemory != VK_NULL_HANDLE )
 	{
-		if ( m_vkImage != VK_NULL_HANDLE )
-		{
-			g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
-			m_vkImage = VK_NULL_HANDLE;
-		}
-
 		g_device.vk.FreeMemory( g_device.device(), m_vkImageMemory, nullptr );
 		m_vkImageMemory = VK_NULL_HANDLE;
 	}
 
+	m_pScanoutBuffer = nullptr;
+
 	m_bInitialized = false;
+}
+
+CVulkanTexture::~CVulkanTexture( void )
+{
+	ReleaseResources();
 }
 
 int CVulkanTexture::memoryFence()

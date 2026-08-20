@@ -160,6 +160,7 @@ static lut3d_t g_tmpLut3d;
 extern int g_nDynamicRefreshHz;
 
 bool g_bForceHDRSupportDebug = false;
+std::atomic<bool> g_bForceOutputImageRemake = { false };
 extern float g_flInternalDisplayBrightnessNits;
 extern float g_flHDRItmSdrNits;
 extern float g_flHDRItmTargetNits;
@@ -8742,8 +8743,12 @@ steamcompmgr_main(int argc, char **argv)
 			 currentOutputHeight != g_nOutputHeight ||
 			 currentOutputRefresh != g_nOutputRefresh ||
 			 currentHDROutput != g_bOutputHDREnabled ||
-			 currentHDRForce != g_bForceHDRSupportDebug )
+			 currentHDRForce != g_bForceHDRSupportDebug ||
+			 g_bForceOutputImageRemake.exchange( false ) )
 		{
+			// May still be set if an earlier condition short-circuited the exchange.
+			g_bForceOutputImageRemake = false;
+
 			if ( g_nXWaylandCount > 1 )
 			{
 				g_nNestedHeight = ( g_nNestedWidth * g_nOutputHeight ) / g_nOutputWidth;
