@@ -8739,16 +8739,20 @@ steamcompmgr_main(int argc, char **argv)
 		// Pick our width/height for this potential frame, regardless of how it might change later
 		// At some point we might even add proper locking so we get real updates atomically instead
 		// of whatever jumble of races the below might cause over a couple of frames
+		// Consume the remake request exactly once, before evaluating the other
+		// conditions: a concurrent request (eg. the drm_gbm_scanout convar
+		// callback on the Wayland thread) must never be cleared unseen, only
+		// exchanged out - a write racing past this point stays set for the
+		// next iteration.
+		const bool bForceOutputImageRemake = g_bForceOutputImageRemake.exchange( false );
+
 		if ( currentOutputWidth != g_nOutputWidth ||
 			 currentOutputHeight != g_nOutputHeight ||
 			 currentOutputRefresh != g_nOutputRefresh ||
 			 currentHDROutput != g_bOutputHDREnabled ||
 			 currentHDRForce != g_bForceHDRSupportDebug ||
-			 g_bForceOutputImageRemake.exchange( false ) )
+			 bForceOutputImageRemake )
 		{
-			// May still be set if an earlier condition short-circuited the exchange.
-			g_bForceOutputImageRemake = false;
-
 			if ( g_nXWaylandCount > 1 )
 			{
 				g_nNestedHeight = ( g_nNestedWidth * g_nOutputHeight ) / g_nOutputWidth;

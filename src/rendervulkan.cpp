@@ -2328,7 +2328,8 @@ bool CVulkanTexture::BInitInternal( uint32_t width, uint32_t height, uint32_t de
 		vk_errorf( res, "vkCreateImage failed" );
 		return false;
 	}
-	
+	m_bOwnsImage = true;
+
 	VkMemoryRequirements memRequirements;
 	g_device.vk.GetImageMemoryRequirements(g_device.device(), m_vkImage, &memRequirements);
 
@@ -2837,13 +2838,15 @@ void CVulkanTexture::ReleaseResources()
 	if ( m_pBackendFb != nullptr )
 		m_pBackendFb = nullptr;
 
-	// The image is destroyed even when the memory isn't ours (aliased
-	// textures, or an init that failed before allocating memory).
-	if ( m_vkImage != VK_NULL_HANDLE )
+	// Images we created are destroyed even when the memory isn't ours
+	// (aliased textures, or an init that failed before allocating memory).
+	// Swapchain-owned images are never destroyed here.
+	if ( m_vkImage != VK_NULL_HANDLE && m_bOwnsImage )
 	{
 		g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
-		m_vkImage = VK_NULL_HANDLE;
 	}
+	m_vkImage = VK_NULL_HANDLE;
+	m_bOwnsImage = false;
 
 	if ( m_vkImageMemory != VK_NULL_HANDLE )
 	{
