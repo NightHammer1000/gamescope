@@ -77,11 +77,16 @@ gamescope::ConVar<bool> cv_drm_debug_disable_color_range( "drm_debug_disable_col
 gamescope::ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_explicit_sync", false, "Force disable explicit sync on the DRM backend." );
 gamescope::ConVar<bool> cv_drm_debug_disable_in_fence_fd( "drm_debug_disable_in_fence_fd", false, "Force disable IN_FENCE_FD being set to avoid over-synchronization on the DRM backend." );
 
-gamescope::ConVar<bool> cv_drm_gbm_scanout( "drm_gbm_scanout", false, "Allocate scanout buffers with GBM and import them into Vulkan, instead of allocating with Vulkan and exporting. Fixes corrupted scanout on the NVIDIA proprietary driver, which requires physically contiguous scanout memory that only GBM allocations guarantee. Off by default; enable with env gamescope_drm_gbm_scanout=1 or via gamescopectl.",
+gamescope::ConVar<bool> cv_drm_gbm_scanout( "drm_gbm_scanout", false, "Allocate scanout buffers with GBM and import them into Vulkan. Fixes corrupted scanout on the NVIDIA proprietary driver.",
 	[]( gamescope::ConVar<bool> &cvar )
 	{
-		// Rebuild the output images with the new allocation strategy;
-		// they are otherwise only re-created on output/HDR changes.
+		// The callback also runs for writes of the unchanged value; only an
+		// actual toggle warrants rebuilding the output images.
+		static bool s_bLastValue = false;
+		if ( cvar == s_bLastValue )
+			return;
+		s_bLastValue = cvar;
+
 		g_bForceOutputImageRemake = true;
 	});
 
@@ -3945,24 +3950,28 @@ namespace gamescope
 				return nullptr;
 
 			uint32_t uFlags = GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT;
-			if ( bLinear )
-				uFlags |= GBM_BO_USE_LINEAR;
 
 			bool bForceLinearModifier = false;
 			struct gbm_bo *pBo = nullptr;
-			if ( !ulModifiers.empty() )
+			if ( bLinear )
 			{
-				pBo = gbm_bo_create_with_modifiers2( g_DRM.gbm.get(), uWidth, uHeight, uDrmFormat, ulModifiers.data(), ulModifiers.size(), uFlags );
-			}
-
-			// Some GBM implementations cannot allocate with an explicit modifier
-			// list. If the caller only wants linear anyway, fall back to a plain
-			// allocation with GBM_BO_USE_LINEAR and report LINEAR explicitly.
-			bool bLinearOnly = bLinear || ( ulModifiers.size() == 1 && ulModifiers[0] == DRM_FORMAT_MOD_LINEAR );
-			if ( !pBo && bLinearOnly )
-			{
+				// GBM rejects GBM_BO_USE_LINEAR combined with an explicit
+				// modifier list (EINVAL in Mesa), so allocate directly.
 				pBo = gbm_bo_create( g_DRM.gbm.get(), uWidth, uHeight, uDrmFormat, uFlags | GBM_BO_USE_LINEAR );
 				bForceLinearModifier = true;
+			}
+			else if ( !ulModifiers.empty() )
+			{
+				pBo = gbm_bo_create_with_modifiers2( g_DRM.gbm.get(), uWidth, uHeight, uDrmFormat, ulModifiers.data(), ulModifiers.size(), uFlags );
+
+				// Some GBM implementations cannot allocate with an explicit
+				// modifier list at all. If only LINEAR was requested, a plain
+				// allocation with GBM_BO_USE_LINEAR is equivalent.
+				if ( !pBo && ulModifiers.size() == 1 && ulModifiers[0] == DRM_FORMAT_MOD_LINEAR )
+				{
+					pBo = gbm_bo_create( g_DRM.gbm.get(), uWidth, uHeight, uDrmFormat, uFlags | GBM_BO_USE_LINEAR );
+					bForceLinearModifier = true;
+				}
 			}
 
 			if ( !pBo )
