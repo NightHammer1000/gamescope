@@ -2,3 +2,7 @@ glm-*
 glm
 packagecache
 stb
+.wraplock
+Catch2-*
+catch2.wrap
+libliftoff.wrap
