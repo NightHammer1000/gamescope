@@ -280,6 +280,10 @@ inline bool close_enough(float a, float b, float epsilon = 0.001f)
 }
 
 bool DRMFormatHasAlpha( uint32_t nDRMFormat );
+// The alpha-bearing sibling of an X-channel DRM format with an identical bit
+// layout (eg. XRGB8888 -> ARGB8888), or the format itself when it already has
+// alpha or no sibling exists.
+uint32_t DRMFormatToAlphaVariant( uint32_t nDRMFormat );
 
 enum AlphaBlendingMode_t
 {

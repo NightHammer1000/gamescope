@@ -893,6 +893,16 @@ namespace GamescopeWSILayer {
       }
       pSurfaceCapabilities->minImageCount = getMinImageCount();
 
+      // Gamescope composites the swapchain itself; the underlying driver
+      // never blends. Expose pre/post-multiplied composite alpha even when
+      // the driver does not (NVIDIA exposes only OPAQUE), so apps like
+      // steamwebhelper can request the alpha handling they actually want.
+      // The app's request reaches gamescope via swapchain_feedback.
+      pSurfaceCapabilities->supportedCompositeAlpha |=
+        VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR |
+        VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR |
+        VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+
       return VK_SUCCESS;
     }
 
@@ -935,6 +945,13 @@ namespace GamescopeWSILayer {
         pSurfaceCapabilities->surfaceCapabilities.currentExtent = rect->extent;
       }
       pSurfaceCapabilities->surfaceCapabilities.minImageCount = getMinImageCount();
+
+      // See GetPhysicalDeviceSurfaceCapabilitiesKHR: gamescope does the
+      // compositing, so composite alpha is ours to honor, not the driver's.
+      pSurfaceCapabilities->surfaceCapabilities.supportedCompositeAlpha |=
+        VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR |
+        VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR |
+        VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
 
       return VK_SUCCESS;
     }
@@ -1206,6 +1223,33 @@ namespace GamescopeWSILayer {
       swapchainInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
       // We always send MAILBOX to the driver.
       swapchainInfo.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+
+      // Gamescope, not the driver, honors compositeAlpha: the app's request
+      // is forwarded via swapchain_feedback below. Hand the driver a bit it
+      // actually supports, since we advertise pre/post-multiplied in the
+      // surface caps even on drivers that only expose OPAQUE (NVIDIA), and
+      // those drivers would reject the unsupported bit here.
+      {
+        VkSurfaceCapabilitiesKHR driverCaps{};
+        VkResult capsRes = pDispatch->pPhysicalDeviceDispatch->pInstanceDispatch->GetPhysicalDeviceSurfaceCapabilitiesKHR(
+          pDispatch->PhysicalDevice, swapchainInfo.surface, &driverCaps);
+        if (capsRes == VK_SUCCESS &&
+            driverCaps.supportedCompositeAlpha != 0 &&
+            !(driverCaps.supportedCompositeAlpha & swapchainInfo.compositeAlpha)) {
+          static constexpr std::array<VkCompositeAlphaFlagBitsKHR, 4> s_PreferredCompositeAlpha = {{
+            VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+            VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+            VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+          }};
+          for (VkCompositeAlphaFlagBitsKHR bit : s_PreferredCompositeAlpha) {
+            if (driverCaps.supportedCompositeAlpha & bit) {
+              swapchainInfo.compositeAlpha = bit;
+              break;
+            }
+          }
+        }
+      }
 
       uint32_t minImageCount = swapchainInfo.minImageCount;
       if (getEnsureMinImageCount())

@@ -276,6 +276,20 @@ bool DRMFormatHasAlpha( uint32_t nDRMFormat )
 	return false;
 }
 
+uint32_t DRMFormatToAlphaVariant( uint32_t nDRMFormat )
+{
+	switch ( nDRMFormat )
+	{
+		case DRM_FORMAT_XRGB8888: return DRM_FORMAT_ARGB8888;
+		case DRM_FORMAT_XBGR8888: return DRM_FORMAT_ABGR8888;
+		case DRM_FORMAT_XRGB2101010: return DRM_FORMAT_ARGB2101010;
+		case DRM_FORMAT_XBGR2101010: return DRM_FORMAT_ABGR2101010;
+		case DRM_FORMAT_XBGR16161616: return DRM_FORMAT_ABGR16161616;
+		case DRM_FORMAT_XBGR16161616F: return DRM_FORMAT_ABGR16161616F;
+		default: return nDRMFormat;
+	}
+}
+
 uint32_t DRMFormatGetBPP( uint32_t nDRMFormat )
 {
 	for ( int i = 0; s_DRMVKFormatTable[i].vkFormat != VK_FORMAT_UNDEFINED; i++ )

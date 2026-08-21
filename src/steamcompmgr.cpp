@@ -1141,6 +1141,10 @@ static bool		debugEvents = false;
 extern bool		steamMode;
 
 gamescope::ConVar<bool> cv_composite_force{ "composite_force", false, "Force composition always, never use scanout" };
+gamescope::ConVar<bool> cv_composite_alpha_promote{ "composite_alpha_promote", true,
+	"Treat client buffers arriving in an opaque (X-channel) DRM format as alpha-bearing when "
+	"their swapchain requested pre/post-multiplied composite alpha. Works around drivers whose "
+	"Vulkan WSI labels such buffers opaque (NVIDIA), which paints transparency opaque black." };
 static bool		useXRes = true;
 
 namespace gamescope
@@ -1420,13 +1424,37 @@ import_commit (
 	}
 
 	struct wlr_dmabuf_attributes dmabuf = {0};
-	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
+	gamescope::OwningRc<CVulkanTexture> pOwnedTexture;
 	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
 	{
-		pBackendFb = GetBackend()->ImportDmabufToBackend( &dmabuf );
-	}
+		// NVIDIA's Vulkan WSI hands us swapchain buffers labeled with an
+		// opaque X-channel format even when the app asked for pre-multiplied
+		// composite alpha (Mesa labels them ARGB in that case). The memory
+		// layout is identical and the alpha channel is valid, so honor the
+		// app's request: sample the real alpha instead of forcing it to 1.0,
+		// which painted every transparent pixel opaque black (Steam Big
+		// Picture notifications, Steam Input touch menus).
+		if ( cv_composite_alpha_promote && commit->feedback &&
+		     ( commit->feedback->vk_composite_alpha == VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR ||
+		       commit->feedback->vk_composite_alpha == VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR ) )
+		{
+			const uint32_t uAlphaFormat = DRMFormatToAlphaVariant( dmabuf.format );
+			if ( uAlphaFormat != dmabuf.format )
+			{
+				static bool s_bLoggedAlphaPromote = false;
+				if ( !std::exchange( s_bLoggedAlphaPromote, true ) )
+					xwm_log.infof( "Client buffers arrive in an opaque format despite their swapchain requesting composite alpha; sampling their alpha channel anyway (composite_alpha_promote)." );
+				dmabuf.format = uAlphaFormat;
+			}
+		}
 
-	gamescope::OwningRc<CVulkanTexture> pOwnedTexture = vulkan_create_texture_from_wlr_buffer( buf, std::move( pBackendFb ) );
+		gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = GetBackend()->ImportDmabufToBackend( &dmabuf );
+		pOwnedTexture = vulkan_create_texture_from_dmabuf( &dmabuf, std::move( pBackendFb ) );
+	}
+	else
+	{
+		pOwnedTexture = vulkan_create_texture_from_wlr_buffer( buf, nullptr );
+	}
 
 	if ( pOwnedTexture == nullptr ) {
 		// Failed to create Vulkan texture from Wayland buffer for some reason.
