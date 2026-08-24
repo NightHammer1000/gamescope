@@ -113,6 +113,7 @@ wlserver_wl_surface_info *get_wl_surface_info(struct wlr_surface *wlr_surf);
 static void wlserver_update_cursor_constraint();
 static void handle_pointer_constraint(struct wl_listener *listener, void *data);
 static void wlserver_constrain_cursor( struct wlr_pointer_constraint_v1 *pNewConstraint );
+static void apply_touchscreen_orientation(GamescopePanelOrientation orientation, double *x, double *y );
 struct wlr_surface *wlserver_surface_to_main_surface( struct wlr_surface *pSurface );
 bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press );
 
@@ -364,6 +365,25 @@ static void wlserver_handle_pointer_motion(struct wl_listener *listener, void *d
 	wlserver_mousemotion(event->unaccel_dx, event->unaccel_dy, event->time_msec);
 }
 
+static void wlserver_handle_pointer_motion_absolute(struct wl_listener *listener, void *data)
+{
+	struct wlr_pointer_motion_absolute_event *event = (struct wlr_pointer_motion_absolute_event *) data;
+
+	double x = event->x;
+	double y = event->y;
+	if ( gamescope::IBackendConnector *connector = GetBackend()->GetCurrentConnector() )
+		apply_touchscreen_orientation( connector->GetCurrentOrientation(), &x, &y );
+
+	x *= g_nOutputWidth;
+	y *= g_nOutputHeight;
+	x += focusedWindowOffsetX;
+	y += focusedWindowOffsetY;
+	x *= focusedWindowScaleX;
+	y *= focusedWindowScaleY;
+
+	wlserver_mousewarp( x, y, event->time_msec, false );
+}
+
 void wlserver_open_steam_menu( bool qam )
 {
 	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server( 0 );
@@ -538,6 +558,8 @@ static void wlserver_new_input(struct wl_listener *listener, void *data)
 
 			pointer->motion.notify = wlserver_handle_pointer_motion;
 			wl_signal_add( &pointer->wlr->events.motion, &pointer->motion );
+			pointer->motion_absolute.notify = wlserver_handle_pointer_motion_absolute;
+			wl_signal_add( &pointer->wlr->events.motion_absolute, &pointer->motion_absolute );
 			pointer->button.notify = wlserver_handle_pointer_button;
 			wl_signal_add( &pointer->wlr->events.button, &pointer->button );
 			pointer->axis.notify = wlserver_handle_pointer_axis;
@@ -1007,11 +1029,6 @@ static void gamescope_swapchain_set_hdr_metadata( struct wl_client *client, stru
 			wl_log.errorf("set_hdr_metadata with no swapchain_feedback.");
 			return;
 		}
-
-		// Check validity of this metadata,
-		// if it's garbage, just toss it...
-		if (!max_cll || !max_fall || (!white_point_x && !white_point_y))
-			return;
 
 		hdr_output_metadata metadata = {};
 		metadata.metadata_type = 0;

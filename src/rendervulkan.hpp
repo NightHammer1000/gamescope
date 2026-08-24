@@ -658,12 +658,16 @@ struct VulkanOutput_t
 
 enum ShaderType {
 	SHADER_TYPE_BLIT = 0,
+	SHADER_TYPE_BLIT_RGB10A2,
 	SHADER_TYPE_BLUR,
 	SHADER_TYPE_BLUR_COND,
 	SHADER_TYPE_BLUR_FIRST_PASS,
 	SHADER_TYPE_EASU,
+	SHADER_TYPE_EASU_RGBA16F,
 	SHADER_TYPE_RCAS,
 	SHADER_TYPE_RCAS_FP16,
+	SHADER_TYPE_RCAS_RGBA16F,
+	SHADER_TYPE_RCAS_RGB10A2,
 	SHADER_TYPE_NIS,
 	SHADER_TYPE_RGB_TO_NV12,
 
@@ -905,12 +909,8 @@ public:
 	bool isComplete(uint64_t sequence);
 	void waitIdle(bool reset = true);
 	void garbageCollect();
-	inline VkDescriptorSet descriptorSet()
-	{
-		VkDescriptorSet ret = m_descriptorSets[m_currentDescriptorSet];
-		m_currentDescriptorSet = (m_currentDescriptorSet + 1) % m_descriptorSets.size();
-		return ret;
-	}
+	VkDescriptorSet descriptorSet();
+	void recycleDescriptorSets( std::vector<VkDescriptorSet>& descriptorSets );
 
 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
@@ -933,6 +933,7 @@ public:
 	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
 	inline int drmRenderFd() {return m_drmRendererFd;}
 	inline bool supportsModifiers() {return m_bSupportsModifiers;}
+	inline bool supportsClientDmabufs() {return m_bSupportsClientDmabufs;}
 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
@@ -1008,6 +1009,7 @@ protected:
 	uint32_t m_uVendorID = 0;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
+	bool m_bSupportsClientDmabufs = true;
 	bool m_bInitialized = false;
 
 
@@ -1020,11 +1022,10 @@ protected:
 
 	static constexpr uint32_t k_uMaxConcurrentSubmits = 8;
 
-	// currently just one set, no need to double buffer because we
-	// vkQueueWaitIdle after each submit.
-	// should be moved to the output if we are going to support multiple outputs
+	// Descriptor sets are checked out by command buffers and returned only after
+	// the submission using them has completed.
 	std::array<VkDescriptorSet, k_uMaxConcurrentSubmits * 3> m_descriptorSets;
-	uint32_t m_currentDescriptorSet = 0;
+	std::vector<VkDescriptorSet> m_freeDescriptorSets;
 
 	VkBuffer m_uploadBuffer;
 	VkDeviceMemory m_uploadBufferMemory;
@@ -1129,6 +1130,7 @@ private:
 	std::vector<VulkanTimelinePoint_t> m_ExternalDependencies;
 	std::vector<std::shared_ptr<VulkanBinarySemaphore_t>> m_ExternalBinaryDependencies;
 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
+	std::vector<VkDescriptorSet> m_descriptorSets;
 
 	uint32_t m_renderBufferOffset = 0;
 };

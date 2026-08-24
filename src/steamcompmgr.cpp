@@ -1428,16 +1428,26 @@ import_commit (
 		commit->feedback = *swapchain_feedback;
 	commit->present_id = present_id;
 	commit->desired_present_time = desired_present_time;
-	if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
+	struct wlr_dmabuf_attributes dmabuf = {0};
+	const bool bDmabuf = wlr_buffer_get_dmabuf( buf, &dmabuf );
+
+	// DMA-BUF textures refer to the client's live backing storage, so they can
+	// be reused for every commit of the same wlr_buffer. Data-pointer buffers
+	// are copied into a Vulkan image below; clients can refill and recommit the
+	// same buffer after release, so reusing that snapshot would show stale
+	// contents as the client cycles through its buffer pool.
+	if ( bDmabuf )
 	{
-		// Going from OwningRc -> Rc now.
-		commit->vulkanTex = pTexture;
-		return commit;
+		if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
+		{
+			// Going from OwningRc -> Rc now.
+			commit->vulkanTex = pTexture;
+			return commit;
+		}
 	}
 
-	struct wlr_dmabuf_attributes dmabuf = {0};
 	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
-	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
+	if ( bDmabuf )
 	{
 		pBackendFb = GetBackend()->ImportDmabufToBackend( &dmabuf );
 	}
@@ -1451,7 +1461,8 @@ import_commit (
 
 	commit->vulkanTex = pOwnedTexture;
 
-	s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
+	if ( bDmabuf )
+		s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
 
 	return commit;
 }
@@ -7856,6 +7867,13 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
 		{
 			fence = dup( dmabuf.fd[0] );
+		}
+		else if ( !g_device.supportsClientDmabufs() )
+		{
+			// The data-pointer fallback waits for its upload before returning
+			// and is not exported on drivers where client DMA-BUF imports are
+			// disabled, so there is no external fence to wait for.
+			bKnownReady = true;
 		}
 		else
 		{

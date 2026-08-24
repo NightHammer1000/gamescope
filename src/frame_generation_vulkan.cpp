@@ -754,7 +754,10 @@ namespace
 			};
 
 			const auto common = Upload( constants );
-			if ( !Dispatch( cmdBuffer->rawBuffer(), clampedScale == 100 ? resources->prepare : resources->prepareScaled,
+			// FidelityFX's prepare-luma shader does not bounds-check its rounded-up
+			// 32x32 dispatch. Use the bounds-safe adapter at every scale, including
+			// 100%, so non-aligned extents cannot access beyond the source or luma.
+			if ( !Dispatch( cmdBuffer->rawBuffer(), resources->prepareScaled,
 				{
 					Sampled( source->srgbView() ), Storage( resources->luma[current][0] ), common,
 				}, ( resources->lumaExtent.width + 31 ) / 32, ( resources->lumaExtent.height + 31 ) / 32 ) )

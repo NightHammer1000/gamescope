@@ -43,12 +43,17 @@
 #include "Utils/Process.h"
 
 #include "cs_composite_blit.h"
+#include "cs_composite_blit_rgb10a2.h"
 #include "cs_composite_blur.h"
 #include "cs_composite_blur_cond.h"
 #include "cs_composite_rcas.h"
 #include "cs_composite_rcas_fp16.h"
+#include "cs_composite_rcas_rgba16f.h"
+#include "cs_composite_rcas_rgb10a2.h"
 #include "cs_easu.h"
 #include "cs_easu_fp16.h"
+#include "cs_easu_rgba16f.h"
+#include "cs_easu_fp16_rgba16f.h"
 #include "cs_gaussian_blur_horizontal.h"
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
@@ -424,10 +429,27 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 		return false;
 	}
 
-	VkPhysicalDeviceProperties props;
-	vk.GetPhysicalDeviceProperties( m_physDev, &props );
+	VkPhysicalDeviceDriverProperties driverProps = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+	};
+	VkPhysicalDeviceProperties2 props2 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		.pNext = &driverProps,
+	};
+	vk.GetPhysicalDeviceProperties2( m_physDev, &props2 );
+	const VkPhysicalDeviceProperties &props = props2.properties;
 	m_uVendorID = props.vendorID;
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
+
+	// Venus currently aborts when importing DMA-BUFs from the guest's virtio-gpu
+	// device. Don't advertise the zero-copy client path there, so Wayland and
+	// Xwayland clients use wl_shm and Gamescope's existing upload path instead.
+	// Keep DMA-BUFs enabled for native drivers, where this is a critical fast path.
+	if ( driverProps.driverID == VK_DRIVER_ID_MESA_VENUS )
+	{
+		m_bSupportsClientDmabufs = false;
+		vk_log.infof( "Venus driver detected, disabling client DMA-BUF imports" );
+	}
 
 	return true;
 }
@@ -975,20 +997,25 @@ bool CVulkanDevice::createShaders()
 	std::array<ShaderInfo_t, SHADER_TYPE_COUNT> shaderInfos;
 #define SHADER(type, array) shaderInfos[SHADER_TYPE_##type] = {array , sizeof(array)}
 	SHADER(BLIT, cs_composite_blit);
+	SHADER(BLIT_RGB10A2, cs_composite_blit_rgb10a2);
 	SHADER(BLUR, cs_composite_blur);
 	SHADER(BLUR_COND, cs_composite_blur_cond);
 	SHADER(BLUR_FIRST_PASS, cs_gaussian_blur_horizontal);
 	SHADER(RCAS, cs_composite_rcas);
+	SHADER(RCAS_RGBA16F, cs_composite_rcas_rgba16f);
+	SHADER(RCAS_RGB10A2, cs_composite_rcas_rgb10a2);
 	if (m_bSupportsFp16)
 	{
 		SHADER(RCAS_FP16, cs_composite_rcas_fp16);
 		SHADER(EASU, cs_easu_fp16);
+		SHADER(EASU_RGBA16F, cs_easu_fp16_rgba16f);
 		SHADER(NIS, cs_nis_fp16);
 	}
 	else
 	{
 		SHADER(RCAS_FP16, cs_composite_rcas);
 		SHADER(EASU, cs_easu);
+		SHADER(EASU_RGBA16F, cs_easu_rgba16f);
 		SHADER(NIS, cs_nis);
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
@@ -1030,6 +1057,7 @@ bool CVulkanDevice::createScratchResources()
 		vk_log.errorf( "vkAllocateDescriptorSets failed" );
 		return false;
 	}
+	m_freeDescriptorSets.assign( m_descriptorSets.begin(), m_descriptorSets.end() );
 
 	// Make and map upload buffer
 	
@@ -1227,12 +1255,16 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	std::array<PipelineInfo_t, SHADER_TYPE_COUNT> pipelineInfos;
 #define SHADER(type, layer_count, max_ycbcr, blur_layers) pipelineInfos[SHADER_TYPE_##type] = {SHADER_TYPE_##type, layer_count, max_ycbcr, blur_layers}
 	SHADER(BLIT, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(BLIT_RGB10A2, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(BLUR, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
 	SHADER(BLUR_COND, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
 	SHADER(BLUR_FIRST_PASS, 1, 2, 1);
 	SHADER(RCAS, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(RCAS_FP16, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(RCAS_RGBA16F, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(RCAS_RGB10A2, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(EASU, 1, 1, 1);
+	SHADER(EASU_RGBA16F, 1, 1, 1);
 	SHADER(NIS, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
 #undef SHADER
@@ -1406,6 +1438,32 @@ uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
 	uint64_t nextSeqNo = submitInternal(cmdBuffer.get());
 	m_pendingCmdBufs.emplace(nextSeqNo, std::move(cmdBuffer));
 	return nextSeqNo;
+}
+
+VkDescriptorSet CVulkanDevice::descriptorSet()
+{
+	// Updating a descriptor set that an earlier submission still uses is invalid.
+	// Reclaim completed command buffers first; only wait when all sets are busy.
+	if ( m_freeDescriptorSets.empty() )
+		garbageCollect();
+
+	if ( m_freeDescriptorSets.empty() && !m_pendingCmdBufs.empty() )
+	{
+		vk_log.warnf( "Descriptor set pool exhausted; waiting for the oldest Vulkan submission" );
+		wait( m_pendingCmdBufs.begin()->first );
+	}
+
+	assert( !m_freeDescriptorSets.empty() );
+	VkDescriptorSet descriptorSet = m_freeDescriptorSets.back();
+	m_freeDescriptorSets.pop_back();
+	return descriptorSet;
+}
+
+void CVulkanDevice::recycleDescriptorSets( std::vector<VkDescriptorSet>& descriptorSets )
+{
+	m_freeDescriptorSets.insert(
+		m_freeDescriptorSets.end(), descriptorSets.begin(), descriptorSets.end() );
+	descriptorSets.clear();
 }
 
 void CVulkanDevice::garbageCollect( void )
@@ -1666,12 +1724,14 @@ CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuf
 
 CVulkanCmdBuffer::~CVulkanCmdBuffer()
 {
+	m_device->recycleDescriptorSets( m_descriptorSets );
 	m_device->vk.FreeCommandBuffers(m_device->device(), m_device->commandPool(), 1, &m_cmdBuffer);
 }
 
 void CVulkanCmdBuffer::reset()
 {
 	vk_check( m_device->vk.ResetCommandBuffer(m_cmdBuffer, 0) );
+	m_device->recycleDescriptorSets( m_descriptorSets );
 	m_textureRefs.clear();
 	m_textureState.clear();
 
@@ -1777,6 +1837,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	insertBarrier();
 
 	VkDescriptorSet descriptorSet = m_device->descriptorSet();
+	m_descriptorSets.push_back( descriptorSet );
 
 	std::array<VkWriteDescriptorSet, 7> writeDescriptorSets;
 	std::array<VkDescriptorImageInfo, VKR_SAMPLER_SLOTS> imageDescriptors = {};
@@ -1975,6 +2036,13 @@ void CVulkanCmdBuffer::copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, u
 	m_textureRefs.emplace_back(std::move(dst));
 }
 
+static uint32_t external_queue_family( CVulkanDevice *device )
+{
+	return device->supportsModifiers()
+		? VK_QUEUE_FAMILY_FOREIGN_EXT
+		: VK_QUEUE_FAMILY_EXTERNAL_KHR;
+}
+
 void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 {
 	auto result = m_textureState.emplace(image, TextureState());
@@ -1983,7 +2051,8 @@ void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 		return;
 	// using the swapchain image as a source without writing to it doesn't make any sense
 	assert(image->outputImage() == false);
-	result.first->second.needsImport = image->externalImage();
+	result.first->second.needsImport =
+		image->queueFamily == external_queue_family( m_device );
 	result.first->second.needsExport = image->externalImage();
 }
 
@@ -1994,6 +2063,8 @@ void CVulkanCmdBuffer::prepareDestImage(CVulkanTexture *image)
 	if (!result.second)
 		return;
 	result.first->second.discarded = true;
+	result.first->second.needsImport =
+		image->queueFamily == external_queue_family( m_device );
 	result.first->second.needsExport = image->externalImage();
 	result.first->second.needsPresentLayout = image->outputImage();
 }
@@ -2018,7 +2089,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 {
 	std::vector<VkImageMemoryBarrier> barriers;
 
-	uint32_t externalQueue = m_device->supportsModifiers() ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL_KHR;
+	uint32_t externalQueue = external_queue_family( m_device );
 
 	VkImageSubresourceRange subResRange =
 	{
@@ -2059,6 +2130,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		};
 
 		barriers.push_back(memoryBarrier);
+		image->queueFamily = memoryBarrier.dstQueueFamilyIndex;
 
 		state.discarded = false;
 		state.dirty = false;
@@ -2205,6 +2277,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	}
 
 	m_bExternal = pDMA || flags.bExportable == true;
+	// Imported DMA-BUFs begin in the external producer's ownership. Locally
+	// allocated exportable images remain unowned until their first Vulkan use.
+	queueFamily = pDMA
+		? external_queue_family( &g_device )
+		: VK_QUEUE_FAMILY_IGNORED;
 
 	// Possible extensions for below
 	wsi_image_create_info wsiImageCreateInfo = {};
@@ -3719,11 +3796,12 @@ bool vulkan_make_output()
 	return true;
 }
 
-static void update_tmp_images( uint32_t width, uint32_t height )
+static void update_tmp_images( uint32_t width, uint32_t height, uint32_t drmFormat = DRM_FORMAT_ARGB8888 )
 {
 	if ( g_output.tmpOutput != nullptr
 			&& width == g_output.tmpOutput->width()
-			&& height == g_output.tmpOutput->height() )
+			&& height == g_output.tmpOutput->height()
+			&& drmFormat == g_output.tmpOutput->drmFormat() )
 	{
 		return;
 	}
@@ -3733,7 +3811,7 @@ static void update_tmp_images( uint32_t width, uint32_t height )
 	createFlags.bStorage = true;
 
 	g_output.tmpOutput = new CVulkanTexture();
-	bool bSuccess = g_output.tmpOutput->BInit( width, height, 1u, DRM_FORMAT_ARGB8888, createFlags, nullptr );
+	bool bSuccess = g_output.tmpOutput->BInit( width, height, 1u, drmFormat, createFlags, nullptr );
 
 	if ( !bSuccess )
 	{
@@ -4282,6 +4360,24 @@ static bool is_8bit_sdr_target( const CVulkanTexture *texture )
 // A plain 1:1 SDR FSR frame needs none of the compositing tail after RCAS.
 // When everything below holds, the shader can write the sharpened pixels
 // straight out and skip blending, colour management and debug handling.
+static bool is_fp16_fsr_target( const CVulkanTexture *texture )
+{
+	return texture->format() == VK_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+static bool is_rgb10a2_target( const CVulkanTexture *texture )
+{
+	// GLSL's rgb10_a2 storage format maps to Vulkan's A2B10G10R10 view.
+	return texture->format() == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+}
+
+static ShaderType blit_shader_for_target( const CVulkanTexture *texture )
+{
+	return is_rgb10a2_target( texture )
+		? SHADER_TYPE_BLIT_RGB10A2
+		: SHADER_TYPE_BLIT;
+}
+
 static bool can_use_simple_fsr_output( const FrameInfo_t *frameInfo, CVulkanTexture *output, EOTF outputTF )
 {
 	if ( frameInfo->layers.count() != 1 ||
@@ -4373,12 +4469,20 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		uint32_t tempY = frameInfo->layers.get( 0 ).integerHeight();
 
 		if ( !pFsrIntermediateOverride )
-			update_tmp_images(tempX, tempY);
+		{
+			const uint32_t fsrIntermediateFormat = ColorspaceIsHDR( frameInfo->layers.get( 0 ).colorspace )
+				? DRM_FORMAT_ABGR16161616F
+				: DRM_FORMAT_ARGB8888;
+			update_tmp_images( tempX, tempY, fsrIntermediateFormat );
+		}
 		gamescope::Rc<CVulkanTexture> fsrIntermediate = pFsrIntermediateOverride;
 		if ( !fsrIntermediate )
 			fsrIntermediate = g_output.tmpOutput;
 
-		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_EASU));
+		const ShaderType easuShader = is_fp16_fsr_target( fsrIntermediate.get() )
+			? SHADER_TYPE_EASU_RGBA16F
+			: SHADER_TYPE_EASU;
+		cmdBuffer->bindPipeline(g_device.pipeline(easuShader));
 		cmdBuffer->bindTarget(fsrIntermediate);
 		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
 		cmdBuffer->setTextureSrgb(0, true);
@@ -4391,9 +4495,13 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->dispatch(div_roundup(tempX, pixelsPerGroup), div_roundup(tempY, pixelsPerGroup));
 
 		const bool simpleFsrOutput = can_use_simple_fsr_output( frameInfo, compositeImage.get(), outputTF );
-		const ShaderType rcasShader = can_use_fp16_fsr_rcas( frameInfo, compositeImage.get(), outputTF )
-			? SHADER_TYPE_RCAS_FP16
-			: SHADER_TYPE_RCAS;
+		const ShaderType rcasShader = is_fp16_fsr_target( compositeImage.get() )
+			? SHADER_TYPE_RCAS_RGBA16F
+			: is_rgb10a2_target( compositeImage.get() )
+				? SHADER_TYPE_RCAS_RGB10A2
+				: can_use_fp16_fsr_rcas( frameInfo, compositeImage.get(), outputTF )
+					? SHADER_TYPE_RCAS_FP16
+					: SHADER_TYPE_RCAS;
 		cmdBuffer->bindPipeline(g_device.pipeline(rcasShader, frameInfo->layers.count(), frameInfo->ycbcrMask() & ~1, 0u, frameInfo->colorspaceMask(), outputTF, false, simpleFsrOutput ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 		cmdBuffer->bindTexture(0, fsrIntermediate);
@@ -4441,7 +4549,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		nisFrameInfo.layers.get( 0 ).scale.x = 1.0f;
 		nisFrameInfo.layers.get( 0 ).scale.y = 1.0f;
 
-		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, nisFrameInfo.layers.count(), nisFrameInfo.ycbcrMask(), 0u, nisFrameInfo.colorspaceMask(), outputTF ));
+		cmdBuffer->bindPipeline( g_device.pipeline(blit_shader_for_target( compositeImage.get() ), nisFrameInfo.layers.count(), nisFrameInfo.ycbcrMask(), 0u, nisFrameInfo.colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), &nisFrameInfo);
 		cmdBuffer->bindTarget(compositeImage);
 		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo, uOutputRotation);
@@ -4491,7 +4599,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 	else
 	{
-		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
+		cmdBuffer->bindPipeline( g_device.pipeline(blit_shader_for_target( compositeImage.get() ), frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 		cmdBuffer->bindTarget(compositeImage);
 		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uOutputRotation);
@@ -4845,6 +4953,7 @@ namespace
 			FrameGenerationQueuedFrame real = {
 				realLayer, false, frameInfo->useFSRLayer0, nullptr,
 				m_currentRealOutputId };
+			const bool hdrOutput = ColorspaceIsHDR( realLayer.colorspace );
 
 			std::optional<uint64_t> sequence;
 			if ( abDuplicate )
@@ -4857,7 +4966,9 @@ namespace
 			{
 				const uint32_t outputWidth = fsrEnabled ? uint32_t( g_nOutputWidth ) : rawSource->width();
 				const uint32_t outputHeight = fsrEnabled ? uint32_t( g_nOutputHeight ) : rawSource->height();
-				const uint32_t outputFormat = fsrEnabled
+				const uint32_t outputFormat = hdrOutput
+					? DRM_FORMAT_XBGR2101010
+					: fsrEnabled
 					? ( realLayer.tex->drmFormat() != DRM_FORMAT_INVALID
 						? realLayer.tex->drmFormat() : g_output.uOutputFormat )
 					: rawSource->drmFormat();
@@ -4898,15 +5009,15 @@ namespace
 				}
 				else
 				{
-					// FI's SDR midpoint is raw encoded color in FP16. Treat it as
-					// passthrough data for this format conversion, then retain the
-					// game's colorspace metadata on the scanout layer.
-					if ( !ColorspaceIsHDR( realLayer.colorspace ) )
+					// Preserve SDR midpoint values verbatim. HDR midpoints are linear
+					// scRGB, so encode them into the display EOTF while writing the
+					// native 10-bit scanout.
+					if ( !hdrOutput )
 						generatedFrame.layers.get( 0 ).colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
-					else if ( realLayer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ )
+					else
 					{
 						generatedFrame.applyOutputColorMgmt = true;
-						generatedFrame.outputEncodingEOTF = EOTF_PQ;
+						generatedFrame.outputEncodingEOTF = frameInfo->outputEncodingEOTF;
 					}
 					generatedFrame.layers.get( 0 ).scale = { 1.0f, 1.0f };
 					generatedFrame.layers.get( 0 ).offset = { 0.0f, 0.0f };
@@ -4943,7 +5054,7 @@ namespace
 				}
 
 				generated.layer.tex = scanout;
-				if ( fsrEnabled && generatedFrame.outputEncodingEOTF == EOTF_Gamma22 )
+				if ( generatedFrame.applyOutputColorMgmt && generatedFrame.outputEncodingEOTF == EOTF_Gamma22 )
 					generated.layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
 				else if ( ColorspaceIsHDR( realLayer.colorspace ) )
 					generated.layer.colorspace = generatedFrame.outputEncodingEOTF == EOTF_PQ
@@ -4954,13 +5065,26 @@ namespace
 					generated.layer.scale = { 1.0f, 1.0f };
 					generated.layer.offset = { 0.0f, 0.0f };
 					generated.layer.blackBorder = false;
+					generated.layer.filter = GamescopeUpscaleFilter::NEAREST;
+				}
+				if ( generatedFrame.applyOutputColorMgmt )
+				{
+					// This scanout already contains the compositor's display-encoded
+					// result. Keep its output colorspace and HDR metadata, but do not
+					// apply the source plane's color pipeline a second time in KMS.
+					generated.layer.applyColorMgmt = false;
+					generated.layer.ctm = nullptr;
 				}
 
-				// With preemptive upscaling disabled for frame generation, prepare
-				// the real frame's single FSR result after the midpoint result. This
-				// leaves presentation as two cheap scanouts and gives the midpoint
-				// first use of the GPU before its earlier deadline.
-				if ( fsrEnabled && realLayer.tex.get() == rawSource.get() )
+				// Keep both halves of an HDR pair in the same display-encoded scanout
+				// format. Alternating the generated scanout with the raw HDR layer
+				// otherwise makes KMS reprogram the plane color pipeline every output
+				// slot, which is slow enough to destroy VRR frame pacing. FSR already
+				// requires this precomposition; HDR requires it even without FSR.
+				// Submit the real result after the midpoint so the earlier deadline
+				// retains first use of the GPU.
+				if ( gamescope::FrameGenerationShouldPrecomposeRealFrame(
+						fsrEnabled, hdrOutput, realLayer.tex.get() == rawSource.get() ) )
 				{
 					gamescope::Rc<CVulkanTexture> realScanout = AcquireScanout(
 						outputWidth, outputHeight, outputFormat, scanout.get() );
@@ -4974,15 +5098,27 @@ namespace
 					*realFrame.layers.push() = realLayer;
 					realFrame.layers.get( 0 ).acquirePoint = nullptr;
 					realFrame.layers.get( 0 ).opacity = 1.0f;
-					realFrame.useFSRLayer0 = true;
+					realFrame.useFSRLayer0 = fsrEnabled;
 					realFrame.applyOutputColorMgmt = frameInfo->applyOutputColorMgmt;
 					realFrame.outputEncodingEOTF = frameInfo->outputEncodingEOTF;
-					if ( realFrame.layers.get( 0 ).integerWidth() == uint32_t( g_nOutputWidth ) &&
-						realFrame.layers.get( 0 ).integerHeight() == uint32_t( g_nOutputHeight ) &&
-						close_enough( realFrame.layers.get( 0 ).offset.x, 0.0f ) &&
-						close_enough( realFrame.layers.get( 0 ).offset.y, 0.0f ) )
+					if ( fsrEnabled )
 					{
+						if ( realFrame.layers.get( 0 ).integerWidth() == uint32_t( g_nOutputWidth ) &&
+							realFrame.layers.get( 0 ).integerHeight() == uint32_t( g_nOutputHeight ) &&
+							close_enough( realFrame.layers.get( 0 ).offset.x, 0.0f ) &&
+							close_enough( realFrame.layers.get( 0 ).offset.y, 0.0f ) )
+						{
+							realFrame.layers.get( 0 ).blackBorder = false;
+						}
+					}
+					else
+					{
+						// The target has the raw source extent. Composite the real frame
+						// one-to-one, then retain its original presentation scale below.
+						realFrame.layers.get( 0 ).scale = { 1.0f, 1.0f };
+						realFrame.layers.get( 0 ).offset = { 0.0f, 0.0f };
 						realFrame.layers.get( 0 ).blackBorder = false;
+						realFrame.layers.get( 0 ).ctm = nullptr;
 					}
 
 					auto realCmdBuffer = g_device.commandBuffer();
@@ -5002,9 +5138,13 @@ namespace
 					}
 
 					real.layer.tex = realScanout;
-					real.layer.scale = { 1.0f, 1.0f };
-					real.layer.offset = { 0.0f, 0.0f };
-					real.layer.blackBorder = false;
+					if ( fsrEnabled )
+					{
+						real.layer.scale = { 1.0f, 1.0f };
+						real.layer.offset = { 0.0f, 0.0f };
+						real.layer.blackBorder = false;
+						real.layer.filter = GamescopeUpscaleFilter::NEAREST;
+					}
 					real.useFSR = false;
 					if ( realFrame.outputEncodingEOTF == EOTF_Gamma22 )
 						real.layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
@@ -5012,6 +5152,11 @@ namespace
 						real.layer.colorspace = realFrame.outputEncodingEOTF == EOTF_PQ
 							? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ
 							: GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB;
+					if ( realFrame.applyOutputColorMgmt )
+					{
+						real.layer.applyColorMgmt = false;
+						real.layer.ctm = nullptr;
+					}
 				}
 			}
 
@@ -5354,6 +5499,9 @@ static const struct wlr_drm_format_set *renderer_get_texture_formats( struct wlr
 {
 	if (buffer_caps & WLR_BUFFER_CAP_DMABUF)
 	{
+		if ( !g_device.supportsClientDmabufs() )
+			return nullptr;
+
 		return &sampledDRMFormats;
 	}
 	else if (buffer_caps & WLR_BUFFER_CAP_DATA_PTR)
@@ -5484,7 +5632,11 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 	CVulkanTexture::createFlags texCreateFlags;
 	texCreateFlags.bSampled = true;
 	texCreateFlags.bTransferDst = true;
-	texCreateFlags.bFlippable = true;
+	// When client DMA-BUFs are unavailable (currently Venus), this texture is
+	// an upload-only fallback. Exporting every upload for direct scanout is both
+	// unnecessary and rejected by virtio KMS; composition uses the internal
+	// Vulkan image directly. Native drivers retain the flippable fast path.
+	texCreateFlags.bFlippable = g_device.supportsClientDmabufs();
 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
 		return nullptr;
 

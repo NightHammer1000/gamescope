@@ -44,6 +44,12 @@ namespace gamescope
 			( queuedFrames == 1u && !frontFrameGenerated );
 	}
 
+	constexpr bool FrameGenerationShouldPrecomposeRealFrame(
+		bool fsrEnabled, bool hdrOutput, bool usesRawSource )
+	{
+		return usesRawSource && ( fsrEnabled || hdrOutput );
+	}
+
 	constexpr bool FrameGenerationOutputDeadlineMissed(
 		uint64_t now, uint64_t deadline, uint64_t interval )
 	{

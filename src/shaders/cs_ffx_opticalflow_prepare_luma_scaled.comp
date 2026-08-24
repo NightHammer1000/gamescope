@@ -70,9 +70,20 @@ void main()
         const ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy) * 2 + ivec2(x, y);
         if (any(greaterThanEqual(outputPosition, constants.targetSize)))
             continue;
-        const vec2 sourcePosition = (vec2(outputPosition) + 0.5) *
-            vec2(constants.sourceSize) / vec2(constants.targetSize);
+
+        vec3 sourceColor;
+        if (all(equal(constants.sourceSize, constants.targetSize)))
+        {
+            // Keep the full-resolution path to one source fetch per pixel.
+            sourceColor = texelFetch(inputColor, outputPosition, 0).rgb;
+        }
+        else
+        {
+            const vec2 sourcePosition = (vec2(outputPosition) + 0.5) *
+                vec2(constants.sourceSize) / vec2(constants.targetSize);
+            sourceColor = sampleBilinear(sourcePosition);
+        }
         imageStore(outputLuma, outputPosition,
-            uvec4(uint(clamp(luminance(sampleBilinear(sourcePosition)), 0.0, 1.0) * 255.0), 0, 0, 0));
+            uvec4(uint(clamp(luminance(sourceColor), 0.0, 1.0) * 255.0), 0, 0, 0));
     }
 }

@@ -1,7 +1,9 @@
 #version 460
 
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
 
-#define FSR_EASU_USE_FP16 0
+#define VKR_TARGET_FORMAT rgba16f
+#define FSR_EASU_USE_FP16 1
 #include "cs_easu_common.h"

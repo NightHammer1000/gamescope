@@ -79,6 +79,11 @@ int main()
 	assert( !FrameGenerationCanAcceptSourceFrame( 1, true ) );
 	assert( !FrameGenerationCanAcceptSourceFrame( 2, true ) );
 
+	assert( FrameGenerationShouldPrecomposeRealFrame( true, false, true ) );
+	assert( FrameGenerationShouldPrecomposeRealFrame( false, true, true ) );
+	assert( !FrameGenerationShouldPrecomposeRealFrame( false, false, true ) );
+	assert( !FrameGenerationShouldPrecomposeRealFrame( true, true, false ) );
+
 	constexpr uint64_t outputInterval = 8'333'333;
 	const uint64_t firstDeadline = FrameGenerationNextOutputDeadline(
 		0, 100'000'000, outputInterval );

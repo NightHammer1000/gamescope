@@ -413,6 +413,7 @@ namespace gamescope
 			std::optional<CDRMAtomicProperty> vrr_capable;
 			std::optional<CDRMAtomicProperty> EDID;
 			std::optional<CDRMAtomicProperty> Broadcast_RGB;
+			std::optional<CDRMAtomicProperty> max_bpc;
 			std::optional<CDRMAtomicProperty> DUMMY_END;
 		};
 		      ConnectorProperties &GetProperties()       { return m_Props; }
@@ -1559,6 +1560,9 @@ void finish_drm(struct drm_t *drm)
 
 		if ( pConnector->GetProperties().content_type )
 			pConnector->GetProperties().content_type->SetPendingValue( req, 0, true );
+
+		if ( pConnector->GetProperties().max_bpc )
+			pConnector->GetProperties().max_bpc->SetPendingValue( req, pConnector->GetProperties().max_bpc->GetInitialValue(), true );
 	}
 
 	for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
@@ -2240,6 +2244,15 @@ namespace gamescope
 			if (bGoodRefreshA != bGoodRefreshB)
 				return bGoodRefreshA;
 
+			// Some tvs may report 60hz as their preferred output even
+			// if they support 120hz. Prefer 120hz modes if available.
+			// Still honor preferred mode, above 120hz things might get
+			// funny, such as 360hz. Leave those for manual override.
+			bGoodRefreshA = a.vrefresh >= 120;
+			bGoodRefreshB = b.vrefresh >= 120;
+			if (bGoodRefreshA != bGoodRefreshB)
+				return bGoodRefreshA;
+
 			bool bPreferredA = a.type & DRM_MODE_TYPE_PREFERRED;
 			bool bPreferredB = b.type & DRM_MODE_TYPE_PREFERRED;
 			if (bPreferredA != bPreferredB)
@@ -2291,6 +2304,7 @@ namespace gamescope
 			m_Props.vrr_capable              = CDRMAtomicProperty::Instantiate( "vrr_capable",            this, *rawProperties );
 			m_Props.EDID                     = CDRMAtomicProperty::Instantiate( "EDID",                   this, *rawProperties );
 			m_Props.Broadcast_RGB            = CDRMAtomicProperty::Instantiate( "Broadcast RGB",          this, *rawProperties );
+			m_Props.max_bpc                  = CDRMAtomicProperty::Instantiate( "max bpc",                this, *rawProperties );
 		}
 
 		ParseEDID();
@@ -2635,25 +2649,10 @@ namespace gamescope
 			hdr_output_metadata defaultHDRMetadata{};
 			hdr_metadata_infoframe *pInfoframe = &defaultHDRMetadata.hdmi_metadata_type1;
 
-			// To be filled in by the app based on the scene, default to desired_content_max_luminance
-			//
-			// Using display's max_fall for the default metadata max_cll to avoid displays
-			// overcompensating with tonemapping for SDR content.
-			uint16_t uDefaultInfoframeLuminances = m_Mutable.HDR.uMaxFrameAverageLuminance;
-
-			pInfoframe->display_primaries[0].x = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.r.x );
-			pInfoframe->display_primaries[0].y = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.r.y );
-			pInfoframe->display_primaries[1].x = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.g.x );
-			pInfoframe->display_primaries[1].y = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.g.y );
-			pInfoframe->display_primaries[2].x = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.b.x );
-			pInfoframe->display_primaries[2].y = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.b.y );
-			pInfoframe->white_point.x = color_xy_to_u16( m_Mutable.DisplayColorimetry.white.x );
-			pInfoframe->white_point.y = color_xy_to_u16( m_Mutable.DisplayColorimetry.white.y );
-			pInfoframe->max_display_mastering_luminance = uDefaultInfoframeLuminances;
-			pInfoframe->min_display_mastering_luminance = m_Mutable.HDR.uMinContentLightLevel;
-			pInfoframe->max_cll = uDefaultInfoframeLuminances;
-			pInfoframe->max_fall = uDefaultInfoframeLuminances;
+			// The mastering display and content light levels describe the source, not
+			// this connector. Leave them zero (unknown) until the app supplies them.
 			pInfoframe->eotf = HDMI_EOTF_ST2084;
+			pInfoframe->metadata_type = 0;
 
 			m_Mutable.HDR.pDefaultMetadataBlob = GetBackend()->CreateBackendBlob( defaultHDRMetadata );
 		}
@@ -3120,6 +3119,8 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	drm_colorspace uColorimetry = DRM_MODE_COLORIMETRY_DEFAULT;
 
 	const bool bWantsHDR10 = g_bOutputHDREnabled && frameInfo->outputEncodingEOTF == EOTF_PQ;
+	// Request only the color depth needed by the active output encoding.
+	const uint64_t uMaxBpc = bWantsHDR10 ? 10u : 8u;
 	gamescope::BackendBlob *pHDRMetadata = nullptr;
 	if ( drm->pConnector && drm->pConnector->SupportsHDR10() )
 	{
@@ -3141,6 +3142,10 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 		if ( uColorimetry != drm->pConnector->GetProperties().Colorspace->GetCurrentValue() )
 			drm->needs_modeset = true;
 	}
+
+	if ( drm->pConnector && drm->pConnector->GetProperties().max_bpc &&
+		 uMaxBpc != drm->pConnector->GetProperties().max_bpc->GetCurrentValue() )
+		drm->needs_modeset = true;
 
 	drm->m_FbIdsInRequest.clear();
 	drm_close_in_fences( drm );
@@ -3315,6 +3320,9 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 		if ( drm->pConnector->GetProperties().content_type )
 			drm->pConnector->GetProperties().content_type->SetPendingValue( drm->req, DRM_MODE_CONTENT_TYPE_GAME, bForceInRequest );
+
+		if ( drm->pConnector->GetProperties().max_bpc )
+			drm->pConnector->GetProperties().max_bpc->SetPendingValue( drm->req, uMaxBpc, bForceInRequest );
 
 		GamescopeBroadcastRGBMode_t eBroadcastRGB = drm->pConnector->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL
 			? s_ExternalBroadcastRGBMode
