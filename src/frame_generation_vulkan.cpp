@@ -11,6 +11,7 @@
 
 #include "frame_generation_config.hpp"
 #include "cs_ffx_opticalflow_prepare_luma_scaled.h"
+#include "cs_ffx_opticalflow_compute_optical_flow_dot.h"
 #include "cs_ffx_frameinterpolation_gui_mask.h"
 #include "cs_ffx_frameinterpolation_midpoint.h"
 #include "cs_ffx_frameinterpolation_vector_field.h"
@@ -37,6 +38,9 @@ gamescope::ConVar<bool> cv_frame_generation_gui_correction(
 gamescope::ConVar<bool> cv_frame_generation_debug_gui(
 	"frame_generation_debug_gui", false,
 	"Visualize the screen-space GUI correction mask." );
+gamescope::ConVar<bool> cv_frame_generation_dot_product_of(
+	"frame_generation_dot_product_of", true,
+	"Use accelerated integer dot products for FidelityFX optical-flow SAD when supported." );
 
 namespace
 {
@@ -409,9 +413,9 @@ namespace
 			return g_device.vk.ResetDescriptorPool( g_device.device(), descriptorPool, 0 ) == VK_SUCCESS;
 		}
 
-		std::array<Pass *, 13> AllPasses()
+		std::array<Pass *, 14> AllPasses()
 		{
-			return { &prepare, &prepareScaled, &pyramid, &histogram, &divergence, &search, &filter, &scale,
+			return { &prepare, &prepareScaled, &pyramid, &histogram, &divergence, &search, &searchDot, &filter, &scale,
 				&vectorField, &guiMaskPass, &midpointPass, &inpaintingPyramidPass, &inpaintingPass };
 		}
 
@@ -422,6 +426,7 @@ namespace
 		Pass histogram;
 		Pass divergence;
 		Pass search;
+		Pass searchDot;
 		Pass filter;
 		Pass scale;
 		Pass vectorField;
@@ -573,7 +578,7 @@ namespace
 			const auto Binding = []( uint32_t binding, D type ) {
 				return VkDescriptorSetLayoutBinding{ binding, type, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 			};
-			return CreatePass( prepare, ffx_opticalflow_prepare_luma_pass, sizeof( ffx_opticalflow_prepare_luma_pass ),
+			const bool created = CreatePass( prepare, ffx_opticalflow_prepare_luma_pass, sizeof( ffx_opticalflow_prepare_luma_pass ),
 				{ D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER } ) &&
 				CreatePass( prepareScaled, cs_ffx_opticalflow_prepare_luma_scaled, sizeof( cs_ffx_opticalflow_prepare_luma_scaled ),
 					{ D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER } ) &&
@@ -634,6 +639,13 @@ namespace
 					Binding( 7, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ), Binding( 8, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ),
 					Binding( 1000, D::VK_DESCRIPTOR_TYPE_SAMPLER ),
 				} );
+			if ( !created || !g_device.supportsIntegerDotProduct() )
+				return created;
+			return CreatePass( searchDot, cs_ffx_opticalflow_compute_optical_flow_dot,
+				sizeof( cs_ffx_opticalflow_compute_optical_flow_dot ),
+				{ D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+				  D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				  D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER } );
 		}
 	};
 
@@ -768,7 +780,9 @@ namespace
 				const uint32_t lumaHeight = std::max( resources->lumaExtent.height >> level, 1u );
 				const uint32_t searchX = ( ( ( lumaWidth + 3 ) / 4 ) * 16 + 63 ) / 64;
 				const uint32_t searchY = ( lumaHeight + 15 ) / 16;
-				if ( !Dispatch( cmdBuffer->rawBuffer(), resources->search,
+				Pass &searchPass = g_device.supportsIntegerDotProduct() &&
+					cv_frame_generation_dot_product_of ? resources->searchDot : resources->search;
+				if ( !Dispatch( cmdBuffer->rawBuffer(), searchPass,
 					{ Sampled( resources->luma[current][level] ), Sampled( resources->luma[previous][level] ),
 					  Storage( resources->flow[a][level] ), Storage( resources->scdOutput ), levelConstants }, searchX, searchY ) )
 					return false;

@@ -519,8 +519,12 @@ bool CVulkanDevice::createDevice()
 	}
 
 	{
+		VkPhysicalDeviceVulkan13Features vulkan13Features = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		};
 		VkPhysicalDeviceVulkan12Features vulkan12Features = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+			.pNext = &vulkan13Features,
 		};
 		VkPhysicalDeviceFeatures2 features2 = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -529,6 +533,18 @@ bool CVulkanDevice::createDevice()
 		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
 
 		m_bSupportsFp16 = vulkan12Features.shaderFloat16 && features2.features.shaderInt16;
+		VkPhysicalDeviceShaderIntegerDotProductProperties dotProductProperties = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES,
+		};
+		VkPhysicalDeviceProperties2 properties2 = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			.pNext = &dotProductProperties,
+		};
+		vk.GetPhysicalDeviceProperties2( physDev(), &properties2 );
+		m_bSupportsIntegerDotProduct = vulkan12Features.shaderInt8 &&
+			vulkan13Features.shaderIntegerDotProduct &&
+			properties2.properties.apiVersion >= VK_API_VERSION_1_3 &&
+			dotProductProperties.integerDotProduct8BitUnsignedAccelerated;
 		m_bSupportsStorageImageReadWithoutFormat = features2.features.shaderStorageImageReadWithoutFormat;
 		m_bSupportsStorageImageWriteWithoutFormat = features2.features.shaderStorageImageWriteWithoutFormat;
 	}
@@ -626,6 +642,7 @@ bool CVulkanDevice::createDevice()
 		.pNext = &maintenance5,
 #endif
 		.dynamicRendering = VK_TRUE,
+		.shaderIntegerDotProduct = m_bSupportsIntegerDotProduct,
 	};
 
 	VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures = {
@@ -661,6 +678,7 @@ bool CVulkanDevice::createDevice()
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
 		.pNext = std::exchange(features2.pNext, &vulkan12Features),
 		.shaderFloat16 = m_bSupportsFp16,
+		.shaderInt8 = m_bSupportsIntegerDotProduct,
 		.scalarBlockLayout = VK_TRUE,
 		.timelineSemaphore = VK_TRUE,
 	};

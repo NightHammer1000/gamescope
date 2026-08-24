@@ -177,6 +177,21 @@ ffx_spirv_shaders += custom_target(
   depfile: ffx_scaled_luma_shader_name + '.h.d',
 )
 
+ffx_dot_search_shader_name = 'cs_ffx_opticalflow_compute_optical_flow_dot'
+ffx_spirv_shaders += custom_target(
+  ffx_dot_search_shader_name + '.h',
+  output: ffx_dot_search_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_dot_search_shader_name + '.comp'),
+    '--vn', ffx_dot_search_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_dot_search_shader_name + '.h.d',
+)
+
 ffx_vector_field_shader_name = 'cs_ffx_frameinterpolation_vector_field'
 ffx_spirv_shaders += custom_target(
   ffx_vector_field_shader_name + '.h',

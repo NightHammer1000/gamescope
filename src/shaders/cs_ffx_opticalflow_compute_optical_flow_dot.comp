@@ -1,0 +1,173 @@
+// This file is part of the FidelityFX SDK integration in Gamescope.
+//
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
+// Copyright (C) 2026 Gamescope contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+// Local adaptation of FidelityFX Optical Flow 1.1.4. Uses Vulkan integer dot
+// products to reduce packed-luma SAD cost while retaining the official search
+// geometry and reduction logic.
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+
+#define FFX_WAVE 1
+#extension GL_KHR_shader_subgroup_basic : require
+
+#define FFX_OPTICALFLOW_BIND_SRV_OPTICAL_FLOW_INPUT                0
+#define FFX_OPTICALFLOW_BIND_SRV_OPTICAL_FLOW_PREVIOUS_INPUT       1
+
+#define FFX_OPTICALFLOW_BIND_UAV_OPTICAL_FLOW                      2
+#define FFX_OPTICALFLOW_BIND_UAV_OPTICAL_FLOW_SCD_OUTPUT           3
+
+#define FFX_OPTICALFLOW_BIND_CB_COMMON                             4
+
+#include "opticalflow/ffx_opticalflow_callbacks_glsl.h"
+#include "opticalflow/ffx_opticalflow_common.h"
+
+u8vec4 UnpackLumaBytes(FfxUInt32 value)
+{
+    return u8vec4(
+        uint8_t(value),
+        uint8_t(value >> 8),
+        uint8_t(value >> 16),
+        uint8_t(value >> 24));
+}
+
+FfxUInt32 DotSadBytes(u8vec4 a, u8vec4 b)
+{
+    const u8vec4 difference = max(a, b) - min(a, b);
+    return dotEXT(difference, u8vec4(uint8_t(1)));
+}
+
+FfxUInt32 DotSad(FfxUInt32 a, FfxUInt32 b)
+{
+    return DotSadBytes(UnpackLumaBytes(a), UnpackLumaBytes(b));
+}
+
+FfxUInt32x4 DotQSad(FfxUInt32 a0, FfxUInt32 a1, FfxUInt32 b)
+{
+    const u8vec4 lo = UnpackLumaBytes(a0);
+    const u8vec4 hi = UnpackLumaBytes(a1);
+    const u8vec4 reference = UnpackLumaBytes(b);
+    return FfxUInt32x4(
+        DotSadBytes(lo, reference),
+        DotSadBytes(u8vec4(lo.y, lo.z, lo.w, hi.x), reference),
+        DotSadBytes(u8vec4(lo.z, lo.w, hi.x, hi.y), reference),
+        DotSadBytes(u8vec4(lo.w, hi.x, hi.y, hi.z), reference));
+}
+
+// Substitute only the byte-SAD implementation. Everything else, including
+// the 16x16 search and seven-level coarse-to-fine refinement, stays official.
+#define Sad DotSad
+#define QSad DotQSad
+
+#define FFX_OPTICALFLOW_BLOCK_SIZE 8
+#define FFX_OPTICALFLOW_THREAD_GROUP_WIDTH 64
+#define FFX_OPTICALFLOW_THREAD_GROUP_HEIGHT 1
+#define FFX_OPTICALFLOW_THREAD_GROUP_DEPTH 1
+#define ComputeOpticalFlowAdvanced FidelityFxComputeOpticalFlowAdvanced
+#include "opticalflow/ffx_opticalflow_compute_optical_flow_v5.h"
+#undef ComputeOpticalFlowAdvanced
+
+// The official shader evaluates the complete search before its level-zero
+// local fallback selects a zero vector. An exact same-position 8x8 match has
+// the minimum possible SAD, so it can select zero before loading or searching
+// the 16x16 candidate region without changing the result.
+void ComputeOpticalFlowAdvanced(FfxInt32x2 iGlobalId, FfxInt32x2 iLocalId,
+    FfxInt32x2 iGroupId, FfxInt32 iLocalIndex)
+{
+    FfxInt32x2 iSearchId;
+    FfxInt32x2 iPxPos;
+    FfxInt32 iLaneToBlockId;
+    MapThreads(iGroupId, iLocalIndex, iSearchId, iPxPos, iLaneToBlockId);
+
+    FfxInt32x2 currentOFPos = iPxPos >> 3u;
+    if (IsSceneChanged())
+    {
+        if ((iSearchId.y & 0x7) == 0 && (iSearchId.x & 0x1) == 0)
+            StoreOpticalFlow(currentOFPos, FfxInt32x2(0, 0));
+        return;
+    }
+
+    const FfxBoolean usePrediction =
+        OpticalFlowPyramidLevel() != OpticalFlowPyramidLevelCount() - 1;
+    const FfxUInt32 packedLuma = LoadFirstImagePackedLuma(iPxPos);
+    const FfxUInt32 previousPackedLuma = LoadSecondImagePackedLuma(iPxPos);
+    // Only level zero consumes the same-position SAD magnitude for the local
+    // fallback. Coarser levels use it solely to prove an exact block match, so
+    // a packed equality test avoids needless byte-SAD arithmetic there.
+    const FfxUInt32 localSad = OpticalFlowPyramidLevel() == 0u
+        ? DotSad(packedLuma, previousPackedLuma)
+        : FfxUInt32(packedLuma != previousPackedLuma);
+    const FfxInt32x2 ofGroupOffset = iGroupId << 1u;
+    const FfxInt32x2 pixelGroupOffset = iGroupId << 4u;
+
+    FfxInt32x2 blockId;
+    for (blockId.y = 0; blockId.y < BlockCount; ++blockId.y)
+    {
+        for (blockId.x = 0; blockId.x < BlockCount; ++blockId.x)
+        {
+            const FfxInt32 block = blockId.x + blockId.y * 2;
+            const FfxUInt32 localBlockSad =
+                BlockSad64(localSad, iLocalIndex, iLaneToBlockId, block);
+            if (localBlockSad == 0u)
+            {
+                if (iLocalIndex == 0)
+                    StoreOpticalFlow(ofGroupOffset + blockId, FfxInt32x2(0, 0));
+                continue;
+            }
+
+            FfxInt32x2 currentVector = LoadRwOpticalFlow(ofGroupOffset + blockId);
+            if (!usePrediction)
+                currentVector = FfxInt32x2(0, 0);
+
+            if (iLaneToBlockId == block)
+                pixels[iSearchId.y & 0x7][iSearchId.x & 0x1] = packedLuma;
+
+            LoadSearchBuffer(iLocalIndex, pixelGroupOffset + blockId * 8 + currentVector);
+            const FfxUInt32x4 qsad = CalculateQSads2(iSearchId);
+            PrepareSadMap(iSearchId, qsad);
+            const FfxUInt32 minSad = SadMapMinReduction256(iSearchId, iLocalIndex);
+            FfxInt32x2 newVector = currentVector + DecodeSearchCoord(minSad);
+            if (OpticalFlowPyramidLevel() == 0 && localBlockSad <= (minSad >> 16u))
+                newVector = FfxInt32x2(0, 0);
+            if (iLocalIndex == 0)
+                StoreOpticalFlow(ofGroupOffset + blockId, newVector);
+        }
+    }
+}
+
+layout(local_size_x = FFX_OPTICALFLOW_THREAD_GROUP_WIDTH,
+       local_size_y = FFX_OPTICALFLOW_THREAD_GROUP_HEIGHT,
+       local_size_z = FFX_OPTICALFLOW_THREAD_GROUP_DEPTH) in;
+
+void main()
+{
+    ComputeOpticalFlowAdvanced(
+        FfxInt32x2(gl_GlobalInvocationID.xy),
+        FfxInt32x2(gl_LocalInvocationID.xy),
+        FfxInt32x2(gl_WorkGroupID.xy),
+        FfxInt32(gl_LocalInvocationIndex));
+}
