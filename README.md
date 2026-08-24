@@ -20,7 +20,7 @@ So shoot your workarounds my way. Open a PR. Let us make the Linux gaming ecosys
 
 ## Status
 
-Early, and not yet run on real hardware. The fork builds clean and its unit tests pass, but nothing here has been exercised on a real display. Do not put it on a machine you need working. [`HARDWARE-CHECKLIST.md`](HARDWARE-CHECKLIST.md) tracks what has and has not been verified.
+Early, and not yet run on real hardware. The fork builds clean and its unit tests pass, but nothing here has been exercised on a real display. Do not put it on a machine you need working.
 
 ## Currently included workarounds
 
@@ -163,5 +163,9 @@ applies to the driver that needs it. Nothing gets applied globally where it woul
 another vendor something.
 
 Telescope keeps merging upstream gamescope, so the size of our diff against upstream is a
-design constraint. Read [`UPSTREAM.md`](UPSTREAM.md) before you write anything, and
-[`CLAUDE.md`](CLAUDE.md) for architecture and conventions.
+design constraint rather than a detail. In practice that means new behaviour goes in new
+files, hooks into upstream files stay to a line or two, and nothing gets reformatted,
+reordered or renamed just because we would have written it differently. A deleted file is
+one merge conflict you resolve once. A file you reindented conflicts forever.
+
+We merge upstream, never rebase onto it.

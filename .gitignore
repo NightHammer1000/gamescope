@@ -8,3 +8,8 @@
 /subprojects/v4l-utils/
 /subprojects/v4l-utils.wrap
 /subprojects/packagecache/
+
+# Working notes, local only. Not part of the published fork.
+/CLAUDE.md
+/UPSTREAM.md
+/HARDWARE-CHECKLIST.md

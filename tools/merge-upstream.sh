@@ -5,7 +5,8 @@
 # deleted on purpose in the cleanout. Everything else is left conflicted for a
 # human, on purpose.
 #
-# See UPSTREAM.md.
+# Merge, never rebase: rebasing replays every commit onto a moving base and
+# re-raises the cleanout's deletion conflicts each time.
 
 set -euo pipefail
 
