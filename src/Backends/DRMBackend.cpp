@@ -2722,7 +2722,10 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			{
 				nFence = pLayer->bufferSync->DuplicateAcquireSyncFile();
 				if ( nFence < 0 )
+				{
+					pLayer->bufferSync->RecordFailure( "KMS acquire duplication" );
 					return -EINVAL;
+				}
 				drm->m_InFenceFdsInRequest.push_back( nFence );
 			}
 			else if ( !cv_drm_debug_disable_in_fence_fd && pLayer->acquirePoint )

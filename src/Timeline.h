@@ -26,6 +26,7 @@ namespace gamescope
     {
     public:
         static std::shared_ptr<CTimeline> Create( const TimelineCreateDesc_t &desc = {} );
+        static std::shared_ptr<CTimeline> CreateVulkanOnly( const TimelineCreateDesc_t &desc = {} );
 
         // Inherits nSyncobjFd's ref.
         CTimeline( int32_t nSyncobjFd, std::shared_ptr<VulkanTimelineSemaphore_t> pSemaphore = nullptr );
@@ -46,6 +47,8 @@ namespace gamescope
         uint32_t GetSyncobjHandle() const { return m_uSyncobjHandle; }
 
         int32_t ExportSyncFile( uint64_t ulPoint ) const;
+        bool SignalPoint( uint64_t ulPoint ) const;
+        bool WaitPoint( uint64_t ulPoint ) const;
 
         std::shared_ptr<VulkanTimelineSemaphore_t> ToVkSemaphore();
         
@@ -71,8 +74,6 @@ namespace gamescope
 
               std::shared_ptr<CTimeline> &GetTimeline()       { return m_pTimeline; }
         const std::shared_ptr<CTimeline> &GetTimeline() const { return m_pTimeline; }
-
-        constexpr bool ShouldSignalOnDestruction() const { return Type == TimelinePointType::Release; }
 
         bool Wait( int64_t lTimeout = std::numeric_limits<int64_t>::max() );
 

@@ -7731,7 +7731,7 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 	}
 
 	std::shared_ptr<gamescope::CCommitBufferSync> bufferSync = std::make_shared<gamescope::CCommitBufferSync>(
-		buf, std::move( reslistentry.pAcquirePoint ), std::move( reslistentry.pReleasePoint ) );
+		buf, std::move( reslistentry.pAcquirePoint ), std::move( reslistentry.pReleasePoint ), w->pid );
 
 	gamescope::Rc<commit_t> newCommit = import_commit(
 		w,
@@ -7912,7 +7912,11 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 	{
 		newCommit->SetFence( fence, mango_nudge, doneCommits );
 		if ( bKnownReady )
+		{
+			if ( bufferSync->IsAcquireFallback() )
+				bufferSync->MarkAcquireFallbackReady();
 			newCommit->Signal();
+		}
 		else
 			g_ImageWaiter.AddWaitable( newCommit.get() );
 	}

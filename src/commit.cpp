@@ -59,7 +59,11 @@ void commit_t::OnPollIn()
             return;
     }
 
-    if ( bufferSync && bufferSync->UsesSyncFileInterop() && !bufferSync->IsAcquireFallback() )
+    if ( bufferSync && bufferSync->IsAcquireFallback() )
+    {
+        bufferSync->MarkAcquireFallbackReady();
+    }
+    else if ( bufferSync && bufferSync->UsesSyncFileInterop() )
     {
         std::pair<int32_t, bool> nextEvent = gamescope::CAcquireTimelinePoint::k_InvalidEvent;
         const gamescope::CCommitBufferSync::AcquireStatus status = bufferSync->PrepareAcquire();

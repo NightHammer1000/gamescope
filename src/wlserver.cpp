@@ -2035,6 +2035,7 @@ wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, s
 	{
 		pid_t nPid = 0;
 		wl_client_get_credentials( client, &nPid, nullptr, nullptr );
+		window->pid = nPid;
 		window->appID = get_appid_from_pid( nPid );
 	}
 	window->_window_types.emplace<steamcompmgr_xdg_win_t>();

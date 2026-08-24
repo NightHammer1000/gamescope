@@ -1430,6 +1430,7 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	};
 
 	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, VK_NULL_HANDLE ) );
+	cmdBuffer->NotifyBufferUsesSubmitted( GetSubmissionTimeline(), nextSeqNo );
 
 	return nextSeqNo;
 }
@@ -1511,6 +1512,36 @@ int VulkanTimelineSemaphore_t::GetFd() const
 	}
 
 	return nFd;
+}
+
+bool VulkanTimelineSemaphore_t::Signal( uint64_t ulPoint ) const
+{
+	const VkSemaphoreSignalInfo signalInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+		.semaphore = pVkSemaphore,
+		.value = ulPoint,
+	};
+
+	VkResult res = pDevice->vk.SignalSemaphore( pDevice->device(), &signalInfo );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkSignalSemaphore failed" );
+		return false;
+	}
+
+	return true;
+}
+
+VulkanTimelineSyncFile_t::~VulkanTimelineSyncFile_t()
+{
+	if ( nSyncFileFd >= 0 )
+		close( nSyncFileFd );
+}
+
+int VulkanTimelineSyncFile_t::DuplicateSyncFile() const
+{
+	return nSyncFileFd >= 0 ? dup( nSyncFileFd ) : -1;
 }
 
 std::shared_ptr<VulkanTimelineSemaphore_t> CVulkanDevice::CreateTimelineSemaphore( uint64_t ulStartPoint, bool bShared )
@@ -1598,6 +1629,79 @@ std::shared_ptr<VulkanTimelineSemaphore_t> CVulkanDevice::ImportTimelineSemaphor
 	return pSemaphore;
 }
 
+std::shared_ptr<VulkanTimelineSyncFile_t> CVulkanDevice::CreateTimelineSyncFile(
+	const std::shared_ptr<VulkanTimelineSemaphore_t> &pTimeline, uint64_t ulPoint )
+{
+	if ( !pTimeline || !ulPoint )
+		return nullptr;
+
+	std::shared_ptr<VulkanTimelineSyncFile_t> pSyncFile = std::make_shared<VulkanTimelineSyncFile_t>();
+	pSyncFile->pSemaphore = std::make_shared<VulkanBinarySemaphore_t>();
+	pSyncFile->pSemaphore->pDevice = this;
+
+	const VkExportSemaphoreCreateInfo exportInfo = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	const VkSemaphoreCreateInfo createInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+		.pNext = &exportInfo,
+	};
+	VkResult res = vk.CreateSemaphore( m_device, &createInfo, nullptr,
+		&pSyncFile->pSemaphore->pVkSemaphore );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkCreateSemaphore for timeline sync_file failed" );
+		return nullptr;
+	}
+
+	const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	const uint64_t ulBinarySignalValue = 0;
+	const VkTimelineSemaphoreSubmitInfo timelineInfo = {
+		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+		.waitSemaphoreValueCount = 1,
+		.pWaitSemaphoreValues = &ulPoint,
+		.signalSemaphoreValueCount = 1,
+		.pSignalSemaphoreValues = &ulBinarySignalValue,
+	};
+	const VkSemaphore waitSemaphore = pTimeline->pVkSemaphore;
+	const VkSemaphore signalSemaphore = pSyncFile->pSemaphore->pVkSemaphore;
+	const VkSubmitInfo submitInfo = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.pNext = &timelineInfo,
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = &waitSemaphore,
+		.pWaitDstStageMask = &waitStage,
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = &signalSemaphore,
+	};
+	res = vk.QueueSubmit( generalQueue(), 1, &submitInfo, VK_NULL_HANDLE );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkQueueSubmit for timeline sync_file failed" );
+		return nullptr;
+	}
+
+	const VkSemaphoreGetFdInfoKHR getInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+		.semaphore = signalSemaphore,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	res = vk.GetSemaphoreFdKHR( m_device, &getInfo, &pSyncFile->nSyncFileFd );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkGetSemaphoreFdKHR for timeline sync_file failed" );
+
+		// Nothing will consume this private timeline after setup fails. Signal it
+		// so the submitted bridge can retire before its semaphore is destroyed.
+		pTimeline->Signal( ulPoint );
+		vk.QueueWaitIdle( generalQueue() );
+		return nullptr;
+	}
+
+	return pSyncFile;
+}
+
 std::shared_ptr<VulkanBinarySemaphore_t> CVulkanDevice::ImportSyncFile( int32_t nSyncFile )
 {
 	if ( nSyncFile < 0 )
@@ -1654,6 +1758,21 @@ int CVulkanDevice::ExportSubmissionTimelineFd() const
 	return fd;
 }
 
+std::shared_ptr<gamescope::CTimeline> CVulkanDevice::GetSubmissionTimeline()
+{
+	if ( m_pSubmissionTimeline )
+		return m_pSubmissionTimeline;
+
+	const int fd = ExportSubmissionTimelineFd();
+	if ( fd < 0 )
+		return nullptr;
+
+	m_pSubmissionTimeline = std::make_shared<gamescope::CTimeline>( fd );
+	if ( !m_pSubmissionTimeline->IsValid() )
+		m_pSubmissionTimeline = nullptr;
+	return m_pSubmissionTimeline;
+}
+
 void CVulkanCmdBuffer::AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
 {
 	m_ExternalDependencies.emplace_back( std::move( pTimelineSemaphore ), ulPoint );
@@ -1669,15 +1788,39 @@ bool CVulkanCmdBuffer::AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSyn
 	if ( !pBufferSync || std::find( m_BufferUses.begin(), m_BufferUses.end(), pBufferSync ) != m_BufferUses.end() )
 		return true;
 
-	if ( pBufferSync->UsesSyncFileInterop() && !pBufferSync->IsAcquireFallback() )
+	if ( pBufferSync->UsesSyncFileInterop() && pBufferSync->IsAcquireFallback() )
 	{
-		std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore = m_device->ImportSyncFile( pBufferSync->DuplicateAcquireSyncFile() );
-		if ( !pSemaphore )
+		if ( !pBufferSync->IsAcquireFallbackReady() )
 			return false;
-		AddBinaryDependency( std::move( pSemaphore ) );
+	}
+	else if ( pBufferSync->UsesSyncFileInterop() )
+	{
+		const std::shared_ptr<gamescope::CTimeline> &pRelayTimeline = pBufferSync->GetAcquireRelayTimeline();
+		std::shared_ptr<VulkanTimelineSemaphore_t> pSemaphore = pRelayTimeline ? pRelayTimeline->ToVkSemaphore() : nullptr;
+		if ( !pSemaphore || !pBufferSync->GetAcquireRelayPoint() )
+		{
+			pBufferSync->RecordFailure( "Vulkan acquire relay import" );
+			pBufferSync->BeginAcquireFallbackWait();
+			return false;
+		}
+		AddDependency( std::move( pSemaphore ), pBufferSync->GetAcquireRelayPoint() );
 	}
 	m_BufferUses.emplace_back( std::move( pBufferSync ) );
 	return true;
+}
+
+void CVulkanCmdBuffer::NotifyBufferUsesSubmitted( const std::shared_ptr<gamescope::CTimeline> &pTimeline, uint64_t ulPoint )
+{
+	if ( !pTimeline )
+		return;
+
+	std::erase_if( m_BufferUses, [&]( const std::shared_ptr<gamescope::CCommitBufferSync> &pBufferSync )
+	{
+		if ( !pBufferSync->UsesSyncFileInterop() )
+			return false;
+		pBufferSync->RecordVulkanUse( pTimeline, ulPoint );
+		return true;
+	} );
 }
 
 void CVulkanCmdBuffer::AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )

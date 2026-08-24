@@ -32,6 +32,7 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 	// For waitable:
 	int GetFD() final;
 	void OnPollIn() final;
+	void OnPollError() final { OnPollIn(); }
 	void Signal();
 	void OnPollHangUp() final;
 

@@ -862,6 +862,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(ResetCommandBuffer) \
 	VK_FUNC(ResetDescriptorPool) \
 	VK_FUNC(ResetFences) \
+	VK_FUNC(SignalSemaphore) \
 	VK_FUNC(UnmapMemory) \
 	VK_FUNC(UpdateDescriptorSets) \
 	VK_FUNC(WaitForFences) \
@@ -884,6 +885,7 @@ struct VulkanTimelineSemaphore_t
 	VkSemaphore pVkSemaphore = VK_NULL_HANDLE;
 
 	int GetFd() const;
+	bool Signal( uint64_t ulPoint ) const;
 };
 
 struct VulkanBinarySemaphore_t
@@ -892,6 +894,16 @@ struct VulkanBinarySemaphore_t
 
 	CVulkanDevice *pDevice = nullptr;
 	VkSemaphore pVkSemaphore = VK_NULL_HANDLE;
+};
+
+struct VulkanTimelineSyncFile_t
+{
+	~VulkanTimelineSyncFile_t();
+
+	std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore;
+	int nSyncFileFd = -1;
+
+	int DuplicateSyncFile() const;
 };
 
 struct VulkanTimelinePoint_t
@@ -920,9 +932,12 @@ public:
 
 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
+	std::shared_ptr<VulkanTimelineSyncFile_t> CreateTimelineSyncFile(
+		const std::shared_ptr<VulkanTimelineSemaphore_t> &pTimeline, uint64_t ulPoint );
 	// Consumes nSyncFile regardless of success.
 	std::shared_ptr<VulkanBinarySemaphore_t> ImportSyncFile( int32_t nSyncFile );
 	int ExportSubmissionTimelineFd() const;
+	std::shared_ptr<gamescope::CTimeline> GetSubmissionTimeline();
 
 	static const uint32_t upload_buffer_size = 1920 * 1080 * 4;
 
@@ -1039,6 +1054,7 @@ protected:
 	uint32_t m_uploadBufferOffset = 0;
 
 	VkSemaphore m_scratchTimelineSemaphore;
+	std::shared_ptr<gamescope::CTimeline> m_pSubmissionTimeline;
 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
@@ -1108,6 +1124,7 @@ public:
 	void AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 	void AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore );
 	bool AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync );
+	void NotifyBufferUsesSubmitted( const std::shared_ptr<gamescope::CTimeline> &pTimeline, uint64_t ulPoint );
 	void AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 
 	const std::vector<VulkanTimelinePoint_t> &GetExternalDependencies() const { return m_ExternalDependencies; }
