@@ -15,6 +15,7 @@ namespace gamescope
 		{
 			quirks.bCanDirectScanoutClientBuffers = false;
 			quirks.bRequiresGbmScanoutAllocation = true;
+			quirks.bNeedsModesetLinkDown = true;
 		}
 
 		return quirks;

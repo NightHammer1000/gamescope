@@ -192,6 +192,7 @@ TEST_CASE("Only nvidia-drm carries the scanout quirks", "[scanout]") {
 	const DrmVendorQuirks nvidia = DrmVendorQuirksForDriver( "nvidia-drm" );
 	REQUIRE_FALSE( nvidia.bCanDirectScanoutClientBuffers );
 	REQUIRE( nvidia.bRequiresGbmScanoutAllocation );
+	REQUIRE( nvidia.bNeedsModesetLinkDown );
 
 	// Direct scanout is the copy gamescope exists to avoid, and Vulkan-allocated
 	// scanout works fine on Mesa. Every other driver keeps both.
@@ -201,6 +202,7 @@ TEST_CASE("Only nvidia-drm carries the scanout quirks", "[scanout]") {
 		INFO( "driver: " << pszDriver );
 		REQUIRE( quirks.bCanDirectScanoutClientBuffers );
 		REQUIRE_FALSE( quirks.bRequiresGbmScanoutAllocation );
+		REQUIRE_FALSE( quirks.bNeedsModesetLinkDown );
 	}
 
 	// Unknown drivers get the permissive default, not the NVIDIA workaround.

@@ -31,6 +31,18 @@ namespace gamescope
 		// Where this is set, falling back to Vulkan allocation means falling
 		// back into the bug, so it is treated as fatal rather than a fallback.
 		bool bRequiresGbmScanoutAllocation = false;
+
+		// Whether a modeset must take the link fully down, let it settle, and
+		// bring it back up as a separate commit.
+		//
+		// The usual sequence zeroes CRTC_ID / ACTIVE / MODE_ID and refills them
+		// with the new mode in a single atomic request. We have no guarantee how
+		// a driver sequences that internally, and on nvidia-drm the link appears
+		// not to actually drop, so it never retrains cleanly -- which is the
+		// corruption. Measured on a 5080 against a 4K TV: splitting it into a
+		// real link-down commit, a settle, then a link-up brought the display up
+		// clean 8 times out of 10 where the single-request path corrupted.
+		bool bNeedsModesetLinkDown = false;
 	};
 
 	// Pure driver-name -> quirks mapping. Kept free of any fd or ioctl so it

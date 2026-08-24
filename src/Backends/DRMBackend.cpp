@@ -23,6 +23,8 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <chrono>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -76,6 +78,15 @@ gamescope::ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_e
 gamescope::ConVar<bool> cv_drm_debug_disable_in_fence_fd( "drm_debug_disable_in_fence_fd", false, "Force disable IN_FENCE_FD being set to avoid over-synchronization on the DRM backend." );
 
 gamescope::ConVar<bool> cv_drm_allow_dynamic_modes_for_external_display( "drm_allow_dynamic_modes_for_external_display", false, "Allow dynamic mode/refresh rate switching for external displays." );
+
+gamescope::ConVar<bool> cv_drm_modeset_link_down( "drm_modeset_link_down", true,
+	"On drivers that need it, take the link fully down as its own commit before bringing it "
+	"back up with the new mode, instead of disabling and refilling in one atomic request. "
+	"Turn off to A/B the corruption this works around." );
+
+gamescope::ConVar<int> cv_drm_modeset_link_down_settle_ms( "drm_modeset_link_down_settle_ms", 1000,
+	"How long to wait after the link-down commit before bringing the link back up. "
+	"Only used when drm_modeset_link_down applies." );
 
 int HackyDRMPresent( const FrameInfo_t *pFrameInfo, bool bAsync );
 
@@ -2962,6 +2973,88 @@ static void drm_unlink_foreign_planes( struct drm_t *drm )
 	drmModeAtomicFree( req );
 }
 
+/* Takes the link fully down as its own blocking commit, waits for it to settle,
+ * and leaves the caller to bring it back up.
+ *
+ * The point is that the link-up must be a *separate* request. Zeroing CRTC_ID /
+ * ACTIVE / MODE_ID and refilling them in one atomic request leaves it to the
+ * driver to decide whether the link ever really dropped, and nvidia-drm appears
+ * to decide that it did not -- so it never retrains, and we get corruption.
+ *
+ * Returns true if the link is now down and the caller should NOT emit its own
+ * disable pass. On failure the properties are rolled back and we fall through to
+ * the single-request path, which is no worse than not trying.
+ */
+static bool drm_modeset_link_down( struct drm_t *drm )
+{
+	auto ForEachProperty = [ & ]( auto &&func )
+	{
+		for ( auto &iter : drm->connectors )
+			for ( std::optional<gamescope::CDRMAtomicProperty> &oProp : iter.second.GetProperties() )
+				if ( oProp ) func( *oProp );
+		for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
+			for ( std::optional<gamescope::CDRMAtomicProperty> &oProp : pCRTC->GetProperties() )
+				if ( oProp ) func( *oProp );
+		for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
+			for ( std::optional<gamescope::CDRMAtomicProperty> &oProp : pPlane->GetProperties() )
+				if ( oProp ) func( *oProp );
+	};
+
+	// Nothing is lit, so there is no link to drop. Skip the settle rather than
+	// stalling for a second on the way to the first modeset.
+	bool bAnythingActive = false;
+	for ( auto &iter : drm->connectors )
+		bAnythingActive |= iter.second.GetProperties().CRTC_ID->GetCurrentValue() != 0;
+	for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
+		bAnythingActive |= pCRTC->GetProperties().ACTIVE->GetCurrentValue() != 0;
+
+	if ( !bAnythingActive )
+		return false;
+
+	drmModeAtomicReq *pRequest = drmModeAtomicAlloc();
+	if ( !pRequest )
+		return false;
+
+	defer( drmModeAtomicFree( pRequest ) );
+
+	for ( auto &iter : drm->connectors )
+		iter.second.GetProperties().CRTC_ID->SetPendingValue( pRequest, 0, true );
+
+	for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
+	{
+		pCRTC->GetProperties().ACTIVE->SetPendingValue( pRequest, 0, true );
+		pCRTC->GetProperties().MODE_ID->SetPendingValue( pRequest, 0, true );
+	}
+
+	for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
+	{
+		pPlane->GetProperties().FB_ID->SetPendingValue( pRequest, 0, true );
+		pPlane->GetProperties().CRTC_ID->SetPendingValue( pRequest, 0, true );
+	}
+
+	// Blocking on purpose: the whole point is that this lands before the link
+	// comes back up.
+	int ret = drmModeAtomicCommit( drm->fd, pRequest, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr );
+	if ( ret != 0 )
+	{
+		// -EACCES just means we are VT-switched away; our caller handles that.
+		if ( ret != -EACCES )
+			drm_log.errorf_errno( "drm_modeset_link_down: commit failed, falling back to a single-request modeset" );
+
+		ForEachProperty( []( gamescope::CDRMAtomicProperty &prop ){ prop.Rollback(); } );
+		return false;
+	}
+
+	ForEachProperty( []( gamescope::CDRMAtomicProperty &prop ){ prop.OnCommit(); } );
+
+	const int nSettleMs = std::max( 0, cv_drm_modeset_link_down_settle_ms.Get() );
+	drm_log.debugf( "drm_modeset_link_down: link down, settling for %dms", nSettleMs );
+	if ( nSettleMs > 0 )
+		std::this_thread::sleep_for( std::chrono::milliseconds( nSettleMs ) );
+
+	return true;
+}
+
 /* Prepares an atomic commit for the provided scene-graph. Returns 0 on success,
  * negative errno on failure or if the scene-graph can't be presented directly. */
 int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
@@ -3065,7 +3158,22 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 		drm_unlink_foreign_planes( drm );
 
+		// Some drivers mishandle disabling and refilling in a single request, and
+		// need the link to come down as its own commit first.
+		//
+		// If that worked, the disable pass below must NOT run: re-adding the
+		// zeroes to this request would rebuild exactly the disable-then-refill
+		// pattern we just went out of our way to avoid.
+		const bool bLinkTakenDown =
+			drm->vendorQuirks.bNeedsModesetLinkDown &&
+			cv_drm_modeset_link_down &&
+			drm_modeset_link_down( drm );
+
 		// Disable all connectors and CRTCs
+		// (Body deliberately left at its original indentation -- reindenting it
+		//  would conflict against every upstream change to these loops.)
+		if ( !bLinkTakenDown )
+		{
 
 		for ( auto &iter : drm->connectors )
 		{
@@ -3116,6 +3224,8 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			if ( pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF )
 				pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( drm->req, 0, bForceInRequest );
 		}
+
+		} // !bLinkTakenDown
 
 		if ( drm->pConnector && !bSleep )
 		{
