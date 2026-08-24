@@ -236,6 +236,7 @@ src = [
   'Utils/Process.cpp',
   'Script/Script.cpp',
   'BufferMemo.cpp',
+  'CommitBufferSync.cpp',
   'DmabufSync.cpp',
   'steamcompmgr.cpp',
   'convar.cpp',

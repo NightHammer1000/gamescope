@@ -97,6 +97,7 @@
 #include "refresh_rate.h"
 #include "commit.h"
 #include "BufferMemo.h"
+#include "CommitBufferSync.h"
 #include "Utils/Process.h"
 #include "Utils/Algorithm.h"
 
@@ -1407,6 +1408,7 @@ import_commit (
 	steamcompmgr_win_t *w,
 	struct wlr_surface *surf,
 	struct wlr_buffer *buf,
+	std::shared_ptr<gamescope::CCommitBufferSync> bufferSync,
 	bool async,
 	std::shared_ptr<wlserver_vk_swapchain_feedback> swapchain_feedback,
 	std::vector<struct wl_resource*> presentation_feedbacks,
@@ -1419,6 +1421,7 @@ import_commit (
 	commit->win_seq = w->seq;
 	commit->surf = surf;
 	commit->buf = buf;
+	commit->bufferSync = std::move( bufferSync );
 	commit->async = async;
 	commit->fifo = fifo;
 	commit->is_steam = window_is_steam( w );
@@ -2076,6 +2079,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 	if (layer->colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB)
 		layer->ctm = s_scRGB709To2020Matrix;
 	layer->tex = commit->vulkanTex;
+	layer->bufferSync = commit->bufferSync;
 
 	layer->filter = base.filter;
 	layer->eAlphaBlendingMode = base.eAlphaBlendingMode;
@@ -2146,6 +2150,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	layer->filter = ( flags & PaintWindowFlag::NoFilter ) ? GamescopeUpscaleFilter::LINEAR : g_upscaleFilter;
 
 	layer->tex = lastCommit->GetTexture( layer->filter, g_upscaleScaler, layer->colorspace );
+	layer->bufferSync = lastCommit->bufferSync;
 
 	if ( flags & PaintWindowFlag::NoScale )
 	{
@@ -7725,10 +7730,14 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		return;
 	}
 
+	std::shared_ptr<gamescope::CCommitBufferSync> bufferSync = std::make_shared<gamescope::CCommitBufferSync>(
+		buf, std::move( reslistentry.pAcquirePoint ), std::move( reslistentry.pReleasePoint ) );
+
 	gamescope::Rc<commit_t> newCommit = import_commit(
 		w,
 		reslistentry.surf,
 		buf,
+		bufferSync,
 		reslistentry.async,
 		std::move(reslistentry.feedback),
 		std::move(reslistentry.presentation_feedbacks),
@@ -7757,7 +7766,8 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 	// work. Preemptive scaling reverses that GPU order and consumes most of
 	// the midpoint's output slot, so let the queued real slot run its single
 	// FSR chain after generated-frame synthesis instead.
-	bool bValidPreemptiveScale = reslistentry.pAcquirePoint && pCurrentFocus &&
+	const std::shared_ptr<gamescope::CAcquireTimelinePoint> &pAcquirePoint = bufferSync->GetAcquirePoint();
+	bool bValidPreemptiveScale = pAcquirePoint && pCurrentFocus &&
 		w == pCurrentFocus->focusWindow && cv_upscale_preemptive &&
 		!steamcompmgr_frame_generation_enabled_for_focus();
 	bool bPreemptiveUpscale = bValidPreemptiveScale && newCommit->ShouldPreemptivelyUpscale();
@@ -7794,7 +7804,7 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 
 			std::unique_ptr<CVulkanCmdBuffer> pCommandBuffer = g_device.commandBuffer();
 			
-			pCommandBuffer->AddDependency( reslistentry.pAcquirePoint->GetTimeline()->ToVkSemaphore(), reslistentry.pAcquirePoint->GetPoint() );
+			pCommandBuffer->AddDependency( pAcquirePoint->GetTimeline()->ToVkSemaphore(), pAcquirePoint->GetPoint() );
 			pCommandBuffer->AddSignal( pTempImage->pReleaseTimeline->ToVkSemaphore(), ulNextReleasePoint );
 
 			static std::optional<uint64_t> s_ulLastPreemptiveUpscaleSeqNo;
@@ -7842,18 +7852,10 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 			ClearUpscaleImages();
 		}
 
-		if ( reslistentry.pAcquirePoint )
+		if ( pAcquirePoint )
 		{
-			eventFd = reslistentry.pAcquirePoint->CreateEventFd();
+			eventFd = pAcquirePoint->CreateEventFd();
 		}
-	}
-
-	if ( gamescope::IBackendFb *pBackendFb = newCommit->vulkanTex->GetBackendFb() )
-	{
-		if ( reslistentry.pReleasePoint )
-			pBackendFb->SetReleasePoint( reslistentry.pReleasePoint );
-		else
-			pBackendFb->SetBuffer( buf );
 	}
 
 	if ( eventFd != gamescope::CAcquireTimelinePoint::k_InvalidEvent )

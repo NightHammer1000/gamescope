@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "backend.h"
+#include "CommitBufferSync.h"
 #include "color_helpers.h"
 #include "Utils/Defer.h"
 #include "drm_include.h"
@@ -158,16 +159,19 @@ struct drm_t {
 	// FBs in the atomic request, but not yet submitted to KMS
 	// Accessed only on req thread
 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_FbIdsInRequest;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_BufferUsesInRequest;
 	std::vector<int> m_InFenceFdsInRequest;
 
 	// FBs currently queued to go on screen.
 	// May be accessed by page flip handler thread and req thread, thus mutex.
 	std::mutex m_QueuedFbIdsMutex;
 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_QueuedFbIds;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_QueuedBufferUses;
 	// FBs currently on screen.
 	// Accessed only on page flip handler thread.
 	std::mutex m_mutVisibleFbIds;
 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_VisibleFbIds;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_VisibleBufferUses;
 
 	std::atomic < uint32_t > uPendingFlipCount = { 0 };
 
@@ -812,6 +816,8 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 		// Swap and clear from queue -> visible to avoid allocations.
 		g_DRM.m_VisibleFbIds.swap( g_DRM.m_QueuedFbIds );
 		g_DRM.m_QueuedFbIds.clear();
+		g_DRM.m_VisibleBufferUses.swap( g_DRM.m_QueuedBufferUses );
+		g_DRM.m_QueuedBufferUses.clear();
 	}
 
 	g_DRM.uPendingFlipCount--;
@@ -1654,14 +1660,17 @@ void finish_drm(struct drm_t *drm)
 	wlr_drm_format_set_finish( &drm->formats );
 	wlr_drm_format_set_finish( &drm->primary_formats );
 	drm->m_FbIdsInRequest.clear();
+	drm->m_BufferUsesInRequest.clear();
 	drm_close_in_fences( drm );
 	{
 		std::unique_lock lock( drm->m_QueuedFbIdsMutex );
 		drm->m_QueuedFbIds.clear();
+		drm->m_QueuedBufferUses.clear();
 	}
 	{
 		std::unique_lock lock( drm->m_mutVisibleFbIds );
 		drm->m_VisibleFbIds.clear();
+		drm->m_VisibleBufferUses.clear();
 	}
 	drm->sdr_static_metadata = nullptr;
 	drm->current = drm_t::drm_state_t{};
@@ -2719,6 +2728,8 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			liftoff_layer_set_property( drm->lo_layers[ i ], "FB_ID", pDrmFb->GetFbId());
 			liftoff_layer_set_property( drm->lo_layers[ i ], "IN_FENCE_FD", nFence );
 			drm->m_FbIdsInRequest.emplace_back( pDrmFb );
+			if ( pLayer->bufferSync )
+				drm->m_BufferUsesInRequest.emplace_back( pLayer->bufferSync );
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "zpos", entry.layerState[i].zpos );
 			liftoff_layer_set_property( drm->lo_layers[ i ], "alpha", frameInfo->layers.get( i ).opacity * 0xffff);
@@ -3148,6 +3159,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 		drm->needs_modeset = true;
 
 	drm->m_FbIdsInRequest.clear();
+	drm->m_BufferUsesInRequest.clear();
 	drm_close_in_fences( drm );
 
 	bool needs_modeset = drm->needs_modeset.exchange(false);
@@ -3361,6 +3373,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 		drm->req = nullptr;
 
 		drm->m_FbIdsInRequest.clear();
+		drm->m_BufferUsesInRequest.clear();
 		drm_close_in_fences( drm );
 
 		if ( needs_modeset )
@@ -4429,6 +4442,7 @@ namespace gamescope
 				// Swap over request FDs -> Queue
 				std::unique_lock lock( drm->m_QueuedFbIdsMutex );
 				drm->m_QueuedFbIds.swap( drm->m_FbIdsInRequest );
+				drm->m_QueuedBufferUses.swap( drm->m_BufferUsesInRequest );
 			}
 
 			GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents++;
@@ -4463,9 +4477,11 @@ namespace gamescope
 				{
 					std::unique_lock lock( drm->m_QueuedFbIdsMutex );
 					drm->m_QueuedFbIds.swap( drm->m_FbIdsInRequest );
+					drm->m_QueuedBufferUses.swap( drm->m_BufferUsesInRequest );
 				}
 				// Clear our refs.
 				drm->m_FbIdsInRequest.clear();
+				drm->m_BufferUsesInRequest.clear();
 
 				GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents--;
 
@@ -4477,6 +4493,7 @@ namespace gamescope
 				// Our request went through!
 				// Clear what we swapped with (what was previously queued)
 				drm->m_FbIdsInRequest.clear();
+				drm->m_BufferUsesInRequest.clear();
 
 				drm->current = drm->pending;
 

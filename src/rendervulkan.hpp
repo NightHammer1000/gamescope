@@ -23,6 +23,11 @@
 
 class CVulkanCmdBuffer;
 
+namespace gamescope
+{
+	class CCommitBufferSync;
+}
+
 // 1: Fade Plane (Fade outs between switching focus)
 // 2: Video Underlay (The actual video)
 // 3: Video Streaming UI (Game, App)
@@ -317,6 +322,7 @@ struct FrameInfo_t
 		std::shared_ptr<gamescope::BackendBlob> ctm;
 		std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
 		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
+		std::shared_ptr<gamescope::CCommitBufferSync> bufferSync;
 
 		GamescopeAppTextureColorspace colorspace;
 
@@ -1101,6 +1107,7 @@ public:
 
 	void AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 	void AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore );
+	void AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync );
 	void AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 
 	const std::vector<VulkanTimelinePoint_t> &GetExternalDependencies() const { return m_ExternalDependencies; }
@@ -1129,6 +1136,7 @@ private:
 
 	std::vector<VulkanTimelinePoint_t> m_ExternalDependencies;
 	std::vector<std::shared_ptr<VulkanBinarySemaphore_t>> m_ExternalBinaryDependencies;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_BufferUses;
 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
 	std::vector<VkDescriptorSet> m_descriptorSets;
 

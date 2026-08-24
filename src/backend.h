@@ -278,9 +278,6 @@ namespace gamescope
     class IBackendFb : public IRcObject
     {
     public:
-        virtual void SetBuffer( wlr_buffer *pClientBuffer ) = 0;
-        virtual void SetReleasePoint( std::shared_ptr<CReleaseTimelinePoint> pReleasePoint ) = 0;
-
         virtual IBackendFb *EnsureImported() = 0;
     };
 
@@ -290,17 +287,7 @@ namespace gamescope
         CBaseBackendFb();
         virtual ~CBaseBackendFb();
 
-        uint32_t IncRef() override;
-        uint32_t DecRef() override;
-
-        void SetBuffer( wlr_buffer *pClientBuffer ) override;
-        void SetReleasePoint( std::shared_ptr<CReleaseTimelinePoint> pReleasePoint ) override;
-
         virtual IBackendFb *EnsureImported() override { return this; };
-
-    private:
-        wlr_buffer *m_pClientBuffer = nullptr;
-        std::shared_ptr<CReleaseTimelinePoint> m_pReleasePoint;
     };
 
     class IBackend

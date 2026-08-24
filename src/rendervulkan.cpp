@@ -34,6 +34,7 @@
 #include "wlr_end.hpp"
 
 #include "rendervulkan.hpp"
+#include "CommitBufferSync.h"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
 #include "frame_generation_config.hpp"
@@ -1663,6 +1664,13 @@ void CVulkanCmdBuffer::AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphor
 	m_ExternalBinaryDependencies.emplace_back( std::move( pSemaphore ) );
 }
 
+void CVulkanCmdBuffer::AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync )
+{
+	if ( !pBufferSync || std::find( m_BufferUses.begin(), m_BufferUses.end(), pBufferSync ) != m_BufferUses.end() )
+		return;
+	m_BufferUses.emplace_back( std::move( pBufferSync ) );
+}
+
 void CVulkanCmdBuffer::AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
 {
 	m_ExternalSignals.emplace_back( std::move( pTimelineSemaphore ), ulPoint );
@@ -1737,6 +1745,7 @@ void CVulkanCmdBuffer::reset()
 
 	m_ExternalDependencies.clear();
 	m_ExternalBinaryDependencies.clear();
+	m_BufferUses.clear();
 	m_ExternalSignals.clear();
 }
 
@@ -4456,6 +4465,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	const uint32_t uOutputRotation = pOutputOverride ? 0u : g_uOutputRotation;
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
+
+	for ( int i = 0; i < frameInfo->layers.count(); i++ )
+		cmdBuffer->AddBufferUse( frameInfo->layers.get( i ).bufferSync );
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
