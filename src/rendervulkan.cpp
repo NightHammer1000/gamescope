@@ -5255,7 +5255,11 @@ namespace
 				// requires this precomposition; HDR requires it even without FSR.
 				// Submit the real result after the midpoint so the earlier deadline
 				// retains first use of the GPU.
-				if ( gamescope::FrameGenerationShouldPrecomposeRealFrame(
+				// Backend-allocated scanout paths always perform a final Vulkan
+				// composition, so they do not alternate KMS plane color state and do
+				// not need a second frame-generation intermediate for the real slot.
+				if ( !GetBackend()->UsesBackendAllocatedScanout() &&
+					 gamescope::FrameGenerationShouldPrecomposeRealFrame(
 						fsrEnabled, hdrOutput, realLayer.tex.get() == rawSource.get() ) )
 				{
 					gamescope::Rc<CVulkanTexture> realScanout = AcquireScanout(
@@ -5395,14 +5399,19 @@ namespace
 				return nullptr;
 
 			CVulkanTexture::createFlags flags;
-			flags.bFlippable = true;
+			// Backend-allocated scanout paths (currently NVIDIA DRM) always
+			// composite into their own final buffer. Keep frame-generation output
+			// device-local there: exporting it and transferring ownership to the
+			// foreign queue family is both unnecessary and breaks the subsequent
+			// Vulkan sampling pass on NVIDIA.
+			flags.bFlippable = !GetBackend()->UsesBackendAllocatedScanout();
 			flags.bSampled = true;
 			flags.bStorage = true;
 			flags.bTransferSrc = true;
 			gamescope::OwningRc<CVulkanTexture> image = new CVulkanTexture;
 			if ( !image->BInit( width, height, 1, drmFormat, flags ) )
 				return nullptr;
-			if ( GetBackend()->IsSessionBased() && !image->GetBackendFb() )
+			if ( flags.bFlippable && GetBackend()->IsSessionBased() && !image->GetBackendFb() )
 				return nullptr;
 			m_scanoutImages.push_back( std::move( image ) );
 			return m_scanoutImages.back();
