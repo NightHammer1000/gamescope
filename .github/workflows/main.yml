@@ -14,13 +14,18 @@ jobs:
         run: |
           pacman-key --init
           pacman -Syu --noconfirm
-          pacman -S --noconfirm git meson clang glslang libcap wlroots0.20 \
-            vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
-            libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
-            xorg-xwayland pipewire cmake \
-            libavif libheif aom rav1e libdecor libxdamage \
-            luajit \
-            catch2 gcovr
+          # Everything we call dependency() on is listed explicitly. Dropping
+          # sdl2 removed libxcursor, libxi, libxxf86vm and libxext along with
+          # it, which we depend on directly and used to get transitively.
+          pacman -S --noconfirm git meson clang glslang cmake \
+            wlroots0.20 wayland wayland-protocols libdrm mesa pixman \
+            vulkan-headers vulkan-icd-loader \
+            libx11 libxcb libxmu libxcomposite libxrender libxres libxtst \
+            libxdamage libxcursor libxi libxext libxfixes libxxf86vm \
+            libxkbcommon libinput libcap libdecor luajit hwdata \
+            libavif libheif aom rav1e \
+            xorg-xwayland pipewire \
+            benchmark catch2 gcovr
       - uses: actions/checkout@v6
         with:
           submodules: true
@@ -40,7 +45,7 @@ jobs:
           meson setup build-coverage -Dinput_emulation=disabled --werror --auto-features=enabled -Db_coverage=true
           meson compile -C build-coverage
           meson test -C build-coverage --suite gamescope -v
-          gcovr -r src -e src/reshade -e src/shaders --xml -o coverage.xml -s build-coverage
+          gcovr -r src -e src/shaders --xml -o coverage.xml -s build-coverage
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:
