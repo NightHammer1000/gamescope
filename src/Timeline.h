@@ -77,6 +77,8 @@ namespace gamescope
         bool Wait( int64_t lTimeout = std::numeric_limits<int64_t>::max() );
 
         std::pair<int32_t, bool> CreateEventFd();
+        std::pair<int32_t, bool> CreateAvailabilityEventFd();
+        bool IsMaterialized() const;
         int32_t CreateSyncFile();
     private:
 

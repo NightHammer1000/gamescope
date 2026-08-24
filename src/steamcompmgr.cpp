@@ -7767,7 +7767,11 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 	// the midpoint's output slot, so let the queued real slot run its single
 	// FSR chain after generated-frame synthesis instead.
 	const std::shared_ptr<gamescope::CAcquireTimelinePoint> &pAcquirePoint = bufferSync->GetAcquirePoint();
-	bool bValidPreemptiveScale = pAcquirePoint && pCurrentFocus &&
+	gamescope::CCommitBufferSync::AcquireStatus acquireStatus = bufferSync->PrepareAcquire();
+	bool bValidPreemptiveScale =
+		acquireStatus != gamescope::CCommitBufferSync::AcquireStatus::Pending &&
+		acquireStatus != gamescope::CCommitBufferSync::AcquireStatus::Failed &&
+		pAcquirePoint && pCurrentFocus &&
 		w == pCurrentFocus->focusWindow && cv_upscale_preemptive &&
 		!steamcompmgr_frame_generation_enabled_for_focus();
 	bool bPreemptiveUpscale = bValidPreemptiveScale && newCommit->ShouldPreemptivelyUpscale();
@@ -7804,7 +7808,8 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 
 			std::unique_ptr<CVulkanCmdBuffer> pCommandBuffer = g_device.commandBuffer();
 			
-			pCommandBuffer->AddDependency( pAcquirePoint->GetTimeline()->ToVkSemaphore(), pAcquirePoint->GetPoint() );
+			if ( !bufferSync->UsesSyncFileInterop() || bufferSync->IsAcquireFallback() )
+				pCommandBuffer->AddDependency( pAcquirePoint->GetTimeline()->ToVkSemaphore(), pAcquirePoint->GetPoint() );
 			pCommandBuffer->AddSignal( pTempImage->pReleaseTimeline->ToVkSemaphore(), ulNextReleasePoint );
 
 			static std::optional<uint64_t> s_ulLastPreemptiveUpscaleSeqNo;
@@ -7852,7 +7857,27 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 			ClearUpscaleImages();
 		}
 
-		if ( pAcquirePoint )
+		if ( acquireStatus == gamescope::CCommitBufferSync::AcquireStatus::Ready )
+		{
+			bKnownReady = true;
+		}
+		else if ( acquireStatus == gamescope::CCommitBufferSync::AcquireStatus::Pending )
+		{
+			eventFd = bufferSync->CreateAcquireAvailabilityEvent();
+			if ( eventFd == gamescope::CAcquireTimelinePoint::k_InvalidEvent )
+			{
+				bufferSync->UseAcquireFallback();
+				eventFd = bufferSync->DuplicateBaselineWaitFd();
+			}
+			bKnownReady = eventFd.second;
+		}
+		else if ( acquireStatus == gamescope::CCommitBufferSync::AcquireStatus::Failed )
+		{
+			bufferSync->UseAcquireFallback();
+			eventFd = bufferSync->DuplicateBaselineWaitFd();
+			bKnownReady = eventFd.second;
+		}
+		else if ( pAcquirePoint )
 		{
 			eventFd = pAcquirePoint->CreateEventFd();
 		}
@@ -7863,7 +7888,7 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		fence = eventFd.first;
 		bKnownReady = eventFd.second;
 	}
-	else
+	else if ( !bKnownReady )
 	{
 		struct wlr_dmabuf_attributes dmabuf = {0};
 		if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )

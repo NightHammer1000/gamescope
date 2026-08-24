@@ -2,6 +2,7 @@
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "commit.h"
+#include "CommitBufferSync.h"
 
 #include "gpuvis_trace_utils.h"
 
@@ -56,6 +57,26 @@ void commit_t::OnPollIn()
         std::unique_lock lock( m_WaitableCommitStateMutex );
         if ( !CloseFenceInternal() )
             return;
+    }
+
+    if ( bufferSync && bufferSync->UsesSyncFileInterop() && !bufferSync->IsAcquireFallback() )
+    {
+        std::pair<int32_t, bool> nextEvent = gamescope::CAcquireTimelinePoint::k_InvalidEvent;
+        const gamescope::CCommitBufferSync::AcquireStatus status = bufferSync->PrepareAcquire();
+        if ( status == gamescope::CCommitBufferSync::AcquireStatus::Pending )
+            nextEvent = bufferSync->CreateAcquireAvailabilityEvent();
+        else if ( status == gamescope::CCommitBufferSync::AcquireStatus::Failed )
+        {
+            bufferSync->UseAcquireFallback();
+            nextEvent = bufferSync->DuplicateBaselineWaitFd();
+        }
+
+        if ( nextEvent.first >= 0 && !nextEvent.second )
+        {
+            SetFence( nextEvent.first, m_bMangoNudge, m_pDoneCommits );
+            g_ImageWaiter.AddWaitable( this );
+            return;
+        }
     }
 
     Signal();

@@ -1107,7 +1107,7 @@ public:
 
 	void AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 	void AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore );
-	void AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync );
+	bool AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync );
 	void AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 
 	const std::vector<VulkanTimelinePoint_t> &GetExternalDependencies() const { return m_ExternalDependencies; }

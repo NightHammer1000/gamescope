@@ -220,6 +220,50 @@ namespace gamescope
         }
     }
 
+    template <TimelinePointType Type>
+    bool CTimelinePoint<Type>::IsMaterialized() const
+    {
+        if constexpr ( Type != TimelinePointType::Acquire )
+            return false;
+
+        uint32_t uHandle = m_pTimeline->GetSyncobjHandle();
+        uint64_t ulPoint = m_ulPoint;
+        return drmSyncobjTimelineWait( m_pTimeline->GetDrmRenderFD(), &uHandle, &ulPoint, 1, 0,
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, nullptr ) == 0;
+    }
+
+    template <TimelinePointType Type>
+    std::pair<int32_t, bool> CTimelinePoint<Type>::CreateAvailabilityEventFd()
+    {
+        if constexpr ( Type != TimelinePointType::Acquire )
+            return k_InvalidEvent;
+
+        if ( IsMaterialized() )
+            return k_AlreadySignalledEvent;
+
+        const int32_t nEventFd = eventfd( 0, EFD_CLOEXEC );
+        if ( nEventFd < 0 )
+        {
+            s_TimelineLog.errorf_errno( "Failed to create availability eventfd" );
+            return k_InvalidEvent;
+        }
+
+        drm_syncobj_eventfd event = {
+            .handle = m_pTimeline->GetSyncobjHandle(),
+            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+            .point = m_ulPoint,
+            .fd = nEventFd,
+        };
+        if ( drmIoctl( m_pTimeline->GetDrmRenderFD(), DRM_IOCTL_SYNCOBJ_EVENTFD, &event ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "DRM_IOCTL_SYNCOBJ_EVENTFD availability failed" );
+            close( nEventFd );
+            return k_InvalidEvent;
+        }
+
+        return { nEventFd, false };
+    }
+
     template class CTimelinePoint<TimelinePointType::Acquire>;
     template class CTimelinePoint<TimelinePointType::Release>;
 

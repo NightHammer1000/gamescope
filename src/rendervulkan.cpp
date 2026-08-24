@@ -1664,11 +1664,20 @@ void CVulkanCmdBuffer::AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphor
 	m_ExternalBinaryDependencies.emplace_back( std::move( pSemaphore ) );
 }
 
-void CVulkanCmdBuffer::AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync )
+bool CVulkanCmdBuffer::AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync )
 {
 	if ( !pBufferSync || std::find( m_BufferUses.begin(), m_BufferUses.end(), pBufferSync ) != m_BufferUses.end() )
-		return;
+		return true;
+
+	if ( pBufferSync->UsesSyncFileInterop() && !pBufferSync->IsAcquireFallback() )
+	{
+		std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore = m_device->ImportSyncFile( pBufferSync->DuplicateAcquireSyncFile() );
+		if ( !pSemaphore )
+			return false;
+		AddBinaryDependency( std::move( pSemaphore ) );
+	}
 	m_BufferUses.emplace_back( std::move( pBufferSync ) );
+	return true;
 }
 
 void CVulkanCmdBuffer::AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
@@ -4467,7 +4476,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 
 	for ( int i = 0; i < frameInfo->layers.count(); i++ )
-		cmdBuffer->AddBufferUse( frameInfo->layers.get( i ).bufferSync );
+	{
+		if ( !cmdBuffer->AddBufferUse( frameInfo->layers.get( i ).bufferSync ) )
+			return std::nullopt;
+	}
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);

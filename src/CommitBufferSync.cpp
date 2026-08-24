@@ -1,5 +1,6 @@
 #include "CommitBufferSync.h"
 
+#include "DmabufSync.h"
 #include "wlserver.hpp"
 
 #include "wlr_begin.hpp"
@@ -23,6 +24,7 @@ namespace gamescope
             return;
 
         m_bDmabuf = true;
+        m_bSyncFileInterop = DmabufSyncFileSupported();
 
         m_DmabufFds.reserve( dmabuf.n_planes );
         for ( int i = 0; i < dmabuf.n_planes; i++ )
@@ -36,6 +38,9 @@ namespace gamescope
 
     CCommitBufferSync::~CCommitBufferSync()
     {
+        if ( m_nAcquireSyncFile >= 0 )
+            close( m_nAcquireSyncFile );
+
         for ( int fd : m_DmabufFds )
             close( fd );
         m_DmabufFds.clear();
@@ -51,5 +56,45 @@ namespace gamescope
             wlserver_unlock();
             m_pBuffer = nullptr;
         }
+    }
+
+    CCommitBufferSync::AcquireStatus CCommitBufferSync::PrepareAcquire()
+    {
+        if ( !UsesSyncFileInterop() || m_bAcquireFallback )
+            return AcquireStatus::Baseline;
+        if ( m_nAcquireSyncFile >= 0 )
+            return AcquireStatus::Ready;
+
+        if ( m_pAcquirePoint )
+        {
+            if ( !m_pAcquirePoint->IsMaterialized() )
+                return AcquireStatus::Pending;
+            m_nAcquireSyncFile = m_pAcquirePoint->CreateSyncFile();
+        }
+        else if ( !m_DmabufFds.empty() )
+        {
+            m_nAcquireSyncFile = ExportDmabufSyncFile( m_DmabufFds.front(), DmabufAccess::Read );
+        }
+
+        return m_nAcquireSyncFile >= 0 ? AcquireStatus::Ready : AcquireStatus::Failed;
+    }
+
+    std::pair<int32_t, bool> CCommitBufferSync::CreateAcquireAvailabilityEvent() const
+    {
+        if ( !m_pAcquirePoint )
+            return CAcquireTimelinePoint::k_InvalidEvent;
+        return m_pAcquirePoint->CreateAvailabilityEventFd();
+    }
+
+    int CCommitBufferSync::DuplicateAcquireSyncFile() const
+    {
+        return m_nAcquireSyncFile >= 0 ? dup( m_nAcquireSyncFile ) : -1;
+    }
+
+    std::pair<int32_t, bool> CCommitBufferSync::DuplicateBaselineWaitFd() const
+    {
+        if ( m_pAcquirePoint )
+            return m_pAcquirePoint->CreateEventFd();
+        return { !m_DmabufFds.empty() ? dup( m_DmabufFds.front() ) : -1, false };
     }
 }

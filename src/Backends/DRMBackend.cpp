@@ -2717,7 +2717,15 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			}
 
 			int nFence = cv_drm_debug_disable_in_fence_fd ? -1 : g_nAlwaysSignalledSyncFile;
-			if ( !cv_drm_debug_disable_in_fence_fd && pLayer->acquirePoint )
+			if ( !cv_drm_debug_disable_in_fence_fd && pLayer->bufferSync &&
+				pLayer->bufferSync->UsesSyncFileInterop() && !pLayer->bufferSync->IsAcquireFallback() )
+			{
+				nFence = pLayer->bufferSync->DuplicateAcquireSyncFile();
+				if ( nFence < 0 )
+					return -EINVAL;
+				drm->m_InFenceFdsInRequest.push_back( nFence );
+			}
+			else if ( !cv_drm_debug_disable_in_fence_fd && pLayer->acquirePoint )
 			{
 				nFence = pLayer->acquirePoint->CreateSyncFile();
 				if ( nFence >= 0 )
