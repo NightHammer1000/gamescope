@@ -115,7 +115,7 @@ namespace gamescope
 
                 if ( s_bRun )
                 {
-                    s_ReaperLog.infof( "Parent of gamescopereaper was killed. Killing children." );
+                    s_ReaperLog.infof( "Parent of telescopereaper was killed. Killing children." );
 
                     s_bRun = false;
                     Process::KillAllChildren( getpid(), SIGTERM );

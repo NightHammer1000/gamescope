@@ -459,7 +459,7 @@ namespace gamescope::Process
     pid_t SpawnProcessInWatchdog( char **argv, bool bRespawn, std::function<void()> fnPreambleInChild )
     {
         std::vector<char *> args;
-        args.push_back( (char *)"gamescopereaper" );
+        args.push_back( (char *)"telescopereaper" );
         if ( bRespawn )
             args.push_back( (char *)"--respawn" );
         args.push_back( (char *)"--" );

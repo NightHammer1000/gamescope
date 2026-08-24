@@ -10,7 +10,7 @@ But it seems this whole topic is a bit of a philosophical minefield, left over f
 
 So here is Telescope. A DRM-backend-focused gamescope fork whose only goal is to give you a working gamemode, no matter what hardware, no matter what philosophical stance is out there.
 
-It coexists with gamescope fine. It ships its own `telescope-session`. Use gamescope for desktop or VR, and Telescope for gamemode.
+It coexists with gamescope fine — nothing it installs shares a path with upstream. Binaries are `telescope`, `telescopectl`, `telescopereaper`, `telescopestream`, `telescope-type`; data lives in `/usr/share/telescope`, config in `/etc/telescope` and `~/.config/telescope`, and the WSI layer is `VK_LAYER_FROG_telescope_wsi` with its own `ENABLE_TELESCOPE_WSI` gate so it never hooks gamescope's clients. Use gamescope for desktop or VR, and Telescope for gamemode.
 
 I only care about one thing. Does it work? Is it clean code? Then it is in. And once it is fixed in the right place — the driver — it comes back out again.
 
@@ -34,7 +34,38 @@ The fork builds clean and its unit tests pass, but nothing here has been exercis
 
 * **NVIDIA: modesets take the link fully down, settle, then bring it back up** as a separate commit, instead of zeroing and refilling `CRTC_ID` / `ACTIVE` / `MODE_ID` in one atomic request.
 
-  Set `drm_modeset_link_down=1` to force this on **any** driver. It is also a workaround for sinks with unreliable HDMI 2.1 link training — some AV receivers only negotiate VRR correctly once the link has actually dropped, which has nothing to do with the GPU. `drm_modeset_link_down=0` disables it, and `drm_modeset_link_down_settle_ms` tunes the wait.
+  We have no guarantee how a driver sequences a disable-and-refill in a single request, and on NVIDIA the link appears never to actually drop — so it never retrains, and that is the corruption. This is also useful well beyond NVIDIA; see below.
+
+## Making badly-behaved displays work
+
+Plenty of sinks negotiate HDMI badly. AV receivers are the worst offenders, cheap TVs are close behind, and none of it is the GPU's fault — the display simply will not retrain its link properly unless you make it.
+
+Telescope can force a real link drop on any driver, not just where a driver quirk applies:
+
+| symptom | try |
+|---|---|
+| VRR never engages, or flickers, through an AV receiver | `drm_modeset_link_down=1` |
+| Corruption or no signal after changing resolution or toggling HDR | `drm_modeset_link_down=1` |
+| It helps, but not every time | raise `drm_modeset_link_down_settle_ms` |
+| It works and you want the black screen shorter | lower `drm_modeset_link_down_settle_ms` |
+
+Set them persistently in a Lua file — any `.lua` under `~/.config/telescope/scripts`:
+
+```lua
+-- ~/.config/telescope/scripts/my_receiver.lua
+gamescope.convars.drm_modeset_link_down.value = 1
+gamescope.convars.drm_modeset_link_down_settle_ms.value = 1000
+```
+
+Or against a running session, to try a value without restarting:
+
+```sh
+telescopectl drm_modeset_link_down 1
+```
+
+`drm_modeset_link_down` is `-1` by default, meaning "on where the driver is known to need it". `0` disables it everywhere, `1` forces it everywhere. The settle defaults to 1000ms; that number came from the experiment that found the workaround, not from measuring how long a link actually needs, so it is worth tuning down.
+
+> The Lua namespace really is `gamescope.*`, not `telescope.*`. It is kept as-is so existing gamescope display-quirk scripts work unchanged.
 
 ## Currently included additional features
 
@@ -96,6 +127,7 @@ apt install meson ninja-build pkg-config cmake libpipewire-0.3-dev hwdata libx11
 git submodule update --init
 meson setup build/
 ninja -C build/
+build/src/telescope -- <game>
 ```
 
 Install:

@@ -38,7 +38,7 @@
 
 static LogScope s_StreamLog( "stream" );
  
-void spa_gamescopestream_log( struct spa_debug_context *ctx, const char *fmt, ... )
+void spa_telescopestream_log( struct spa_debug_context *ctx, const char *fmt, ... )
 {
     va_list args;
     va_start( args, fmt );
@@ -48,7 +48,7 @@ void spa_gamescopestream_log( struct spa_debug_context *ctx, const char *fmt, ..
 
 struct spa_debug_context s_SpaDebugContext =
 {
-    .log = spa_gamescopestream_log,
+    .log = spa_telescopestream_log,
 };
 
 struct pw_version {
@@ -553,7 +553,7 @@ int main(int argc, char *argv[])
     data.pSurface = wl_compositor_create_surface( data.pCompositor );
     data.pFrame = libdecor_decorate( data.pDecor, data.pSurface, &s_LibDecorFrameInterface, &data );
     libdecor_frame_set_title( data.pFrame, "Gamescope Pipewire Stream" );
-    libdecor_frame_set_app_id( data.pFrame, "gamescopestream" );
+    libdecor_frame_set_app_id( data.pFrame, "telescopestream" );
     libdecor_frame_map( data.pFrame );
     wl_surface_commit( data.pSurface );
     wl_display_roundtrip( data.pDisplay );

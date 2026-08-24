@@ -109,7 +109,7 @@ namespace gamescope
 
     void CScriptManager::RunDefaultScripts()
     {
-        const char *sScriptPathEnv = getenv("GAMESCOPE_SCRIPT_PATH");
+        const char *sScriptPathEnv = getenv("TELESCOPE_SCRIPT_PATH");
 
         if ( cv_script_use_local_scripts )
         {
@@ -126,12 +126,12 @@ namespace gamescope
         else
         {
             RunFolder( SCRIPT_DIR, true );
-            RunFolder( "/etc/gamescope/scripts", true );
+            RunFolder( "/etc/telescope/scripts", true );
         }
 
         if ( cv_script_use_user_scripts )
         {
-            std::string sUserConfigs = std::string{ GetConfigDir() } + "/gamescope/scripts";
+            std::string sUserConfigs = std::string{ GetConfigDir() } + "/telescope/scripts";
             RunFolder( sUserConfigs, true );
         }
     }

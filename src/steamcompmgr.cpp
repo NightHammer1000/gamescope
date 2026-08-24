@@ -8434,7 +8434,7 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
 
 		unsetenv( "ENABLE_VKBASALT" );
 		// Enable Gamescope WSI by default for nested.
-		setenv( "ENABLE_GAMESCOPE_WSI", "1", 0 );
+		setenv( "ENABLE_TELESCOPE_WSI", "1", 0 );
 
 		// Unset this to avoid it leaking to Proton apps, etc.
 		unsetenv( "SDL_VIDEODRIVER" );
