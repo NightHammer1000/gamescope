@@ -19,7 +19,6 @@
 #include "WaylandServer/WaylandResource.h"
 #include "WaylandServer/WaylandProtocol.h"
 #include "WaylandServer/LinuxDrmSyncobj.h"
-#include "WaylandServer/Reshade.h"
 #include "WaylandServer/GamescopeActionBinding.h"
 
 #include "wlr_begin.hpp"
@@ -1399,7 +1398,6 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 	});
 
 	// Send feature support
-	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_RESHADE_SHADERS, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_DISPLAY_INFO, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_PIXEL_FILTER, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_REFRESH_CYCLE_ONLY_CHANGE_REFRESH_RATE, 1, 0 );
@@ -1471,11 +1469,6 @@ static void create_gamescope_private( void )
 static void create_explicit_sync()
 {
 	new gamescope::WaylandServer::CLinuxDrmSyncobj( wlserver.display );
-}
-
-static void create_reshade()
-{
-	new gamescope::WaylandServer::CReshade( wlserver.display );
 }
 
 
@@ -2074,8 +2067,6 @@ bool wlserver_init( void ) {
 	wl_signal_add( &wlserver.wlr.compositor->events.new_surface, &new_surface_listener );
 
 	create_ime_manager( &wlserver );
-
-	create_reshade();
 
 	new gamescope::WaylandServer::CGamescopeActionBindingProtocol( wlserver.display );
 

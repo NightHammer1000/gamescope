@@ -40,8 +40,6 @@
 #include "pipewire.hpp"
 #endif
 
-#include <wayland-client.h>
-
 using namespace std::literals;
 
 EStreamColorspace g_ForcedNV12ColorSpace = k_EStreamColorspace_Unknown;
@@ -50,7 +48,6 @@ extern gamescope::ConVar<bool> cv_shutdown_on_primary_child_death;
 
 const char *gamescope_optstring = nullptr;
 const char *g_pOriginalDisplay = nullptr;
-const char *g_pOriginalWaylandDisplay = nullptr;
 
 bool g_bAllowDeferredBackend = false;
 
@@ -95,25 +92,6 @@ const struct option *gamescope_options = (struct option[]){
 	{ "immediate-flips", no_argument, nullptr, 0 },
 	{ "framerate-limit", required_argument, nullptr, 0 },
 
-	// openvr options
-#if HAVE_OPENVR
-	{ "vr-overlay-key", required_argument, nullptr, 0 },
-	{ "vr-app-overlay-key", required_argument, nullptr, 0 },
-	{ "vr-overlay-explicit-name", required_argument, nullptr, 0 },
-	{ "vr-overlay-default-name", required_argument, nullptr, 0 },
-	{ "vr-overlay-icon", required_argument, nullptr, 0 },
-	{ "vr-overlay-show-immediately", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-control-bar", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-control-bar-keyboard", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-control-bar-close", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-click-stabilization", no_argument, nullptr, 0 },
-	{ "vr-overlay-modal", no_argument, nullptr, 0 },
-	{ "vr-overlay-physical-width", required_argument, nullptr, 0 },
-	{ "vr-overlay-physical-curvature", required_argument, nullptr, 0 },
-	{ "vr-overlay-physical-pre-curve-pitch", required_argument, nullptr, 0 },
-	{ "vr-scroll-speed", required_argument, nullptr, 0 },
-	{ "vr-session-manager", no_argument, nullptr, 0 },
-#endif
 
 	// wlserver options
 	{ "xwayland-count", required_argument, nullptr, 0 },
@@ -151,9 +129,6 @@ const struct option *gamescope_options = (struct option[]){
 	{ "hdr-debug-force-output", no_argument, nullptr, 0 },
 	{ "hdr-debug-heatmap", no_argument, nullptr, 0 },
 
-	{ "reshade-effect", required_argument, nullptr, 0 },
-	{ "reshade-technique-idx", required_argument, nullptr, 0 },
-
 	// Steam Deck options
 	{ "mura-map", required_argument, nullptr, 0 },
 
@@ -186,14 +161,7 @@ const char usage[] =
 #if HAVE_DRM
 	"                                     drm => use DRM backend (standalone display session)\n"
 #endif
-#if HAVE_SDL2
-	"                                     sdl => use SDL backend\n"
-#endif
-#if HAVE_OPENVR
-	"                                     openvr => use OpenVR backend (outputs as a VR overlay)\n"
-#endif
 	"                                     headless => use headless backend (no window, no DRM output)\n"
-	"                                     wayland => use Wayland backend\n"
 	"  --cursor                       path to default cursor image\n"
 	"  -R, --ready-fd                 notify FD when ready\n"
 	"  --rt                           Use realtime scheduling\n"
@@ -234,25 +202,6 @@ const char usage[] =
 	"  --generate-drm-mode            DRM mode generation algorithm (cvt, fixed)\n"
 	"  --immediate-flips              Enable immediate flips, may result in tearing\n"
 	"\n"
-#if HAVE_OPENVR
-	"VR mode options:\n"
-	"  --vr-overlay-key                         Sets the SteamVR overlay key to this string\n"
-	"  --vr-app-overlay-key						Sets the SteamVR overlay key to use for child apps\n"
-	"  --vr-overlay-explicit-name               Force the SteamVR overlay name to always be this string\n"
-	"  --vr-overlay-default-name                Sets the fallback SteamVR overlay name when there is no window title\n"
-	"  --vr-overlay-icon                        Sets the SteamVR overlay icon to this file\n"
-	"  --vr-overlay-show-immediately            Makes our VR overlay take focus immediately\n"
-	"  --vr-overlay-enable-control-bar          Enables the SteamVR control bar\n"
-	"  --vr-overlay-enable-control-bar-keyboard Enables the SteamVR keyboard button on the control bar\n"
-	"  --vr-overlay-enable-control-bar-close    Enables the SteamVR close button on the control bar\n"
-	"  --vr-overlay-enable-click-stabilization  Enables the SteamVR click stabilization\n"
-	"  --vr-overlay-modal                       Makes our VR overlay appear as a modal\n"
-	"  --vr-overlay-physical-width              Sets the physical width of our VR overlay in metres\n"
-	"  --vr-overlay-physical-curvature          Sets the curvature of our VR overlay\n"
-	"  --vr-overlay-physical-pre-curve-pitch    Sets the pre-curve pitch of our VR overlay\n"
-	"  --vr-scrolls-speed                       Mouse scrolling speed of trackpad scroll in VR. Default: 8.0\n"
-	"\n"
-#endif
 	"Debug options:\n"
 	"  --disable-layers               disable libliftoff (hardware planes)\n"
 	"  --debug-layers                 debug libliftoff\n"
@@ -267,10 +216,6 @@ const char usage[] =
 	"  --hdr-debug-force-support      forces support for HDR, etc even if the display doesn't support it. HDR clients will be outputted as SDR still in that case.\n"
 	"  --hdr-debug-force-output       forces support and output to HDR10 PQ even if the output does not support it (will look very wrong if it doesn't)\n"
 	"  --hdr-debug-heatmap            displays a heatmap-style debug view of HDR luminence across the scene in nits."
-	"\n"
-	"Reshade shader options:\n"
-	"  --reshade-effect               sets the name of a reshade shader to use in either /usr/share/gamescope/reshade/Shaders or ~/.local/share/gamescope/reshade/Shaders\n"
-	"  --reshade-technique-idx        sets technique idx to use from the reshade effect\n"
 	"\n"
 	"Steam Deck options:\n"
 	"  --mura-map                     Set the mura compensation map to use for the display. Takes in a path to the mura map.\n"
@@ -432,18 +377,8 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
 	} else if (strcmp(str, "drm") == 0) {
 		return gamescope::GamescopeBackend::DRM;
 #endif
-#if HAVE_SDL2
-	} else if (strcmp(str, "sdl") == 0) {
-		return gamescope::GamescopeBackend::SDL;
-#endif
-#if HAVE_OPENVR
-	} else if (strcmp(str, "openvr") == 0) {
-		return gamescope::GamescopeBackend::OpenVR;
-#endif
 	} else if (strcmp(str, "headless") == 0) {
 		return gamescope::GamescopeBackend::Headless;
-	} else if (strcmp(str, "wayland") == 0) {
-		return gamescope::GamescopeBackend::Wayland;
 	} else {
 		fprintf( stderr, "gamescope: invalid value for --backend\n" );
 		exit(1);
@@ -452,12 +387,9 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
 
 static enum gamescope::GamescopeBackend auto_select_backend()
 {
-	if ( getenv( "WAYLAND_DISPLAY" ) != NULL )
-		return gamescope::GamescopeBackend::Wayland;
-	else if ( getenv( "DISPLAY" ) != NULL )
-		return gamescope::GamescopeBackend::SDL;
-	else
-		return gamescope::GamescopeBackend::DRM;
+	// Telescope is a DRM session compositor. There is no nested fallback by design;
+	// ask for "headless" explicitly if you want a display-less run.
+	return gamescope::GamescopeBackend::DRM;
 }
 
 static int parse_integer(const char *str, const char *optionName)
@@ -543,38 +475,6 @@ static EStreamColorspace parse_colorspace_string( const char *pszStr )
 
 
 
-
-static bool g_bSupportsWaylandPresentationTime = false;
-static constexpr wl_registry_listener s_registryListener = {
-    .global = [](void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
-        if (interface == "wp_presentation"sv)
-            g_bSupportsWaylandPresentationTime = true;
-    },
-
-    .global_remove = [](void* data, wl_registry* registry, uint32_t name) {
-    },
-};
-
-static bool CheckWaylandPresentationTime()
-{
-	wl_display *display = wl_display_connect(g_pOriginalWaylandDisplay);
-	if (!display) {
-		fprintf(stderr, "Failed to connect to wayland socket: %s.\n", g_pOriginalWaylandDisplay);
-        exit(1);
-        return false;
-	}
-	wl_registry *registry = wl_display_get_registry(display);
-
-    wl_registry_add_listener(registry, &s_registryListener, nullptr);
-
-	wl_display_dispatch(display);
-	wl_display_roundtrip(display);
-
-	wl_registry_destroy(registry);
-	wl_display_disconnect(display);
-
-    return g_bSupportsWaylandPresentationTime;
-}
 
 #if 0
 static bool IsInDebugSession()
@@ -671,7 +571,7 @@ static void UpdateCompatEnvVars()
 	// Legacy support for SteamOS.
 	setenv( "XWAYLAND_FORCE_ENABLE_EXTRA_MODES", "1", 1 );
 
-	// Don't minimise stuff on focus loss with SDL.
+	// Don't minimise stuff on focus loss for SDL games running under us.
 	setenv( "SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0", 1 );
 
 	const char *pszMangoConfigPath = getenv( "MANGOHUD_CONFIGFILE" );
@@ -866,13 +766,9 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// Steam preloads its overlay into us, but only the SDL backend can draw it.
+	// Steam preloads its overlay into us, but no backend we ship can draw it.
 	// A ConVar or script override comes too late to unload it.
-	gamescope::GamescopeBackend eLaunchBackend = eCurrentBackend;
-	if ( eLaunchBackend == gamescope::GamescopeBackend::Auto )
-		eLaunchBackend = auto_select_backend();
-	if ( eLaunchBackend != gamescope::GamescopeBackend::SDL )
-		gamescope::Process::RestartWithoutSteamOverlay( argv );
+	gamescope::Process::RestartWithoutSteamOverlay( argv );
 
 	// Print this after the re-exec, so we only announce ourselves once.
 	gamescope::PrintVersion();
@@ -937,8 +833,6 @@ int main(int argc, char **argv)
 	g_mainThread = pthread_self();
 
 	g_pOriginalDisplay = getenv("DISPLAY");
-	g_pOriginalWaylandDisplay = getenv("WAYLAND_DISPLAY");
-
 	// Allow overriding the selected backend (even the backend
 	// requested on the command line) in a startup script.
 	auto backendOverride = parse_backend_name( gamescope::cv_backend.Get().c_str() );
@@ -952,25 +846,6 @@ int main(int argc, char **argv)
 		eCurrentBackend = auto_select_backend();
 	}
 
-	if ( g_pOriginalWaylandDisplay != NULL )
-	{
-        if (CheckWaylandPresentationTime())
-        {
-            // Default to SDL_VIDEODRIVER wayland under Wayland and force enable vk_khr_present_wait
-            // (not enabled by default in Mesa because instance does not know if Wayland
-            //  compositor supports wp_presentation, but we can check that ourselves.)
-            setenv("vk_khr_present_wait", "true", 0);
-            setenv("SDL_VIDEODRIVER", "wayland", 0);
-        }
-        else
-        {
-            fprintf(stderr,
-                "Your Wayland compositor does NOT support wp_presentation/presentation-time which is required for VK_KHR_present_wait and VK_KHR_present_id.\n"
-                "Please complain to your compositor vendor for support. Falling back to X11 window with less accurate present wait.\n");
-            setenv("SDL_VIDEODRIVER", "x11", 1);
-        }
-	}
-
 	g_ForcedNV12ColorSpace = parse_colorspace_string( getenv( "GAMESCOPE_NV12_COLORSPACE" ) );
 
 	switch ( eCurrentBackend )
@@ -980,27 +855,10 @@ int main(int argc, char **argv)
 			gamescope::IBackend::Set<gamescope::CDRMBackend>();
 			break;
 #endif
-#if HAVE_SDL2
-		case gamescope::GamescopeBackend::SDL:
-			gamescope::IBackend::Set<gamescope::CSDLBackend>();
-			break;
-#endif
-#if HAVE_OPENVR
-		case gamescope::GamescopeBackend::OpenVR:
-			gamescope::IBackend::Set<gamescope::COpenVRBackend>();
-			break;
-#endif
 		case gamescope::GamescopeBackend::Headless:
 			gamescope::IBackend::Set<gamescope::CHeadlessBackend>();
 			break;
 
-		case gamescope::GamescopeBackend::Wayland:
-			gamescope::IBackend::Set<gamescope::CWaylandBackend>();
-#if HAVE_SDL2
-			if ( !GetBackend() )
-				gamescope::IBackend::Set<gamescope::CSDLBackend>();
-#endif
-			break;
 		default:
 			abort();
 	}

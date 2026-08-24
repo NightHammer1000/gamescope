@@ -94,7 +94,6 @@
 #include "Script/Script.h"
 #include "refresh_rate.h"
 #include "commit.h"
-#include "reshade_effect_manager.hpp"
 #include "BufferMemo.h"
 #include "Utils/Process.h"
 #include "Utils/Algorithm.h"
@@ -171,9 +170,6 @@ static std::shared_ptr<gamescope::BackendBlob> s_scRGB709To2020Matrix;
 std::string clipboard;
 std::string primarySelection;
 
-std::string g_reshade_effect{};
-extern ReshadeEffectPipeline *g_pLastReshadeEffect;
-uint32_t g_reshade_technique_idx = 0;
 
 bool g_bSteamIsActiveWindow = false;
 bool g_bForceInternal = false;
@@ -5904,17 +5900,6 @@ void gamescope_set_selection(std::string contents, GamescopeSelection eSelection
 	}
 }
 
-void gamescope_set_reshade_effect(std::string effect_path)
-{
-	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server(0);
-	set_string_prop(server->ctx.get(), server->ctx->atoms.gamescopeReshadeEffect, effect_path);
-}
-
-void gamescope_clear_reshade_effect() {
-	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server(0);
-	clear_prop(server->ctx.get(), server->ctx->atoms.gamescopeReshadeEffect);
-}
-
 static void
 handle_selection_request(xwayland_ctx_t *ctx, XSelectionRequestEvent *ev)
 {
@@ -6953,16 +6938,6 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 
 			MakeFocusDirty();
 		}
-	}
-	if (ev->atom == ctx->atoms.gamescopeReshadeTechniqueIdx)
-	{
-		uint32_t technique_idx = get_prop(ctx, ctx->root, ctx->atoms.gamescopeReshadeTechniqueIdx, 0);
-		g_reshade_technique_idx = technique_idx;
-	}
-	if (ev->atom == ctx->atoms.gamescopeReshadeEffect)
-	{
-		std::string path = get_string_prop( ctx, ctx->root, ctx->atoms.gamescopeReshadeEffect );
-		g_reshade_effect = path;
 	}
 	if (ev->atom == ctx->atoms.gamescopeDisplayDynamicRefreshBasedOnGamePresence)
 	{
@@ -8228,8 +8203,6 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeCreateXWaylandServerFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_CREATE_XWAYLAND_SERVER_FEEDBACK", false );
 	ctx->atoms.gamescopeDestroyXWaylandServer = XInternAtom( ctx->dpy, "GAMESCOPE_DESTROY_XWAYLAND_SERVER", false );
 
-	ctx->atoms.gamescopeReshadeEffect = XInternAtom( ctx->dpy, "GAMESCOPE_RESHADE_EFFECT", false );
-	ctx->atoms.gamescopeReshadeTechniqueIdx = XInternAtom( ctx->dpy, "GAMESCOPE_RESHADE_TECHNIQUE_IDX", false );
 
 	ctx->atoms.gamescopeDisplayRefreshRateFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK", false );
 	ctx->atoms.gamescopeDisplayDynamicRefreshBasedOnGamePresence = XInternAtom( ctx->dpy, "GAMESCOPE_DISPLAY_DYNAMIC_REFRESH_BASED_ON_GAME_PRESENCE", false );
@@ -8647,10 +8620,6 @@ steamcompmgr_main(int argc, char **argv)
 					g_flHDRItmTargetNits = atof(optarg);
 				} else if (strcmp(opt_name, "framerate-limit") == 0) {
 					g_nSteamCompMgrTargetFPS = atoi(optarg);
-				} else if (strcmp(opt_name, "reshade-effect") == 0) {
-					g_reshade_effect = optarg;
-				} else if (strcmp(opt_name, "reshade-technique-idx") == 0) {
-					g_reshade_technique_idx = atoi(optarg);
 				} else if (strcmp(opt_name, "mura-map") == 0) {
 					set_mura_overlay(optarg);
 				}

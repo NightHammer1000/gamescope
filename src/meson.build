@@ -20,7 +20,6 @@ xkbcommon = dependency('xkbcommon')
 thread_dep = dependency('threads')
 cap_dep = dependency('libcap', required: get_option('rt_cap'))
 epoll_dep = dependency('epoll-shim', required: false)
-sdl2_dep = dependency('SDL2', required: get_option('sdl2_backend'))
 avif_dep = dependency('libavif', version: '>=1.0.0', required: get_option('avif_screenshots'))
 pixman_dep = dependency('pixman-1')
 udev_dep = dependency('libudev')
@@ -75,29 +74,12 @@ shader_src = [
 
 spirv_shaders = glsl_generator.process(shader_src)
 
-reshade_src = [
-  'reshade/source/effect_codegen_spirv.cpp',
-  'reshade/source/effect_expression.cpp',
-  'reshade/source/effect_lexer.cpp',
-  'reshade/source/effect_parser_exp.cpp',
-  'reshade/source/effect_parser_stmt.cpp',
-  'reshade/source/effect_preprocessor.cpp',
-  'reshade/source/effect_symbol_table.cpp',
-]
-
-reshade_include = include_directories([
-  'reshade/source',
-  'reshade/include',
-  '../thirdparty/SPIRV-Headers/include/spirv/unified1'
-])
-
 sol2_include = include_directories(['../thirdparty'])
 
 required_wlroots_features = ['xwayland']
 
 src = [
   'Backends/HeadlessBackend.cpp',
-  'Backends/WaylandBackend.cpp',
   'Utils/DirHelpers.cpp',
   'Utils/TempFiles.cpp',
   'Utils/Version.cpp',
@@ -118,7 +100,6 @@ src = [
   'ime.cpp',
   'mangoapp.cpp',
   'Timeline.cpp',
-  'reshade_effect_manager.cpp',
   'backend.cpp',
   'x11cursor.cpp',
   'InputEmulation.cpp',
@@ -144,13 +125,8 @@ else
   liftoff_dep = dependency('', required: false)
 endif
 
-if sdl2_dep.found()
-  src += 'Backends/SDLBackend.cpp'
-endif
-
 gamescope_cpp_args += '-DHAVE_DRM=@0@'.format(drm_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_GBM=@0@'.format((drm_dep.found() and gbm_dep.found()).to_int())
-gamescope_cpp_args += '-DHAVE_SDL2=@0@'.format(sdl2_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_AVIF=@0@'.format(avif_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBCAP=@0@'.format(cap_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBEIS=@0@'.format(eis_dep.found().to_int())
@@ -162,10 +138,6 @@ src += protocols_client_src
 
 if pipewire_dep.found()
   src += 'pipewire.cpp'
-endif
-
-if openvr_dep.found()
-  src += 'Backends/OpenVRBackend.cpp'
 endif
 
 foreach feat : required_wlroots_features
@@ -193,15 +165,15 @@ gamescope_version = configure_file(
 
   executable(
     'gamescope',
-    src, reshade_src, gamescope_version,
-    include_directories : [reshade_include, sol2_include],
+    src, gamescope_version,
+    include_directories : [sol2_include],
     dependencies: [
       dep_wayland, dep_x11, dep_xdamage, dep_xcomposite, dep_xrender, dep_xext, dep_xfixes,
       dep_xxf86vm, dep_xres, glm_dep, drm_dep, gbm_dep, wayland_server,
-      xkbcommon, thread_dep, sdl2_dep, wlroots_dep,
+      xkbcommon, thread_dep, wlroots_dep,
       vulkan_dep, liftoff_dep, dep_xtst, dep_xmu, cap_dep, epoll_dep, pipewire_dep, librt_dep,
-      stb_dep, displayinfo_dep, openvr_dep, dep_xcursor, avif_dep, dep_xi,
-      libdecor_dep, eis_dep, luajit_dep, libinput_dep, pixman_dep, udev_dep,
+      stb_dep, displayinfo_dep, dep_xcursor, avif_dep, dep_xi,
+      eis_dep, luajit_dep, libinput_dep, pixman_dep, udev_dep,
     ],
     install: true,
     cpp_args: gamescope_cpp_args,

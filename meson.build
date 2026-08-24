@@ -33,7 +33,6 @@ add_project_arguments(cppc.get_supported_arguments([
   '-Wno-unused-const-variable',
   '-Wno-volatile', # glm warning
   '-Wno-deprecated-volatile',
-  '-Wno-ignored-qualifiers', # reshade warning
   '-Wno-missing-braces',
 ]), language: 'cpp')
 
@@ -55,24 +54,8 @@ glm_dep = glm_proj.get_variable('glm_dep')
 stb_proj = subproject('stb')
 stb_dep = stb_proj.get_variable('stb_dep')
 
-if get_option('enable_openvr_support')
-  openvr_dep = dependency('openvr', version: '>= 2.7', required : false)
-  if not openvr_dep.found()
-    cmake = import('cmake')
-    openvr_var = cmake.subproject_options()
-    openvr_var.add_cmake_defines({'USE_LIBCXX': false})
-    openvr_var.set_override_option('warning_level', '0')
-    openvr_proj = cmake.subproject('openvr', options : openvr_var)
-    openvr_dep = openvr_proj.dependency('openvr_api')
-  endif
-else
-  # null dep
-  openvr_dep = dependency('', required : false)
-endif
-
 add_project_arguments(
   '-DHAVE_PIPEWIRE=@0@'.format(pipewire_dep.found().to_int()),
-  '-DHAVE_OPENVR=@0@'.format(openvr_dep.found().to_int()),
   '-DSCRIPT_DIR="@0@"'.format(prefix / data_dir / 'gamescope/scripts'),
   language: 'cpp',
 )

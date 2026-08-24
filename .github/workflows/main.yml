@@ -15,7 +15,7 @@ jobs:
           pacman-key --init
           pacman -Syu --noconfirm
           pacman -S --noconfirm git meson clang glslang libcap wlroots0.20 \
-            sdl2 vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
+            vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
             libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
             xorg-xwayland pipewire cmake \
             libavif libheif aom rav1e libdecor libxdamage \
@@ -29,11 +29,6 @@ jobs:
           export CC=gcc CXX=g++
           meson setup build-gcc/ -Dinput_emulation=disabled --werror --auto-features=enabled
           ninja -C build-gcc/
-      - name: Build with gcc (no vr)
-        run: |
-          export CC=gcc CXX=g++
-          meson setup build-gcc-novr/ -Dinput_emulation=disabled -Denable_openvr_support=false --werror --auto-features=enabled
-          ninja -C build-gcc-novr/
 #      - name: Build with clang
 #        run: |
 #          export CC=clang CXX=clang++

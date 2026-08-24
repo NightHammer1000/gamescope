@@ -68,13 +68,11 @@ body:
 - type: checkboxes
   id: backend
   attributes:
-    label: Which gamescope backends have the issue you are reporting?
+    label: Which backends have the issue you are reporting?
     description: You may select more than one.
     options:
-      - label: Wayland (default for nested gamescope)
-      - label: DRM (default for embedded gamescope, i.e. gamescope-session)
-      - label: SDL
-      - label: OpenVR
+      - label: DRM (the session backend)
+      - label: Headless
   validations:
     required: true
 - type: textarea

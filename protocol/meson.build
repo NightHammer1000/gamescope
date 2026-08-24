@@ -36,7 +36,6 @@ protocols = [
 	'gamescope-pipewire.xml',
 	'gamescope-input-method.xml',
 	'gamescope-control.xml',
-	'gamescope-reshade.xml',
 	'gamescope-swapchain.xml',
 	'gamescope-private.xml',
 	'gamescope-action-binding.xml',
