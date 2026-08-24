@@ -763,6 +763,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(DestroySemaphore) \
 	VK_FUNC(DestroyPipelineLayout) \
 	VK_FUNC(DestroySampler) \
+	VK_FUNC(DestroyShaderModule) \
 	VK_FUNC(DestroySwapchainKHR) \
 	VK_FUNC(EndCommandBuffer) \
 	VK_FUNC(FreeCommandBuffers) \
@@ -782,6 +783,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(QueueSubmit) \
 	VK_FUNC(QueueWaitIdle) \
 	VK_FUNC(ResetCommandBuffer) \
+	VK_FUNC(ResetDescriptorPool) \
 	VK_FUNC(ResetFences) \
 	VK_FUNC(UnmapMemory) \
 	VK_FUNC(UpdateDescriptorSets) \
@@ -833,6 +835,7 @@ public:
 	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
 	void wait(uint64_t sequence, bool reset = true);
+	bool isComplete(uint64_t sequence);
 	void waitIdle(bool reset = true);
 	void garbageCollect();
 	inline VkDescriptorSet descriptorSet()
@@ -869,11 +872,11 @@ public:
 	inline uint32_t vendorID() {return m_uVendorID;}
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
-	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size)
+	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
 	{
 		assert(size <= upload_buffer_size);
 
-		m_uploadBufferOffset = align(m_uploadBufferOffset, 16);
+		m_uploadBufferOffset = align(m_uploadBufferOffset, alignment);
 		if (m_uploadBufferOffset + size > upload_buffer_size)
 		{
 			fprintf(stderr, "Exceeded uploadBufferData\n");

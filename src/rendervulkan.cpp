@@ -1604,6 +1604,15 @@ void CVulkanDevice::wait(uint64_t sequence, bool reset)
 		resetCmdBuffers(sequence);
 }
 
+bool CVulkanDevice::isComplete(uint64_t sequence)
+{
+	if ( sequence == 0 )
+		return true;
+
+	uint64_t completed = 0;
+	return vk.GetSemaphoreCounterValue( device(), m_scratchTimelineSemaphore, &completed ) == VK_SUCCESS && completed >= sequence;
+}
+
 void CVulkanDevice::waitIdle(bool reset)
 {
 	wait(m_submissionSeqNo, reset);

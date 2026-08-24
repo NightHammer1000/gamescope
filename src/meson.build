@@ -147,6 +147,21 @@ ffx_spirv_shaders += custom_target(
   depfile: ffx_midpoint_shader_name + '.h.d',
 )
 
+ffx_scaled_luma_shader_name = 'cs_ffx_opticalflow_prepare_luma_scaled'
+ffx_spirv_shaders += custom_target(
+  ffx_scaled_luma_shader_name + '.h',
+  output: ffx_scaled_luma_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_scaled_luma_shader_name + '.comp'),
+    '--vn', ffx_scaled_luma_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_scaled_luma_shader_name + '.h.d',
+)
+
 sol2_include = include_directories(['../thirdparty'])
 
 required_wlroots_features = ['xwayland']
@@ -165,6 +180,7 @@ src = [
   'convar_script.cpp',
   'commit.cpp',
   'frame_generation_config.cpp',
+  'frame_generation_vulkan.cpp',
   'color_helpers.cpp',
   'main.cpp',
   'edid.cpp',
