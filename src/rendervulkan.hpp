@@ -289,6 +289,10 @@ struct FrameInfo_t
 {
 	bool useFSRLayer0;
 	bool useNISLayer0;
+	bool useSGSRLayer0;
+	bool useBCASLayer0;
+	bool useXBRLayer0;
+	bool useAnime4KLayer0;
 	bool bFadingOut;
 	BlurMode blurLayer0;
 	int blurRadius;
@@ -661,6 +665,9 @@ struct VulkanOutput_t
 	// NIS
 	gamescope::OwningRc<CVulkanTexture> nisScalerImage;
 	gamescope::OwningRc<CVulkanTexture> nisUsmImage;
+
+	// Anime4K CNN feature ping-pong buffers, at source resolution.
+	std::array<gamescope::OwningRc<CVulkanTexture>, 2> anime4kFeatures;
 };
 
 
@@ -677,6 +684,18 @@ enum ShaderType {
 	SHADER_TYPE_RCAS_RGBA16F,
 	SHADER_TYPE_RCAS_RGB10A2,
 	SHADER_TYPE_NIS,
+	SHADER_TYPE_SGSR,
+	SHADER_TYPE_XBR,
+	SHADER_TYPE_BICUBIC,
+	SHADER_TYPE_BICUBIC_RGBA16F,
+	SHADER_TYPE_CAS,
+	SHADER_TYPE_CAS_RGBA16F,
+	SHADER_TYPE_CAS_RGB10A2,
+	SHADER_TYPE_ANIME4K_CONV0,
+	SHADER_TYPE_ANIME4K_CONV1,
+	SHADER_TYPE_ANIME4K_CONV2,
+	SHADER_TYPE_ANIME4K_CONV3,
+	SHADER_TYPE_ANIME4K_D2S,
 	SHADER_TYPE_RGB_TO_NV12,
 
 	SHADER_TYPE_COUNT

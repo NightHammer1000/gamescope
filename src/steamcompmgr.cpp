@@ -2732,6 +2732,10 @@ paint_all( global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPr
 					bool needsScaling = frameInfo.layers.get( 0 ).scale.x < 0.999f && frameInfo.layers.get( 0 ).scale.y < 0.999f;
 					frameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR && needsScaling;
 					frameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS && needsScaling;
+					frameInfo.useSGSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::SGSR && needsScaling;
+					frameInfo.useBCASLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::BCAS && needsScaling;
+					frameInfo.useXBRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::XBR && needsScaling;
+					frameInfo.useAnime4KLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::ANIME4K && needsScaling;
 				}
 				if ( pFocus == GetCurrentFocus() )
 					update_touch_scaling( &frameInfo );
@@ -2908,6 +2912,10 @@ paint_all( global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPr
 
 		frameInfo.useFSRLayer0 = false;
 		frameInfo.useNISLayer0 = false;
+		frameInfo.useSGSRLayer0 = false;
+		frameInfo.useBCASLayer0 = false;
+		frameInfo.useXBRLayer0 = false;
+		frameInfo.useAnime4KLayer0 = false;
 	}
 
 	// Capture FSR activity before frame generation replaces the raw base layer
@@ -6604,13 +6612,30 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
 			g_wantedUpscaleFilter = GamescopeUpscaleFilter::NIS;
 			break;
+		// Telescope extension values; Steam's UI only sends 0-4.
+		case 5:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::SGSR;
+			break;
+		case 6:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::BCAS;
+			break;
+		case 7:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::XBR;
+			break;
+		case 8:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::ANIME4K;
+			break;
 		}
 		hasRepaint = true;
 	}
 	if ( ev->atom == ctx->atoms.gamescopeFSRSharpness || ev->atom == ctx->atoms.gamescopeSharpness )
 	{
 		g_upscaleFilterSharpness = (int)clamp( get_prop( ctx, ctx->root, ev->atom, 2 ), 0u, 20u );
-		if ( g_upscaleFilter == GamescopeUpscaleFilter::FSR || g_upscaleFilter == GamescopeUpscaleFilter::NIS )
+		if ( g_upscaleFilter == GamescopeUpscaleFilter::FSR || g_upscaleFilter == GamescopeUpscaleFilter::NIS || g_upscaleFilter == GamescopeUpscaleFilter::BCAS )
 			hasRepaint = true;
 	}
 	if ( ev->atom == ctx->atoms.gamescopeFrameGenerationEnabled )
@@ -7809,6 +7834,10 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		paint_window_commit( newCommit, w, w, &upscaledFrameInfo, nullptr );
 		upscaledFrameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR;
 		upscaledFrameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS;
+		upscaledFrameInfo.useSGSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::SGSR;
+		upscaledFrameInfo.useBCASLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::BCAS;
+		upscaledFrameInfo.useXBRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::XBR;
+		upscaledFrameInfo.useAnime4KLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::ANIME4K;
 		globalScaleRatio = flOldGlobalScale;
 		zoomScaleRatio = flOldZoomScale;
 		overscanScaleRatio = flOldOverscanScale;

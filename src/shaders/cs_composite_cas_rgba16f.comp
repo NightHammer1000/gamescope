@@ -1,0 +1,7 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VKR_TARGET_FORMAT rgba16f
+#include "cs_composite_cas_common.h"

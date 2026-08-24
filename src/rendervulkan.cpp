@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <bitset>
 #include <deque>
 #include <dlfcn.h>
@@ -58,6 +59,18 @@
 #include "cs_gaussian_blur_horizontal.h"
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
+#include "cs_sgsr.h"
+#include "cs_xbr.h"
+#include "cs_bicubic.h"
+#include "cs_bicubic_rgba16f.h"
+#include "cs_composite_cas.h"
+#include "cs_composite_cas_rgba16f.h"
+#include "cs_composite_cas_rgb10a2.h"
+#include "cs_anime4k_conv0.h"
+#include "cs_anime4k_conv1.h"
+#include "cs_anime4k_conv2.h"
+#include "cs_anime4k_conv3.h"
+#include "cs_anime4k_d2s.h"
 #include "cs_rgb_to_nv12.h"
 
 #define A_CPU
@@ -1019,6 +1032,18 @@ bool CVulkanDevice::createShaders()
 		SHADER(EASU_RGBA16F, cs_easu_rgba16f);
 		SHADER(NIS, cs_nis);
 	}
+	SHADER(SGSR, cs_sgsr);
+	SHADER(XBR, cs_xbr);
+	SHADER(BICUBIC, cs_bicubic);
+	SHADER(BICUBIC_RGBA16F, cs_bicubic_rgba16f);
+	SHADER(CAS, cs_composite_cas);
+	SHADER(CAS_RGBA16F, cs_composite_cas_rgba16f);
+	SHADER(CAS_RGB10A2, cs_composite_cas_rgb10a2);
+	SHADER(ANIME4K_CONV0, cs_anime4k_conv0);
+	SHADER(ANIME4K_CONV1, cs_anime4k_conv1);
+	SHADER(ANIME4K_CONV2, cs_anime4k_conv2);
+	SHADER(ANIME4K_CONV3, cs_anime4k_conv3);
+	SHADER(ANIME4K_D2S, cs_anime4k_d2s);
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
 #undef SHADER
 
@@ -1267,6 +1292,18 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	SHADER(EASU, 1, 1, 1);
 	SHADER(EASU_RGBA16F, 1, 1, 1);
 	SHADER(NIS, 1, 1, 1);
+	SHADER(SGSR, 1, 1, 1);
+	SHADER(XBR, 1, 1, 1);
+	SHADER(BICUBIC, 1, 1, 1);
+	SHADER(BICUBIC_RGBA16F, 1, 1, 1);
+	SHADER(CAS, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(CAS_RGBA16F, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(CAS_RGB10A2, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(ANIME4K_CONV0, 1, 1, 1);
+	SHADER(ANIME4K_CONV1, 1, 1, 1);
+	SHADER(ANIME4K_CONV2, 1, 1, 1);
+	SHADER(ANIME4K_CONV3, 1, 1, 1);
+	SHADER(ANIME4K_D2S, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
 #undef SHADER
 
@@ -3981,6 +4018,32 @@ static void update_tmp_images( uint32_t width, uint32_t height, uint32_t drmForm
 	}
 }
 
+static void update_anime4k_images( uint32_t width, uint32_t height )
+{
+	if ( g_output.anime4kFeatures[0] != nullptr
+			&& width == g_output.anime4kFeatures[0]->width()
+			&& height == g_output.anime4kFeatures[0]->height() )
+	{
+		return;
+	}
+
+	CVulkanTexture::createFlags createFlags;
+	createFlags.bSampled = true;
+	createFlags.bStorage = true;
+
+	for ( auto &tex : g_output.anime4kFeatures )
+	{
+		// Signed CNN feature maps: needs a float format.
+		tex = new CVulkanTexture();
+		if ( !tex->BInit( width, height, 1u, DRM_FORMAT_ABGR16161616F, createFlags, nullptr ) )
+		{
+			vk_log.errorf( "failed to create anime4k feature image" );
+			tex = nullptr;
+			return;
+		}
+	}
+}
+
 
 static bool init_nis_data()
 {
@@ -4434,6 +4497,17 @@ struct NisPushData_t
 			tempX, tempY);
 	}
 };
+
+struct CasPushData_t : RcasPushData_t
+{
+	CasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness, uint32_t rotation = 0)
+		: RcasPushData_t(frameInfo, 0.25f, rotation)
+	{
+		// u_c1 carries the CAS sharpness [0, 1] as raw float bits; the shader
+		// derives the CAS filter constants GPU-side (cs_composite_cas_common.h).
+		u_c1 = std::bit_cast<uint32_t>(sharpness);
+	}
+};
 #pragma pack(pop)
 
 void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *frameInfo)
@@ -4722,6 +4796,156 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo, uOutputRotation);
 
 		int pixelsPerGroup = 8;
+
+		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
+	}
+	else if ( frameInfo->useSGSRLayer0 || frameInfo->useXBRLayer0 )
+	{
+		uint32_t tempX = frameInfo->layers.get( 0 ).integerWidth();
+		uint32_t tempY = frameInfo->layers.get( 0 ).integerHeight();
+
+		update_tmp_images(tempX, tempY);
+
+		// Like NIS: one pass upscales layer 0 into the intermediate at target
+		// size, then the regular blit path composites everything.
+		cmdBuffer->bindPipeline(g_device.pipeline(frameInfo->useSGSRLayer0 ? SHADER_TYPE_SGSR : SHADER_TYPE_XBR));
+		cmdBuffer->bindTarget(g_output.tmpOutput);
+		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
+		cmdBuffer->setTextureSrgb(0, true);
+		cmdBuffer->setSamplerUnnormalized(0, false);
+		cmdBuffer->setSamplerNearest(0, false);
+
+		int pixelsPerGroup = 8;
+
+		cmdBuffer->dispatch(div_roundup(tempX, pixelsPerGroup), div_roundup(tempY, pixelsPerGroup));
+
+		struct FrameInfo_t upscaleFrameInfo = *frameInfo;
+		upscaleFrameInfo.layers.get( 0 ).tex = g_output.tmpOutput;
+		upscaleFrameInfo.layers.get( 0 ).scale.x = 1.0f;
+		upscaleFrameInfo.layers.get( 0 ).scale.y = 1.0f;
+
+		cmdBuffer->bindPipeline( g_device.pipeline(blit_shader_for_target( compositeImage.get() ), upscaleFrameInfo.layers.count(), upscaleFrameInfo.ycbcrMask(), 0u, upscaleFrameInfo.colorspaceMask(), outputTF ));
+		bind_all_layers(cmdBuffer.get(), &upscaleFrameInfo);
+		cmdBuffer->bindTarget(compositeImage);
+		cmdBuffer->uploadConstants<BlitPushData_t>(&upscaleFrameInfo, uOutputRotation);
+
+		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
+	}
+	else if ( frameInfo->useBCASLayer0 )
+	{
+		uint32_t tempX = frameInfo->layers.get( 0 ).integerWidth();
+		uint32_t tempY = frameInfo->layers.get( 0 ).integerHeight();
+
+		// Like FSR: bicubic upscales into the intermediate, CAS sharpens while
+		// compositing the remaining layers.
+		const uint32_t bicubicFormat = ColorspaceIsHDR( frameInfo->layers.get( 0 ).colorspace )
+			? DRM_FORMAT_ABGR16161616F
+			: DRM_FORMAT_ARGB8888;
+		update_tmp_images( tempX, tempY, bicubicFormat );
+
+		const ShaderType bicubicShader = is_fp16_fsr_target( g_output.tmpOutput.get() )
+			? SHADER_TYPE_BICUBIC_RGBA16F
+			: SHADER_TYPE_BICUBIC;
+		cmdBuffer->bindPipeline(g_device.pipeline(bicubicShader));
+		cmdBuffer->bindTarget(g_output.tmpOutput);
+		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
+		cmdBuffer->setTextureSrgb(0, true);
+		cmdBuffer->setSamplerUnnormalized(0, false);
+		cmdBuffer->setSamplerNearest(0, false);
+
+		int pixelsPerGroup = 8;
+
+		cmdBuffer->dispatch(div_roundup(tempX, pixelsPerGroup), div_roundup(tempY, pixelsPerGroup));
+
+		float casSharpness = (20 - g_upscaleFilterSharpness) / 20.0f;
+
+		const bool simpleCasOutput = can_use_simple_fsr_output( frameInfo, compositeImage.get(), outputTF );
+		const ShaderType casShader = is_fp16_fsr_target( compositeImage.get() )
+			? SHADER_TYPE_CAS_RGBA16F
+			: is_rgb10a2_target( compositeImage.get() )
+				? SHADER_TYPE_CAS_RGB10A2
+				: SHADER_TYPE_CAS;
+		cmdBuffer->bindPipeline(g_device.pipeline(casShader, frameInfo->layers.count(), frameInfo->ycbcrMask() & ~1, 0u, frameInfo->colorspaceMask(), outputTF, false, simpleCasOutput ));
+		bind_all_layers(cmdBuffer.get(), frameInfo);
+		cmdBuffer->bindTexture(0, g_output.tmpOutput);
+		cmdBuffer->setTextureSrgb(0, true);
+		cmdBuffer->setSamplerUnnormalized(0, false);
+		cmdBuffer->setSamplerNearest(0, false);
+		cmdBuffer->bindTarget(compositeImage);
+		cmdBuffer->uploadConstants<CasPushData_t>(frameInfo, casSharpness, uOutputRotation);
+
+		int pixelsPerGroupCas = 16;
+
+		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroupCas), div_roundup(currentOutputHeight, pixelsPerGroupCas));
+	}
+	else if ( frameInfo->useAnime4KLayer0 )
+	{
+		uint32_t inputX = frameInfo->layers.get( 0 ).tex->width();
+		uint32_t inputY = frameInfo->layers.get( 0 ).tex->height();
+
+		update_anime4k_images( inputX, inputY );
+		update_tmp_images( inputX * 2, inputY * 2 );
+
+		int pixelsPerGroup = 8;
+
+		if ( g_output.anime4kFeatures[0] != nullptr && g_output.anime4kFeatures[1] != nullptr )
+		{
+			// Four 3x3 convolution passes at source resolution, ping-ponging
+			// between the two feature images, then depth-to-space doubles the
+			// resolution and adds the residual onto a bilinear base.
+			static constexpr ShaderType s_anime4kConvShaders[] =
+			{
+				SHADER_TYPE_ANIME4K_CONV0,
+				SHADER_TYPE_ANIME4K_CONV1,
+				SHADER_TYPE_ANIME4K_CONV2,
+				SHADER_TYPE_ANIME4K_CONV3,
+			};
+
+			for ( int nPass = 0; nPass < 4; nPass++ )
+			{
+				gamescope::Rc<CVulkanTexture> input = nPass == 0
+					? frameInfo->layers.get( 0 ).tex
+					: gamescope::Rc<CVulkanTexture>( g_output.anime4kFeatures[( nPass - 1 ) & 1] );
+
+				cmdBuffer->bindPipeline(g_device.pipeline(s_anime4kConvShaders[nPass]));
+				cmdBuffer->bindTarget(g_output.anime4kFeatures[nPass & 1]);
+				cmdBuffer->bindTexture(0, input);
+				cmdBuffer->setTextureSrgb(0, true);
+				cmdBuffer->setSamplerUnnormalized(0, false);
+				cmdBuffer->setSamplerNearest(0, true);
+
+				cmdBuffer->dispatch(div_roundup(inputX, pixelsPerGroup), div_roundup(inputY, pixelsPerGroup));
+			}
+
+			cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_ANIME4K_D2S));
+			cmdBuffer->bindTarget(g_output.tmpOutput);
+			cmdBuffer->bindTexture(0, g_output.anime4kFeatures[1]);
+			cmdBuffer->setTextureSrgb(0, true);
+			cmdBuffer->setSamplerUnnormalized(0, false);
+			cmdBuffer->setSamplerNearest(0, true);
+			cmdBuffer->bindTexture(1, frameInfo->layers.get( 0 ).tex);
+			cmdBuffer->setTextureSrgb(1, true);
+			cmdBuffer->setSamplerUnnormalized(1, false);
+			cmdBuffer->setSamplerNearest(1, false);
+
+			cmdBuffer->dispatch(div_roundup(inputX * 2, pixelsPerGroup), div_roundup(inputY * 2, pixelsPerGroup));
+		}
+
+		// The doubled image covers the same output region as the source layer,
+		// so its scale doubles with it; the offset is in output pixels and
+		// stays put.
+		struct FrameInfo_t anime4kFrameInfo = *frameInfo;
+		if ( g_output.anime4kFeatures[0] != nullptr && g_output.anime4kFeatures[1] != nullptr )
+		{
+			anime4kFrameInfo.layers.get( 0 ).tex = g_output.tmpOutput;
+			anime4kFrameInfo.layers.get( 0 ).scale.x = frameInfo->layers.get( 0 ).scale.x * 2.0f;
+			anime4kFrameInfo.layers.get( 0 ).scale.y = frameInfo->layers.get( 0 ).scale.y * 2.0f;
+		}
+
+		cmdBuffer->bindPipeline( g_device.pipeline(blit_shader_for_target( compositeImage.get() ), anime4kFrameInfo.layers.count(), anime4kFrameInfo.ycbcrMask(), 0u, anime4kFrameInfo.colorspaceMask(), outputTF ));
+		bind_all_layers(cmdBuffer.get(), &anime4kFrameInfo);
+		cmdBuffer->bindTarget(compositeImage);
+		cmdBuffer->uploadConstants<BlitPushData_t>(&anime4kFrameInfo, uOutputRotation);
 
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
@@ -5474,6 +5698,10 @@ namespace
 			frameInfo->layers.get( 0 ).acquirePoint = std::move( queued.acquirePoint );
 			frameInfo->useFSRLayer0 = queued.useFSR;
 			frameInfo->useNISLayer0 = false;
+			frameInfo->useSGSRLayer0 = false;
+			frameInfo->useBCASLayer0 = false;
+			frameInfo->useXBRLayer0 = false;
+			frameInfo->useAnime4KLayer0 = false;
 			frameInfo->frameGenerationActive = true;
 			frameInfo->frameGenerationOutputId = queued.outputId;
 			m_lastPresentedGenerated = queued.generated;

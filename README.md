@@ -73,10 +73,7 @@ telescopectl drm_modeset_link_down 1
 * **Universal DMA-BUF synchronization**, same origin. Explicit sync_file interop end to end: real per-buffer acquire fences into KMS and Vulkan, releases from the final consumer, and foreign fences relayed through compositor-owned timelines so one driver's failure cannot stall another's queue. This is what heterogeneous setups (iGPU compositor, dGPU game; eGPUs) stand on.
 * **Multi-GPU handling**: the KMS device is picked by which GPU has the display your `--prefer-output` names, other GPUs' displays are blanked at startup and on resume.
 * `--custom-refresh-rates` for panels whose EDID understates what they accept, and DPMS control through a root-window atom.
-
-## Planned additional features
-
-* Additional upscalers (SGSR, BCAS, xBR, Anime4K)
+* **Four extra upscalers** on top of upstream's FSR1 and NIS, each vendored from its original source: **SGSR** (Snapdragon Game Super Resolution v1, Qualcomm, BSD-3), **BCAS** (Catmull-Rom bicubic plus AMD FidelityFX CAS sharpening, MIT), **xBR** (Hyllian's xBR-lv2 edge interpolation for pixel art, MIT) and **Anime4K** (bloc97's CNN upscaler, the x2 S model, MIT). Pick with `-F sgsr`, `-F bcas`, `-F xbr` or `-F anime4k`. The sharpness slider feeds BCAS the way it feeds NIS.
 
 ## What was removed
 
@@ -151,6 +148,10 @@ See `--help` for the full list.
 * `-r`: frame-rate limit for the game, in FPS. Defaults to unlimited.
 * `-F fsr`: use AMD FidelityFX™ Super Resolution 1.0 for upscaling
 * `-F nis`: use NVIDIA Image Scaling v1.0.3 for upscaling
+* `-F sgsr`: use Snapdragon Game Super Resolution v1 for upscaling
+* `-F bcas`: use bicubic upscaling plus AMD FidelityFX CAS sharpening
+* `-F xbr`: use xBR-lv2 for upscaling (pixel art)
+* `-F anime4k`: use Anime4K (CNN x2 S) for upscaling
 * `-S integer`: use integer scaling.
 * `-S stretch`: use stretch scaling, the game will fill the window. (e.g. 4:3 to 16:9)
 * `--backend`: `drm` (default) or `headless`.

@@ -77,6 +77,18 @@ shader_src = [
   'shaders/cs_gaussian_blur_horizontal.comp',
   'shaders/cs_nis.comp',
   'shaders/cs_nis_fp16.comp',
+  'shaders/cs_sgsr.comp',
+  'shaders/cs_xbr.comp',
+  'shaders/cs_bicubic.comp',
+  'shaders/cs_bicubic_rgba16f.comp',
+  'shaders/cs_composite_cas.comp',
+  'shaders/cs_composite_cas_rgba16f.comp',
+  'shaders/cs_composite_cas_rgb10a2.comp',
+  'shaders/cs_anime4k_conv0.comp',
+  'shaders/cs_anime4k_conv1.comp',
+  'shaders/cs_anime4k_conv2.comp',
+  'shaders/cs_anime4k_conv3.comp',
+  'shaders/cs_anime4k_d2s.comp',
   'shaders/cs_rgb_to_nv12.comp',
 ]
 

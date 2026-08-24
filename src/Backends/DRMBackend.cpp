@@ -3947,6 +3947,10 @@ namespace gamescope
 				!cv_composite_force &&
 				!bWasFirstFrame &&
 				!pFrameInfo->useNISLayer0 &&
+				!pFrameInfo->useSGSRLayer0 &&
+				!pFrameInfo->useBCASLayer0 &&
+				!pFrameInfo->useXBRLayer0 &&
+				!pFrameInfo->useAnime4KLayer0 &&
 				!pFrameInfo->blurLayer0 &&
 				!pFrameInfo->bFadingOut &&
 				!g_bColorSliderInUse &&
@@ -4009,6 +4013,10 @@ namespace gamescope
 			bNeedsFullComposite |= bWasFirstFrame;
 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;
+			bNeedsFullComposite |= pFrameInfo->useSGSRLayer0;
+			bNeedsFullComposite |= pFrameInfo->useBCASLayer0;
+			bNeedsFullComposite |= pFrameInfo->useXBRLayer0;
+			bNeedsFullComposite |= pFrameInfo->useAnime4KLayer0;
 			bNeedsFullComposite |= pFrameInfo->blurLayer0;
 			bNeedsFullComposite |= bNeedsCompositeFromFilter;
 			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
