@@ -525,6 +525,8 @@ bool CVulkanDevice::createDevice()
 		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
 
 		m_bSupportsFp16 = vulkan12Features.shaderFloat16 && features2.features.shaderInt16;
+		m_bSupportsStorageImageReadWithoutFormat = features2.features.shaderStorageImageReadWithoutFormat;
+		m_bSupportsStorageImageWriteWithoutFormat = features2.features.shaderStorageImageWriteWithoutFormat;
 	}
 
 	float queuePriorities = 1.0f;
@@ -637,10 +639,10 @@ bool CVulkanDevice::createDevice()
 	VkPhysicalDeviceFeatures2 features2 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
 		.pNext = &presentIdFeatures,
-		.features = {
-			.shaderInt16 = m_bSupportsFp16,
-		},
 	};
+	features2.features.shaderInt16 = m_bSupportsFp16;
+	features2.features.shaderStorageImageReadWithoutFormat = m_bSupportsStorageImageReadWithoutFormat;
+	features2.features.shaderStorageImageWriteWithoutFormat = m_bSupportsStorageImageWriteWithoutFormat;
 
 	VkDeviceCreateInfo deviceCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,

@@ -1,0 +1,37 @@
+// Optical-flow-only adaptation of FidelityFX Frame Interpolation's optical
+// flow vector-field pass.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
+// Copyright (C) 2026 Gamescope contributors
+// SPDX-License-Identifier: MIT
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_OPTICAL_FLOW                       0
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_PREVIOUS_INTERPOLATION_SOURCE      1
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE       2
+#define FFX_FRAMEINTERPOLATION_BIND_UAV_OPTICAL_FLOW_MOTION_VECTOR_FIELD_X 3
+#define FFX_FRAMEINTERPOLATION_BIND_UAV_OPTICAL_FLOW_MOTION_VECTOR_FIELD_Y 4
+#define FFX_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION                  5
+
+#include "frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h"
+#include "frameinterpolation/ffx_frameinterpolation_common.h"
+
+// The upstream implementation reads confidence but does not consume it in the
+// v5 GLSL path. Gamescope has no separate confidence surface, so supply the
+// neutral value and retain the upstream vector construction unchanged.
+FfxFloat32 LoadOpticalFlowConfidence(FfxInt32x2 position)
+{
+    return 1.0;
+}
+
+#include "frameinterpolation/ffx_frameinterpolation_optical_flow_vector_field.h"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    computeOpticalFlowVectorField(FfxInt32x2(gl_GlobalInvocationID.xy));
+}

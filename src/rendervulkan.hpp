@@ -869,6 +869,8 @@ public:
 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
+	inline bool supportsStorageImageReadWithoutFormat() { return m_bSupportsStorageImageReadWithoutFormat; }
+	inline bool supportsStorageImageWriteWithoutFormat() { return m_bSupportsStorageImageWriteWithoutFormat; }
 	inline uint32_t vendorID() {return m_uVendorID;}
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
@@ -932,6 +934,8 @@ protected:
 	dev_t m_drmPrimaryDevId = 0;
 
 	bool m_bSupportsFp16 = false;
+	bool m_bSupportsStorageImageReadWithoutFormat = false;
+	bool m_bSupportsStorageImageWriteWithoutFormat = false;
 	uint32_t m_uVendorID = 0;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;

@@ -73,6 +73,15 @@ void main()
     VectorFieldEntry field;
     SampleOpticalFlowMotionVectorField(uv, field);
 
+    if ((GetDispatchFlags() & 0x80000000u) != 0u)
+    {
+        const vec2 motionPixels = field.fMotionVector * vec2(DisplaySize());
+        const vec2 encodedMotion = clamp(vec2(0.5) + motionPixels / 64.0, vec2(0.0), vec2(1.0));
+        StoreFrameinterpolationOutput(pixel,
+            vec4(encodedMotion, clamp(field.uHighPriorityFactor, 0.0, 1.0), 0.0));
+        return;
+    }
+
     // FidelityFX constructs a half-frame field. Its positive direction reaches
     // into the previous image and its negative direction reaches into current.
     const vec2 previousUv = uv + field.fMotionVector;
