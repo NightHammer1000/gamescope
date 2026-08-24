@@ -2453,7 +2453,9 @@ namespace gamescope
 				sol::optional<sol::table> otDynamicRefreshRates = tTable["dynamic_refresh_rates"];
 				sol::optional<sol::function> ofnDynamicModegen = tTable["dynamic_modegen"];
 
-				if ( otDynamicRefreshRates && ofnDynamicModegen )
+				if ( otDynamicRefreshRates && !ofnDynamicModegen )
+					m_Mutable.ValidDynamicRefreshRates = TableToVector<uint32_t>( *otDynamicRefreshRates );
+				else if ( otDynamicRefreshRates && ofnDynamicModegen )
 				{
 					m_Mutable.ValidDynamicRefreshRates = TableToVector<uint32_t>( *otDynamicRefreshRates );
 
@@ -2632,7 +2634,13 @@ namespace gamescope
 				 pHDRStaticMetadata && pHDRStaticMetadata->eotfs && pHDRStaticMetadata->eotfs->pq )
 			{
 				m_Mutable.HDR.bExposeHDRSupport = true;
-				m_Mutable.HDR.eOutputEncodingEOTF = EOTF_PQ;
+				if (disableInternalPq && GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL)
+					// Current handheld internal displays have issues
+					// with PQ, e.g., Ayaneo 3, Steam Deck etc.
+					// Use Gamma 2.2 as the safest option for now.
+					m_Mutable.HDR.eOutputEncodingEOTF = EOTF_Gamma22;
+				else
+					m_Mutable.HDR.eOutputEncodingEOTF = EOTF_PQ;
 				m_Mutable.HDR.uMaxContentLightLevel =
 					pHDRStaticMetadata->desired_content_max_luminance
 					? nits_to_u16( pHDRStaticMetadata->desired_content_max_luminance )
@@ -3984,6 +3992,17 @@ namespace gamescope
 			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
+
+			if ( !SupportsColorManagement() ) {
+				// Fuzzy match default values to see if we need to composite
+				bNeedsFullComposite |= g_ColorMgmt.pending.nightmode.amount != 0.0f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.x > 0 &&
+					abs(g_ColorMgmt.pending.outputVirtualWhite.x - 0.3127f) > 0.001f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.y > 0 &&
+					abs(g_ColorMgmt.pending.outputVirtualWhite.y - 0.3290f) > 0.001f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.sdrGamutWideness >= 0 &&
+					abs(g_ColorMgmt.pending.sdrGamutWideness - 0.5f) > 0.02f;
+			}
 
 			if ( g_bOutputHDREnabled )
 			{

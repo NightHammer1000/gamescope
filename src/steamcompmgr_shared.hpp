@@ -150,6 +150,7 @@ struct steamcompmgr_win_t {
 	uint32_t hwndStyleEx = 0;
 
 	bool bHasHadNonSRGBColorSpace = false;
+	bool bHasHDRColorspace = false;
 
 	bool placed = false;
 	bool ignoreOverrideRedirect = false;

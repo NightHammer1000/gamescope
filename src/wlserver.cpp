@@ -1691,7 +1691,16 @@ void wlserver_set_output_info( const wlserver_output_info *info )
 	free(wlserver.output_info.description);
 	wlserver.output_info.description = strdup(info->description);
 	wlserver.output_info.phys_width = info->phys_width;
+	// Steam's default UI scaling becomes too small on sub-8-inch displays.
+	// A 16:9 8-inch display is approximately 100 mm tall, so clamp the
+	// reported height rather than doing a more expensive diagonal check.
 	wlserver.output_info.phys_height = info->phys_height;
+	if ( wlserver.output_info.phys_height > 0 && wlserver.output_info.phys_height < 100 )
+	{
+		wlserver.output_info.phys_width =
+			wlserver.output_info.phys_width * 100 / wlserver.output_info.phys_height;
+		wlserver.output_info.phys_height = 100;
+	}
 
 	if (wlserver.wlr.xwayland_servers.empty())
 		return;
