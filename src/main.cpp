@@ -77,8 +77,6 @@ const struct option *gamescope_options = (struct option[]){
 
 	// nested mode options
 	{ "nested-unfocused-refresh", required_argument, nullptr, 'o' },
-	{ "borderless", no_argument, nullptr, 'b' },
-	{ "fullscreen", no_argument, nullptr, 'f' },
 	{ "grab", no_argument, nullptr, 'g' },
 	{ "force-grab-cursor", no_argument, nullptr, 0 },
 	{ "display-index", required_argument, nullptr, 0 },
@@ -172,7 +170,7 @@ const char usage[] =
 	"  --prefer-vk-device             prefer Vulkan device for compositing (ex: 1002:7300)\n"
 	"  --force-composition-rotation   always rotate the output in the compositor instead of at scanout (autodetected otherwise)\n"
 	"  --force-orientation            rotate the internal display (left, right, normal, upsidedown)\n"
-	"  --force-windows-fullscreen     force windows inside of gamescope to be the size of the nested display (fullscreen)\n"
+	"  --force-windows-fullscreen     force windows inside of gamescope to be the size of the output (fullscreen)\n"
 	"  --cursor-scale-height          if specified, sets a base output height to linearly scale the cursor against.\n"
 	"  --virtual-connector-strategy   Specifies how we should make virtual connectors.\n"
 	"  --hdr-enabled                  enable HDR output (needs Gamescope WSI layer enabled for support from clients)\n"
@@ -190,8 +188,6 @@ const char usage[] =
 	"\n"
 	"Nested mode options:\n"
 	"  -o, --nested-unfocused-refresh game refresh rate when unfocused\n"
-	"  -b, --borderless               make the window borderless\n"
-	"  -f, --fullscreen               make the window fullscreen\n"
 	"  -g, --grab                     grab the keyboard\n"
 	"  --force-grab-cursor            always use relative mouse mode instead of flipping dependent on cursor visibility.\n"
 	"  --display-index                forces gamescope to use a specific display in nested mode."
@@ -248,7 +244,6 @@ uint32_t g_nOutputHeight = 0;
 int g_nOutputRefresh = 0;
 bool g_bOutputHDREnabled = false;
 
-bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
 
 bool g_bGrabbed = false;
@@ -264,7 +259,6 @@ int g_upscaleFilterSharpness = 2;
 
 gamescope::GamescopeModeGeneration g_eGamescopeModeGeneration = gamescope::GAMESCOPE_MODE_GENERATE_CVT;
 
-bool g_bBorderlessOutputWindow = false;
 
 int g_nXWaylandCount = 1;
 bool g_bNoTouchPointerEmulation = true;
@@ -665,12 +659,6 @@ int main(int argc, char **argv)
 				break;
 			case 'F':
 				g_wantedUpscaleFilter = parse_upscaler_filter(optarg);
-				break;
-			case 'b':
-				g_bBorderlessOutputWindow = true;
-				break;
-			case 'f':
-				g_bFullscreen = true;
 				break;
 			case 'O':
 				g_sOutputName = optarg;
