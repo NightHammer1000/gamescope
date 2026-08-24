@@ -16,3 +16,12 @@ gamescope_tests = executable(
 test('convar', gamescope_tests, args: ['[convar]'])
 test('process', gamescope_tests, args: ['[process]'])
 test('scanout', gamescope_tests, args: ['[scanout]'])
+
+# Plain assert-based test, not Catch2.
+framegen_config_test = executable(
+	'test_frame_generation_config',
+	['test_frame_generation_config.cpp', srcdir / 'frame_generation_config.cpp'],
+	include_directories: [srcdir],
+	dependencies: [wlroots_dep],
+)
+test('frame_generation_config', framegen_config_test)

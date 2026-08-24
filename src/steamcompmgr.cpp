@@ -85,6 +85,7 @@
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "vblankmanager.hpp"
+#include "frame_generation_config.hpp"
 #include "log.hpp"
 #include "Utils/Defer.h"
 #include "win32_styles.h"
@@ -6417,6 +6418,18 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		if ( g_upscaleFilter == GamescopeUpscaleFilter::FSR || g_upscaleFilter == GamescopeUpscaleFilter::NIS )
 			hasRepaint = true;
 	}
+	if ( ev->atom == ctx->atoms.gamescopeFrameGenerationEnabled )
+	{
+		gamescope::SetFrameGenerationEnabled(
+			get_prop( ctx, ctx->root, ctx->atoms.gamescopeFrameGenerationEnabled, 0 ) );
+		hasRepaint = true;
+	}
+	if ( ev->atom == ctx->atoms.gamescopeFrameGenerationFlowScale )
+	{
+		gamescope::SetFrameGenerationFlowScale(
+			get_prop( ctx, ctx->root, ctx->atoms.gamescopeFrameGenerationFlowScale, 100 ) );
+		hasRepaint = true;
+	}
 	if ( ev->atom == ctx->atoms.gamescopeXWaylandModeControl )
 	{
 		std::vector< uint32_t > xwayland_mode_ctl;
@@ -8068,6 +8081,9 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeLowLatency = XInternAtom( ctx->dpy, "GAMESCOPE_LOW_LATENCY", false );
 
 	ctx->atoms.gamescopeFSRFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_FSR_FEEDBACK", false );
+	ctx->atoms.gamescopeFrameGenerationEnabled = XInternAtom( ctx->dpy, "GAMESCOPE_FRAME_GENERATION_ENABLED", false );
+	ctx->atoms.gamescopeFrameGenerationFlowScale = XInternAtom( ctx->dpy, "GAMESCOPE_FRAME_GENERATION_FLOW_SCALE", false );
+	ctx->atoms.gamescopeFrameGenerationFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_FRAME_GENERATION_FEEDBACK", false );
 
 	ctx->atoms.gamescopeBlurMode = XInternAtom( ctx->dpy, "GAMESCOPE_BLUR_MODE", false );
 	ctx->atoms.gamescopeBlurRadius = XInternAtom( ctx->dpy, "GAMESCOPE_BLUR_RADIUS", false );
@@ -8680,6 +8696,17 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		g_SteamCompMgrWaiter.PollEvents();
+
+		static uint64_t s_lastFrameGenerationStateSerial = 0;
+		const uint64_t frameGenerationStateSerial = gamescope::GetFrameGenerationStateSerial();
+		if ( frameGenerationStateSerial != s_lastFrameGenerationStateSerial )
+		{
+			s_lastFrameGenerationStateSerial = frameGenerationStateSerial;
+			const uint32_t status = static_cast<uint32_t>( gamescope::GetFrameGenerationStatus() );
+			XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeFrameGenerationFeedback,
+				XA_CARDINAL, 32, PropModeReplace, reinterpret_cast<const unsigned char *>( &status ), 1 );
+			XFlush( root_ctx->dpy );
+		}
 
 		bool vblank = false;
 		if ( std::optional<gamescope::VBlankTime> pendingVBlank = GetVBlankTimer().ProcessVBlank() )

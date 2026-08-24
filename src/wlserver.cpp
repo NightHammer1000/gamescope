@@ -63,6 +63,7 @@
 #include "log.hpp"
 #include "ime.hpp"
 #include "xwayland_ctx.hpp"
+#include "frame_generation_config.hpp"
 #include "refresh_rate.h"
 #include "InputEmulation.h"
 #include "commit.h"
@@ -1308,6 +1309,13 @@ static void gamescope_control_request_app_performance_stats( struct wl_client *c
 	wlserver.app_perf_requests[ app_id ].push_back( resource );
 }
 
+static void gamescope_control_set_frame_generation( struct wl_client *client, struct wl_resource *resource, uint32_t enabled )
+{
+	assert( wlserver_is_lock_held() );
+	gamescope::SetFrameGenerationEnabled( enabled );
+	hasRepaint = true;
+}
+
 void wlserver_app_presented( uint32_t app_id, uint64_t frametime_ns )
 {
 	assert( wlserver_is_lock_held() );
@@ -1337,6 +1345,7 @@ static const struct gamescope_control_interface gamescope_control_impl = {
 	.set_look = gamescope_control_set_look,
 	.unset_look = gamescope_control_unset_look,
 	.request_app_performance_stats = gamescope_control_request_app_performance_stats,
+	.set_frame_generation = gamescope_control_set_frame_generation,
 };
 
 static uint32_t get_conn_display_info_flags()
@@ -1406,6 +1415,7 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_MURA_CORRECTION, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_LOOK, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_PERF_QUERY, 1, 0 );
+	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_FRAME_GENERATION, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_DONE, 0, 0 );
 
 	wlserver_send_gamescope_control( resource );
@@ -1415,7 +1425,7 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 
 static void create_gamescope_control( void )
 {
-	uint32_t version = 6;
+	uint32_t version = 7;
 	wl_global_create( wlserver.display, &gamescope_control_interface, version, NULL, gamescope_control_bind );
 }
 

@@ -94,6 +94,7 @@ src = [
   'convar.cpp',
   'convar_script.cpp',
   'commit.cpp',
+  'frame_generation_config.cpp',
   'color_helpers.cpp',
   'main.cpp',
   'edid.cpp',
