@@ -77,6 +77,7 @@ telescopectl drm_modeset_link_down 1
 
 ## Planned additional features
 
+* **A startup screen.** Today nothing gets presented until the first game or Steam frame arrives, so during a Steam update or repair the display just keeps showing whatever the login screen left behind. That reads as a hard hang and it is not one. Telescope will flip its own frame the moment it owns the display: logo, spinner, done. The session launcher already knows why Steam is quiet, so it can feed the splash a status line ("Steam is updating") through the same channel `telescopectl` uses. Gone forever the moment the first real frame lands.
 * **An in-session settings overlay (`telescope-osd`)**: a small companion app that opens on a hotkey and lets you switch upscaler, sharpness, link-down and frame generation live, without Steam's UI knowing anything about them. All the pieces already exist: it draws through the same external overlay plane mangoapp uses, grabs its keys through the `gamescope-action-binding` protocol only while the menu is open, and applies settings through the same control channel `telescopectl` uses. The compositor itself stays untouched.
 
 ## What was removed
