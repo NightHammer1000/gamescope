@@ -259,6 +259,11 @@ namespace gamescope
 		{
 			std::unique_lock lock( m_ScheduleMutex );
 
+			// Drain before the early return below. An expired timerfd stays
+			// readable until it is read or re-armed, so returning without doing
+			// either has epoll wake us again immediately, and keep doing it.
+			ITimerWaitable::OnPollIn();
+
 			// Disarm the timer if it was armed.
 			if ( !m_bArmed.exchange( false ) )
 				return;
