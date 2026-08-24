@@ -3839,9 +3839,15 @@ namespace gamescope
 
 			bool bWantsPartialComposite = pFrameInfo->layers.count() >= 3 && !kDisablePartialComposition;
 
-			static bool s_bWasFirstFrame = true;
-			bool bWasFirstFrame = s_bWasFirstFrame;
-			s_bWasFirstFrame = false;
+			// Held until a commit actually lands, so a first frame after resume
+			// that fails to commit still composites on the next attempt rather
+			// than being consumed by one that never reached the screen.
+			const bool bWasFirstFrame = m_bNeedsFirstFrameComposite.exchange( false );
+			bool bFirstFrameCommitted = false;
+			defer(
+				if ( bWasFirstFrame && !bFirstFrameCommitted )
+					m_bNeedsFirstFrameComposite = true;
+			);
 
 			bool bDrewCursor = false;
 			for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
@@ -3913,7 +3919,9 @@ namespace gamescope
 				if ( pFrameInfo->layers.count() == 2 )
 					m_nLastSingleOverlayZPos = pFrameInfo->layers.get( 1 ).zpos;
 
-				return Commit( pFrameInfo );
+				int ret = Commit( pFrameInfo );
+				bFirstFrameCommitted = ret == 0;
+				return ret;
 			}
 
 			// Composition Path
@@ -4116,15 +4124,21 @@ namespace gamescope
 				}
 			}
 
-			return Commit( &compositeFrameInfo );
+			ret = Commit( &compositeFrameInfo );
+			bFirstFrameCommitted = ret == 0;
+			return ret;
 		}
 
 		virtual void DirtyState( bool bForce, bool bForceModeset ) override
 		{
+			const bool bPaused = !wlsession_active();
+			const bool bWasPaused = g_DRM.paused.exchange( bPaused );
+			if ( bWasPaused && !bPaused )
+				m_bNeedsFirstFrameComposite = true;
+
 			if ( bForceModeset )
 				g_DRM.needs_modeset = true;
 			g_DRM.out_of_date = std::max<int>( g_DRM.out_of_date, bForce ? 2 : 1 );
-			g_DRM.paused = !wlsession_active();
 		}
 
 		virtual bool PollState() override
@@ -4293,6 +4307,7 @@ namespace gamescope
 		}
 
 	private:
+		std::atomic<bool> m_bNeedsFirstFrameComposite = true;
 		bool m_bWasCompositing = false;
 		bool m_bWasPartialCompositing = false;
 		int m_nLastSingleOverlayZPos = 0;
