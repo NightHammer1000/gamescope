@@ -652,6 +652,7 @@ struct PipelineInfo_t
 	uint32_t colorspaceMask;
 	uint32_t outputEOTF;
 	bool itmEnable;
+	bool fsrSimpleOutput;
 
 	bool operator==(const PipelineInfo_t& o) const {
 		return
@@ -662,7 +663,8 @@ struct PipelineInfo_t
 		compositeDebug == o.compositeDebug &&
 		colorspaceMask == o.colorspaceMask &&
 		outputEOTF == o.outputEOTF &&
-		itmEnable == o.itmEnable;
+		itmEnable == o.itmEnable &&
+		fsrSimpleOutput == o.fsrSimpleOutput;
 	}
 };
 
@@ -686,6 +688,7 @@ namespace std
 			hash = hash_combine(hash, k.colorspaceMask);
 			hash = hash_combine(hash, k.outputEOTF);
 			hash = hash_combine(hash, k.itmEnable);
+			hash = hash_combine(hash, k.fsrSimpleOutput);
 			return hash;
 		}
 	};
@@ -823,7 +826,7 @@ public:
 	bool BInit(VkInstance instance, VkSurfaceKHR surface);
 
 	VkSampler sampler(SamplerState key);
-	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false);
+	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false, bool fsr_simple_output = false);
 	int32_t findMemoryType( VkMemoryPropertyFlags properties, uint32_t requiredTypeBits );
 	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
 	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
@@ -901,7 +904,7 @@ protected:
 	bool createPools();
 	bool createShaders();
 	bool createScratchResources();
-	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable);
+	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output);
 	void compileAllPipelines(std::stop_token st);
 
 	VkDevice m_device = nullptr;

@@ -7,6 +7,7 @@ layout(constant_id = 3) const int  c_blur_layer_count = 0;
 
 layout(constant_id = 4) const uint c_colorspaceMask = 0;
 layout(constant_id = 5) const uint c_output_eotf = 0;
+layout(constant_id = 6) const bool c_fsr_simple_output = false;
 layout(constant_id = 7) const bool c_itm_enable = false;
 
 const int colorspace_linear = 0;
