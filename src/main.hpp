@@ -12,8 +12,6 @@ extern std::atomic< bool > g_bRun;
 extern int g_nNestedWidth;
 extern int g_nNestedHeight;
 extern int g_nNestedRefresh; // mHz
-extern int g_nNestedUnfocusedRefresh; // mHz
-extern int g_nNestedDisplayIndex;
 
 extern uint32_t g_nOutputWidth;
 extern uint32_t g_nOutputHeight;
@@ -26,7 +24,6 @@ extern bool g_bForceCompositionRotation;
 extern uint32_t g_uOutputRotation;
 
 
-extern bool g_bGrabbed;
 
 extern float g_mouseSensitivity;
 extern const char *g_sOutputName;

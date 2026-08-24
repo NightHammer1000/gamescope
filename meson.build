@@ -89,6 +89,10 @@ if get_option('enable_tests') and get_option('enable_gamescope')
   subdir('tests')
 endif
 
+if get_option('enable_session')
+  subdir('session')
+endif
+
 
 # Handle default script/config/looks stuff
 meson.add_install_script('default_extras_install.sh')

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Steam's "Switch to Desktop" button runs this. The name is Steam's, not ours.
+#
+# Telescope ships it because the session packages are mutually exclusive
+# anyway: two gamemode sessions cannot both own the display. The *compositor*
+# coexists with gamescope; the session does not.
+
+set -euo pipefail
+
+# A distro that wants to own session switching drops this in and we defer.
+OS_SESSION_SELECT="/usr/lib/os-session-select"
+if [ -x "$OS_SESSION_SELECT" ]; then
+	exec "$OS_SESSION_SELECT" "$@"
+fi
+
+target="${1:-desktop}"
+
+case "$target" in
+	gamescope|telescope|gamer|game)
+		telescope-session-select telescope-steam
+		;;
+	desktop|plasma|plasma-wayland|plasma-x11|gnome|*)
+		telescope-session-select desktop
+		;;
+esac
+
+# Ending the client ends the session; the display manager then applies the
+# selection we just made.
+if command -v steam >/dev/null 2>&1; then
+	steam -shutdown || true
+fi

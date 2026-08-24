@@ -76,10 +76,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "backend", required_argument, nullptr, 0 },
 
 	// nested mode options
-	{ "nested-unfocused-refresh", required_argument, nullptr, 'o' },
-	{ "grab", no_argument, nullptr, 'g' },
 	{ "force-grab-cursor", no_argument, nullptr, 0 },
-	{ "display-index", required_argument, nullptr, 0 },
 
 	// embedded mode options
 	{ "disable-layers", no_argument, nullptr, 0 },
@@ -137,7 +134,7 @@ const struct option *gamescope_options = (struct option[]){
 };
 
 const char usage[] =
-	"usage: gamescope [options...] -- [command...]\n"
+	"usage: telescope [options...] -- [command...]\n"
 	"\n"
 	"Options:\n"
 	"  --help                         show help message\n"
@@ -185,12 +182,7 @@ const char usage[] =
 	"  --framerate-limit              Set a simple framerate limit. Used as a divisor of the refresh rate, rounds down eg 60 / 59 -> 60fps, 60 / 25 -> 30fps. Default: 0, disabled.\n"
 	"  --mangoapp                     Launch with the mangoapp (mangohud) performance overlay enabled. You should use this instead of using mangohud on the game or gamescope.\n"
 	"  --adaptive-sync                Enable adaptive sync if available (variable rate refresh)\n"
-	"\n"
-	"Nested mode options:\n"
-	"  -o, --nested-unfocused-refresh game refresh rate when unfocused\n"
-	"  -g, --grab                     grab the keyboard\n"
-	"  --force-grab-cursor            always use relative mouse mode instead of flipping dependent on cursor visibility.\n"
-	"  --display-index                forces gamescope to use a specific display in nested mode."
+	"  --force-grab-cursor            always composite the cursor rather than deciding from cursor visibility\n"
 	"\n"
 	"Embedded mode options:\n"
 	"  -O, --prefer-output            list of connectors in order of preference (ex: DP-1,DP-2,DP-3,HDMI-A-1)\n"
@@ -236,8 +228,6 @@ std::atomic< bool > g_bRun{true};
 int g_nNestedWidth = 0;
 int g_nNestedHeight = 0;
 int g_nNestedRefresh = 0;
-int g_nNestedUnfocusedRefresh = 0;
-int g_nNestedDisplayIndex = 0;
 
 uint32_t g_nOutputWidth = 0;
 uint32_t g_nOutputHeight = 0;
@@ -246,7 +236,6 @@ bool g_bOutputHDREnabled = false;
 
 bool g_bForceRelativeMouse = false;
 
-bool g_bGrabbed = false;
 
 float g_mouseSensitivity = 1.0;
 
@@ -648,9 +637,6 @@ int main(int argc, char **argv)
 			case 'H':
 				g_nPreferredOutputHeight = parse_integer( optarg, "output-height" );
 				break;
-			case 'o':
-				g_nNestedUnfocusedRefresh = gamescope::ConvertHztomHz( parse_integer( optarg, "nested-unfocused-refresh" ) );
-				break;
 			case 'm':
 				g_flMaxWindowScale = parse_float( optarg, "max-scale" );
 				break;
@@ -662,9 +648,6 @@ int main(int argc, char **argv)
 				break;
 			case 'O':
 				g_sOutputName = optarg;
-				break;
-			case 'g':
-				g_bGrabbed = true;
 				break;
 			case 's':
 				g_mouseSensitivity = parse_float( optarg, "mouse-sensitivity" );
@@ -723,8 +706,6 @@ int main(int argc, char **argv)
 					cv_tearing_enabled = true;
 				} else if (strcmp(opt_name, "force-grab-cursor") == 0) {
 					g_bForceRelativeMouse = true;
-				} else if (strcmp(opt_name, "display-index") == 0) {
-					g_nNestedDisplayIndex = parse_integer( optarg, opt_name );
 				} else if (strcmp(opt_name, "adaptive-sync") == 0) {
 					cv_adaptive_sync = true;
 				} else if (strcmp(opt_name, "expose-wayland") == 0) {

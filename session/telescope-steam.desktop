@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Steam Big Picture (Telescope)
+Comment=Steam Big Picture session on Telescope
+Exec=telescope-session steam
+DesktopNames=telescope

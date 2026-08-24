@@ -6,3 +6,4 @@ option('enable_gamescope',           type : 'boolean', value : true, description
 option('enable_gamescope_wsi_layer', type : 'boolean', value : true, description: 'Build Gamescope layer')
 option('enable_tests',               type : 'boolean', value : true, description: 'Build unit tests')
 option('benchmark', type: 'feature', description: 'Benchmark tools')
+option('enable_session',             type : 'boolean', value : true, description: 'Install the telescope-session launcher, units and session-select')

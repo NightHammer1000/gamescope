@@ -10,7 +10,9 @@ But it seems this whole topic is a bit of a philosophical minefield, left over f
 
 So here is Telescope. A DRM-backend-focused gamescope fork whose only goal is to give you a working gamemode, no matter what hardware, no matter what philosophical stance is out there.
 
-It coexists with gamescope fine — nothing it installs shares a path with upstream. Binaries are `telescope`, `telescopectl`, `telescopereaper`, `telescopestream`, `telescope-type`; data lives in `/usr/share/telescope`, config in `/etc/telescope` and `~/.config/telescope`, and the WSI layer is `VK_LAYER_FROG_telescope_wsi` with its own `ENABLE_TELESCOPE_WSI` gate so it never hooks gamescope's clients. Use gamescope for desktop or VR, and Telescope for gamemode.
+The *compositor* coexists with gamescope fine — nothing it installs shares a path with upstream. Binaries are `telescope`, `telescopectl`, `telescopereaper`, `telescopestream`, `telescope-type`; data lives in `/usr/share/telescope`, config in `/etc/telescope` and `~/.config/telescope`, and the WSI layer is `VK_LAYER_FROG_telescope_wsi` with its own `ENABLE_TELESCOPE_WSI` gate so it never hooks gamescope's clients. Use gamescope for desktop or VR, and Telescope for gamemode.
+
+The *session* package is a different matter: `telescope-session` conflicts with `gamescope-session-steam`, and has to. Two gamemode sessions cannot both own the display, and both ship `steamos-session-select`, which is the name Steam's "Switch to Desktop" button calls. Pick one.
 
 I only care about one thing. Does it work? Is it clean code? Then it is in. And once it is fixed in the right place — the driver — it comes back out again.
 
