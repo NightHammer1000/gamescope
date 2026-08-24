@@ -79,10 +79,12 @@ gamescope::ConVar<bool> cv_drm_debug_disable_in_fence_fd( "drm_debug_disable_in_
 
 gamescope::ConVar<bool> cv_drm_allow_dynamic_modes_for_external_display( "drm_allow_dynamic_modes_for_external_display", false, "Allow dynamic mode/refresh rate switching for external displays." );
 
-gamescope::ConVar<bool> cv_drm_modeset_link_down( "drm_modeset_link_down", true,
-	"On drivers that need it, take the link fully down as its own commit before bringing it "
-	"back up with the new mode, instead of disabling and refilling in one atomic request. "
-	"Turn off to A/B the corruption this works around." );
+gamescope::ConVar<int> cv_drm_modeset_link_down( "drm_modeset_link_down", -1,
+	"Take the link fully down as its own commit before bringing it back up with the new mode, "
+	"instead of disabling and refilling in one atomic request. "
+	"-1 = auto (on where the driver is known to need it), 0 = never, 1 = always.\n"
+	"Worth forcing on for sinks with unreliable HDMI 2.1 link training: some AV receivers only "
+	"negotiate VRR correctly after the link has actually dropped, regardless of GPU vendor." );
 
 gamescope::ConVar<int> cv_drm_modeset_link_down_settle_ms( "drm_modeset_link_down_settle_ms", 1000,
 	"How long to wait after the link-down commit before bringing the link back up. "
@@ -3164,10 +3166,16 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 		// If that worked, the disable pass below must NOT run: re-adding the
 		// zeroes to this request would rebuild exactly the disable-then-refill
 		// pattern we just went out of our way to avoid.
-		const bool bLinkTakenDown =
-			drm->vendorQuirks.bNeedsModesetLinkDown &&
-			cv_drm_modeset_link_down &&
-			drm_modeset_link_down( drm );
+		// -1 follows the driver quirk; 0 and 1 are the user overriding us. The
+		// override has to be able to turn this ON, not just off -- it is also a
+		// workaround for sinks that will not retrain properly, which is a
+		// property of the display, not the GPU.
+		const int nLinkDownMode = cv_drm_modeset_link_down;
+		const bool bWantLinkDown =
+			nLinkDownMode > 0 ||
+			( nLinkDownMode < 0 && drm->vendorQuirks.bNeedsModesetLinkDown );
+
+		const bool bLinkTakenDown = bWantLinkDown && drm_modeset_link_down( drm );
 
 		// Disable all connectors and CRTCs
 		// (Body deliberately left at its original indentation -- reindenting it

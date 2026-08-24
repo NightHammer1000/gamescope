@@ -30,6 +30,12 @@ The fork builds clean and its unit tests pass, but nothing here has been exercis
 
   This is NVIDIA-only. AMD and Intel keep Vulkan-allocated scanout and, more importantly, keep direct scanout of client buffers — the copy this compositor exists to avoid. Where GBM is required there is deliberately no fallback: falling back to Vulkan allocation on such a driver does not fail, it renders corruption, and refusing to start beats that.
 
+  Measured on real hardware: framecount is identical patched and unpatched, so the forced composition costs nothing in steady state.
+
+* **NVIDIA: modesets take the link fully down, settle, then bring it back up** as a separate commit, instead of zeroing and refilling `CRTC_ID` / `ACTIVE` / `MODE_ID` in one atomic request.
+
+  Set `drm_modeset_link_down=1` to force this on **any** driver. It is also a workaround for sinks with unreliable HDMI 2.1 link training — some AV receivers only negotiate VRR correctly once the link has actually dropped, which has nothing to do with the GPU. `drm_modeset_link_down=0` disables it, and `drm_modeset_link_down_settle_ms` tunes the wait.
+
 ## Currently included additional features
 
 *Nothing yet.*

@@ -42,6 +42,12 @@ namespace gamescope
 		// corruption. Measured on a 5080 against a 4K TV: splitting it into a
 		// real link-down commit, a settle, then a link-up brought the display up
 		// clean 8 times out of 10 where the single-request path corrupted.
+		//
+		// This flag is only the *default* for drivers known to need it. A real
+		// link drop also helps sinks whose HDMI 2.1 link training is unreliable
+		// -- some AV receivers only negotiate VRR correctly once the link has
+		// actually gone down -- and that is a property of the display, not the
+		// GPU. Users can force it on anywhere with drm_modeset_link_down=1.
 		bool bNeedsModesetLinkDown = false;
 	};
 
