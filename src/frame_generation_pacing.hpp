@@ -33,6 +33,14 @@ namespace gamescope
 		uint32_t queuedFrames, bool frontFrameGenerated )
 	{
 		return queuedFrames == 0u ||
+			( queuedFrames == 1u && !frontFrameGenerated ) ||
+			( queuedFrames == 2u && frontFrameGenerated );
+	}
+
+	constexpr bool FrameGenerationCanAcceptSourceFrame(
+		uint32_t queuedFrames, bool frontFrameGenerated )
+	{
+		return queuedFrames == 0u ||
 			( queuedFrames == 1u && !frontFrameGenerated );
 	}
 
@@ -41,6 +49,13 @@ namespace gamescope
 	{
 		return deadline != 0u && interval != 0u && now >= deadline &&
 			now - deadline >= interval;
+	}
+
+	constexpr bool FrameGenerationShouldDropStaleGenerated(
+		bool frontFrameGenerated, uint64_t now, uint64_t deadline, uint64_t interval )
+	{
+		return frontFrameGenerated &&
+			FrameGenerationOutputDeadlineMissed( now, deadline, interval );
 	}
 
 	constexpr uint64_t FrameGenerationNextOutputDeadline(

@@ -66,12 +66,18 @@ int main()
 	assert( sourceSlots == 45 );
 	assert( outputSlots == 90 );
 
-	// Let the client begin its next frame while the current real frame is queued,
-	// but not while the generated midpoint still needs to be presented.
+	// Let the client begin its next frame on the midpoint slot. Commit latching
+	// remains blocked separately until the midpoint drains, leaving one real.
 	assert( FrameGenerationCanRequestSourceFrame( 0, false ) );
-	assert( !FrameGenerationCanRequestSourceFrame( 2, true ) );
+	assert( FrameGenerationCanRequestSourceFrame( 2, true ) );
 	assert( !FrameGenerationCanRequestSourceFrame( 1, true ) );
 	assert( FrameGenerationCanRequestSourceFrame( 1, false ) );
+	assert( !FrameGenerationCanRequestSourceFrame( 3, true ) );
+
+	assert( FrameGenerationCanAcceptSourceFrame( 0, false ) );
+	assert( FrameGenerationCanAcceptSourceFrame( 1, false ) );
+	assert( !FrameGenerationCanAcceptSourceFrame( 1, true ) );
+	assert( !FrameGenerationCanAcceptSourceFrame( 2, true ) );
 
 	constexpr uint64_t outputInterval = 8'333'333;
 	const uint64_t firstDeadline = FrameGenerationNextOutputDeadline(
@@ -87,5 +93,11 @@ int main()
 	assert( FrameGenerationNextOutputDeadline(
 		firstDeadline, firstDeadline + outputInterval, outputInterval ) ==
 		firstDeadline + outputInterval * 2u );
+	assert( !FrameGenerationShouldDropStaleGenerated(
+		false, firstDeadline + outputInterval, firstDeadline, outputInterval ) );
+	assert( !FrameGenerationShouldDropStaleGenerated(
+		true, firstDeadline + outputInterval - 1, firstDeadline, outputInterval ) );
+	assert( FrameGenerationShouldDropStaleGenerated(
+		true, firstDeadline + outputInterval, firstDeadline, outputInterval ) );
 	return 0;
 }
