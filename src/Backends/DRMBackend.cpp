@@ -1036,15 +1036,42 @@ static std::unordered_map<std::string, int> parse_connector_priorities(const cha
 	return priorities;
 }
 
-static int get_connector_priority(struct drm_t *drm, const char *name)
+static int get_connector_priority(const std::unordered_map<std::string, int> &priorities, const char *name)
 {
-	if (drm->connector_priorities.count(name) > 0) {
-		return drm->connector_priorities[name];
+	if ( auto iter = priorities.find( name ); iter != priorities.end() ) {
+		return iter->second;
 	}
-	if (drm->connector_priorities.count("*") > 0) {
-		return drm->connector_priorities["*"];
+	if ( auto iter = priorities.find( "*" ); iter != priorities.end() ) {
+		return iter->second;
 	}
-	return drm->connector_priorities.size();
+	return priorities.size();
+}
+
+static int get_best_connector_priority_for_fd( int fd, const void *userdata )
+{
+	const auto &priorities = *static_cast<const std::unordered_map<std::string, int> *>( userdata );
+	drmModeRes *resources = drmModeGetResources( fd );
+	if ( !resources )
+		return INT_MAX;
+
+	int best_priority = INT_MAX;
+	for ( int i = 0; i < resources->count_connectors; i++ )
+	{
+		drmModeConnector *connector = drmModeGetConnector( fd, resources->connectors[i] );
+		if ( !connector )
+			continue;
+
+		if ( connector->connection == DRM_MODE_CONNECTED )
+		{
+			char name[64];
+			snprintf( name, sizeof( name ), "%s-%u", drmModeGetConnectorTypeName( connector->connector_type ), connector->connector_type_id );
+			best_priority = std::min( best_priority, get_connector_priority( priorities, name ) );
+		}
+		drmModeFreeConnector( connector );
+	}
+
+	drmModeFreeResources( resources );
+	return best_priority;
 }
 
 static bool get_saved_mode(const char *description, saved_mode &mode_info)
@@ -1099,7 +1126,7 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 		if ( g_bForceInternal && pConnector->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL )
 			continue;
 
-		int nPriority = get_connector_priority( drm, pConnector->GetName() );
+		int nPriority = get_connector_priority( drm->connector_priorities, pConnector->GetName() );
 		if ( nPriority < nBestPriority )
 		{
 			best = pConnector;
@@ -1262,7 +1289,7 @@ gamescope_liftoff_log_handler(enum liftoff_log_priority liftoff_priority, const 
 	liftoff_log_scope.vlogf(priority, fmt, args);
 }
 
-bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 {
 	load_pnps();
 
@@ -1272,33 +1299,26 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 	drm->preferred_height = height;
 	drm->preferred_refresh = refresh;
 
+	drm->fd = fd;
 	drm->device_name = nullptr;
-	dev_t dev_id = 0;
-	if (vulkan_primary_dev_id(&dev_id)) {
-		drmDevice *drm_dev = nullptr;
-		if (drmGetDeviceFromDevId(dev_id, 0, &drm_dev) != 0) {
-			drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)dev_id);
-			return false;
-		}
-		assert(drm_dev->available_nodes & (1 << DRM_NODE_PRIMARY));
-		drm->device_name = strdup(drm_dev->nodes[DRM_NODE_PRIMARY]);
-		drm_log.infof("opening DRM node '%s'", drm->device_name);
-	}
-	else
+
+	struct stat fd_stat = {};
+	if ( fstat( drm->fd, &fd_stat ) == 0 )
 	{
-		drm_log.infof("warning: picking an arbitrary DRM device");
+		drmDevice *drm_dev = nullptr;
+		if ( drmGetDeviceFromDevId( fd_stat.st_rdev, 0, &drm_dev ) == 0 )
+		{
+			if ( drm_dev->available_nodes & (1 << DRM_NODE_PRIMARY) )
+				drm->device_name = strdup( drm_dev->nodes[DRM_NODE_PRIMARY] );
+			drmFreeDevice( &drm_dev );
+		}
 	}
 
-	drm->fd = wlsession_open_kms( drm->device_name );
-	if ( drm->fd < 0 )
-	{
-		drm_log.errorf("Could not open KMS device");
-		return false;
-	}
+	drm_log.infof( "opening DRM node '%s'", drm->device_name ? drm->device_name : "unknown" );
 
 	if ( !drmIsKMS( drm->fd ) )
 	{
-		drm_log.errorf( "'%s' is not a KMS device", drm->device_name );
+		drm_log.errorf( "'%s' is not a KMS device", drm->device_name ? drm->device_name : "unknown" );
 		wlsession_close_kms();
 		return -1;
 	}
@@ -3734,19 +3754,48 @@ namespace gamescope
 
 		virtual bool Init() override
 		{
-			if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
-			{
-				fprintf( stderr, "Failed to initialize Vulkan\n" );
-				return false;
-			}
-
 			if ( !wlsession_init() )
 			{
 				fprintf( stderr, "Failed to initialize Wayland session\n" );
 				return false;
 			}
 
-			return init_drm( &g_DRM, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh );
+			const auto connector_priorities = parse_connector_priorities( g_sOutputName );
+			int kms_fd = wlsession_open_kms( nullptr, get_best_connector_priority_for_fd, &connector_priorities );
+			if ( kms_fd < 0 )
+			{
+				fprintf( stderr, "Failed to select KMS device\n" );
+				return false;
+			}
+
+			struct stat fd_stat = {};
+			if ( fstat( kms_fd, &fd_stat ) != 0 )
+			{
+				drm_log.errorf_errno( "Failed to identify selected KMS device" );
+				return false;
+			}
+
+			drmDevice *drm_device = nullptr;
+			if ( drmGetDeviceFromDevId( fd_stat.st_rdev, 0, &drm_device ) != 0 ||
+			     drm_device->bustype != DRM_BUS_PCI || !drm_device->deviceinfo.pci )
+			{
+				drm_log.errorf( "Selected KMS device has no PCI identity" );
+				if ( drm_device )
+					drmFreeDevice( &drm_device );
+				return false;
+			}
+
+			g_preferVendorID = drm_device->deviceinfo.pci->vendor_id;
+			g_preferDeviceID = drm_device->deviceinfo.pci->device_id;
+			drmFreeDevice( &drm_device );
+
+			if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
+			{
+				fprintf( stderr, "Failed to initialize Vulkan\n" );
+				return false;
+			}
+
+			return init_drm( &g_DRM, kms_fd, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh );
 		}
 
 		virtual bool PostInit() override

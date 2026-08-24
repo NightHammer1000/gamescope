@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <xf86drm.h>
+#include <xf86drmMode.h>
 #include <sys/eventfd.h>
 
 #include <linux/input-event-codes.h>
@@ -75,6 +76,7 @@
 #include "gpuvis_trace_utils.h"
 
 #include <algorithm>
+#include <climits>
 #include <list>
 #include <set>
 
@@ -1755,26 +1757,76 @@ static void kms_device_handle_change( struct wl_listener *listener, void *data )
 	nudge_steamcompmgr();
 }
 
-int wlsession_open_kms( const char *device_name ) {
+static void blank_kms_device( struct wlr_device *device )
+{
+	drmModeRes *resources = drmModeGetResources( device->fd );
+	if ( !resources )
+		return;
+
+	for ( int i = 0; i < resources->count_crtcs; i++ )
+	{
+		if ( drmModeSetCrtc( device->fd, resources->crtcs[i], 0, 0, 0, nullptr, 0, nullptr ) != 0 )
+			wl_log.errorf_errno( "Failed to blank unused KMS device" );
+	}
+
+	drmModeFreeResources( resources );
+}
+
+int wlsession_open_kms( const char *device_name, wlsession_kms_device_selector selector, const void *userdata ) {
 	if ( device_name != nullptr )
 	{
 		wlserver.wlr.device = wlr_session_open_file( wlserver.wlr.session, device_name );
 		if ( wlserver.wlr.device == nullptr )
 			return -1;
 	}
-	else
+
+	// Enumerate regardless of whether a device was named: we still want to know
+	// about the other GPUs so their displays can be turned off below.
+	struct wlr_device *devices[8] = {};
+	ssize_t n = wlr_session_find_gpus( wlserver.wlr.session, 8, devices );
+	if ( n < 0 )
+		n = 0;
+
+	if ( wlserver.wlr.device == nullptr )
 	{
-		ssize_t n = wlr_session_find_gpus( wlserver.wlr.session, 1, &wlserver.wlr.device );
-		if ( n < 0 )
-		{
-			wl_log.errorf( "Failed to list GPUs" );
-			return -1;
-		}
 		if ( n == 0 )
 		{
 			wl_log.errorf( "No GPU detected" );
 			return -1;
 		}
+
+		// Pick the GPU that actually drives the display we were asked for,
+		// rather than whichever one enumerated first. On a hybrid or eGPU box
+		// those are routinely not the same device.
+		int best_priority = INT_MAX;
+
+		for ( ssize_t i = 0; i < n; i++ )
+		{
+			int priority = selector ? selector( devices[i]->fd, userdata ) : 0;
+			if ( priority < best_priority )
+			{
+				best_priority = priority;
+				wlserver.wlr.device = devices[i];
+			}
+		}
+
+		if ( wlserver.wlr.device == nullptr )
+		{
+			wl_log.infof( "No connected KMS connector found; falling back to the first GPU" );
+			wlserver.wlr.device = devices[0];
+		}
+		else
+		{
+			wl_log.infof( "Selected KMS device with connector priority %d", best_priority );
+		}
+	}
+
+	// A second GPU left driving a display flickers or holds a stale image
+	// behind us. Blank anything that is not the device we are using.
+	for ( ssize_t i = 0; i < n; i++ )
+	{
+		if ( devices[i]->dev != wlserver.wlr.device->dev )
+			blank_kms_device( devices[i] );
 	}
 
 	wlserver.wlr.device_change_listener.notify = kms_device_handle_change;
