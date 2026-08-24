@@ -69,12 +69,14 @@ telescopectl drm_modeset_link_down 1
 
 ## Currently included additional features
 
-Nothing yet.
+* **Frame generation (fixed x2)**, ported from Antheas Kapenekakis's gamescope patch queue. FidelityFX Optical Flow v5 plus optical-flow-only interpolation synthesise a midpoint between real frames, paced against vblank or a free-running timer under VRR, with a GUI mask so overlays are not smeared, per-pass GPU timings, and telemetry through `gamescope-control`. Enabled per game via the `frame_generation` feature; the game runs at half the output rate.
+* **Universal DMA-BUF synchronization**, same origin. Explicit sync_file interop end to end: real per-buffer acquire fences into KMS and Vulkan, releases from the final consumer, and foreign fences relayed through compositor-owned timelines so one driver's failure cannot stall another's queue. This is what heterogeneous setups (iGPU compositor, dGPU game; eGPUs) stand on.
+* **Multi-GPU handling**: the KMS device is picked by which GPU has the display your `--prefer-output` names, other GPUs' displays are blanked at startup and on resume.
+* `--custom-refresh-rates` for panels whose EDID understates what they accept, and DPMS control through a root-window atom.
 
 ## Planned additional features
 
 * Additional upscalers (SGSR, BCAS, xBR, Anime4K)
-* Framegen?
 
 ## What was removed
 
