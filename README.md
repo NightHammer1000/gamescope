@@ -75,6 +75,10 @@ telescopectl drm_modeset_link_down 1
 * `--custom-refresh-rates` for panels whose EDID understates what they accept, and DPMS control through a root-window atom.
 * **Four extra upscalers** on top of upstream's FSR1 and NIS, each vendored from its original source: **SGSR** (Snapdragon Game Super Resolution v1, Qualcomm, BSD-3), **BCAS** (Catmull-Rom bicubic plus AMD FidelityFX CAS sharpening, MIT), **xBR** (Hyllian's xBR-lv2 edge interpolation for pixel art, MIT) and **Anime4K** (bloc97's CNN upscaler, the x2 S model, MIT). Pick with `-F sgsr`, `-F bcas`, `-F xbr` or `-F anime4k`. The sharpness slider feeds BCAS the way it feeds NIS.
 
+## Planned additional features
+
+* **An in-session settings overlay (`telescope-osd`)**: a small companion app that opens on a hotkey and lets you switch upscaler, sharpness, link-down and frame generation live, without Steam's UI knowing anything about them. All the pieces already exist: it draws through the same external overlay plane mangoapp uses, grabs its keys through the `gamescope-action-binding` protocol only while the menu is open, and applies settings through the same control channel `telescopectl` uses. The compositor itself stays untouched.
+
 ## What was removed
 
 Telescope targets the DRM/KMS session case only. Removed from upstream:
