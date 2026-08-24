@@ -601,6 +601,7 @@ enum ShaderType {
 	SHADER_TYPE_BLUR_FIRST_PASS,
 	SHADER_TYPE_EASU,
 	SHADER_TYPE_RCAS,
+	SHADER_TYPE_RCAS_FP16,
 	SHADER_TYPE_NIS,
 	SHADER_TYPE_RGB_TO_NV12,
 
@@ -865,6 +866,7 @@ public:
 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
+	inline uint32_t vendorID() {return m_uVendorID;}
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size)
@@ -927,6 +929,7 @@ protected:
 	dev_t m_drmPrimaryDevId = 0;
 
 	bool m_bSupportsFp16 = false;
+	uint32_t m_uVendorID = 0;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
 	bool m_bInitialized = false;

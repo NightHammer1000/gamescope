@@ -42,6 +42,7 @@
 #include "cs_composite_blur.h"
 #include "cs_composite_blur_cond.h"
 #include "cs_composite_rcas.h"
+#include "cs_composite_rcas_fp16.h"
 #include "cs_easu.h"
 #include "cs_easu_fp16.h"
 #include "cs_gaussian_blur_horizontal.h"
@@ -122,6 +123,7 @@ VulkanOutput_t g_output;
 
 uint32_t g_uCompositeDebug = 0u;
 gamescope::ConVar<uint32_t> cv_composite_debug{ "composite_debug", 0, "Debug composition flags" };
+gamescope::ConVar<int> cv_fsr_rcas_fp16{ "fsr_rcas_fp16", -1, "FSR RCAS FP16 mode: -1 = automatic on AMD, 0 = disabled, 1 = enabled when supported" };
 
 static std::map< VkFormat, std::map< uint64_t, VkDrmFormatModifierPropertiesEXT > > DRMModifierProps = {};
 static std::unordered_map<uint32_t, std::vector<uint64_t>> s_SampledModifierFormats = {};
@@ -420,6 +422,7 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 
 	VkPhysicalDeviceProperties props;
 	vk.GetPhysicalDeviceProperties( m_physDev, &props );
+	m_uVendorID = props.vendorID;
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
 
 	return true;
@@ -954,11 +957,13 @@ bool CVulkanDevice::createShaders()
 	SHADER(RCAS, cs_composite_rcas);
 	if (m_bSupportsFp16)
 	{
+		SHADER(RCAS_FP16, cs_composite_rcas_fp16);
 		SHADER(EASU, cs_easu_fp16);
 		SHADER(NIS, cs_nis_fp16);
 	}
 	else
 	{
+		SHADER(RCAS_FP16, cs_composite_rcas);
 		SHADER(EASU, cs_easu);
 		SHADER(NIS, cs_nis);
 	}
@@ -1202,6 +1207,7 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	SHADER(BLUR_COND, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
 	SHADER(BLUR_FIRST_PASS, 1, 2, 1);
 	SHADER(RCAS, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(RCAS_FP16, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(EASU, 1, 1, 1);
 	SHADER(NIS, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
@@ -4274,6 +4280,33 @@ static bool can_use_simple_fsr_output( const FrameInfo_t *frameInfo, CVulkanText
 	return true;
 }
 
+static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTexture *output, EOTF outputTF )
+{
+	if ( cv_fsr_rcas_fp16 == 0 ||
+	     !g_device.supportsFp16() ||
+	     !frameInfo->applyOutputColorMgmt ||
+	     outputTF != EOTF_Gamma22 ||
+	     g_bHDRItmEnable ||
+	     !is_8bit_sdr_target( output ) )
+		return false;
+
+	// Automatic mode is intentionally conservative until other vendors have
+	// equivalent image-quality and driver validation. Positive values override
+	// the vendor policy, but never the Vulkan feature or SDR format checks.
+	if ( cv_fsr_rcas_fp16 < 0 && g_device.vendorID() != 0x1002 )
+		return false;
+
+	for ( int i = 0; i < frameInfo->layers.count(); i++ )
+	{
+		const GamescopeAppTextureColorspace colorspace = frameInfo->layers.get( i ).colorspace;
+		if ( colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR &&
+		     colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB )
+			return false;
+	}
+
+	return true;
+}
+
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
 {
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
@@ -4317,7 +4350,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->dispatch(div_roundup(tempX, pixelsPerGroup), div_roundup(tempY, pixelsPerGroup));
 
 		const bool simpleFsrOutput = can_use_simple_fsr_output( frameInfo, compositeImage.get(), outputTF );
-		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_RCAS, frameInfo->layers.count(), frameInfo->ycbcrMask() & ~1, 0u, frameInfo->colorspaceMask(), outputTF, false, simpleFsrOutput ));
+		const ShaderType rcasShader = can_use_fp16_fsr_rcas( frameInfo, compositeImage.get(), outputTF )
+			? SHADER_TYPE_RCAS_FP16
+			: SHADER_TYPE_RCAS;
+		cmdBuffer->bindPipeline(g_device.pipeline(rcasShader, frameInfo->layers.count(), frameInfo->ycbcrMask() & ~1, 0u, frameInfo->colorspaceMask(), outputTF, false, simpleFsrOutput ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 		cmdBuffer->bindTexture(0, g_output.tmpOutput);
 		cmdBuffer->setTextureSrgb(0, true);
