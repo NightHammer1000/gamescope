@@ -10,8 +10,10 @@ dep_xres = dependency('xres')
 dep_xmu = dependency('xmu')
 dep_xi = dependency('xi')
 
-drm_dep = dependency('libdrm', version: '>= 2.4.113', required: get_option('drm_backend'))
-gbm_dep = dependency('gbm', version: '>= 21.3', required: false)
+# Telescope is a DRM session compositor: a build without it is not this project.
+# The HAVE_DRM guards stay, deliberately -- rewriting them would cost upstream merges.
+drm_dep = dependency('libdrm', version: '>= 2.4.113', required: true)
+gbm_dep = dependency('gbm', version: '>= 21.3', required: true)
 eis_dep = dependency('libeis-1.0', required : get_option('input_emulation'))
 
 wayland_server = dependency('wayland-server', version: '>=1.21')
