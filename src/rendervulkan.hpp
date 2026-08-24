@@ -302,6 +302,8 @@ struct FrameInfo_t
 	bool applyOutputColorMgmt; // drm only
 	EOTF outputEncodingEOTF;
 
+	bool dpms = false;
+
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
