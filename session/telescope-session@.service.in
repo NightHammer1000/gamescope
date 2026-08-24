@@ -6,7 +6,7 @@ Wants=graphical-session-pre.target
 After=graphical-session-pre.target
 
 [Service]
-ExecStart=/usr/share/telescope-session/telescope-session %i
+ExecStart=@sessiondir@/telescope-session %i
 KillMode=mixed
 # Make Steam's srt-logger write to the journal with its own prefixes
 Environment=SRT_LOG_TO_JOURNAL=1

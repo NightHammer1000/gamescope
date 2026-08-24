@@ -11,7 +11,7 @@
 set -x
 
 declare -r CLIENT=$1
-declare -r CLIENT_CONFIG_DIR_USR=/usr/share/telescope-session/sessions.d
+declare -r CLIENT_CONFIG_DIR_USR=@sessiondir@/sessions.d
 declare -r CLIENT_CONFIG_DIR_ETC=/etc/telescope-session/sessions.d
 declare -r CLIENT_CONFIG_DIR_LOCAL="${XDG_CONFIG_HOME:-$HOME/.config}/telescope-session/sessions.d"
 
@@ -20,7 +20,7 @@ post_telescope_start() { :; }
 post_client_shutdown() { :; }
 
 get_telescope_binary() {
-	if [ -n "$TELESCOPE_BIN" ]; then echo "$TELESCOPE_BIN"; else echo "/usr/bin/telescope"; fi
+	if [ -n "$TELESCOPE_BIN" ]; then echo "$TELESCOPE_BIN"; else echo "@bindir@/telescope"; fi
 }
 
 # Feature-detect rather than assume: this script outlives any one build.
@@ -61,7 +61,13 @@ echo "1x1" > "$RADV_FORCE_VRS_CONFIG_FILE"
 ulimit -n 524288
 
 # shellcheck source=/dev/null
-[ -f /usr/share/telescope-session/device-quirks ] && . /usr/share/telescope-session/device-quirks
+# Machine-specific setup, keyed on SYS_ID. Sourced, so it can define the
+# short_session_recover / post_telescope_start / post_client_shutdown hooks
+# as well as export variables.
+SYS_ID="$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null)"
+export SYS_ID
+# shellcheck source=/dev/null
+[ -f @sessiondir@/device-quirks ] && . @sessiondir@/device-quirks
 
 set -a
 for i in ${CLIENT_CONFIG_DIR_USR}/${CLIENT} ${CLIENT_CONFIG_DIR_ETC}/${CLIENT} ${CLIENT_CONFIG_DIR_LOCAL}/${CLIENT}; do
@@ -193,8 +199,8 @@ fi
 
 post_telescope_start
 
-command -v /usr/bin/ibus-daemon >/dev/null && \
-	/usr/bin/ibus-daemon -d -r --panel=disable --emoji-extension=disable
+command -v ibus-daemon >/dev/null && \
+	ibus-daemon -d -r --panel=disable --emoji-extension=disable
 
 if command -v mangoapp >/dev/null; then
 	(while true; do mangoapp; done) &
