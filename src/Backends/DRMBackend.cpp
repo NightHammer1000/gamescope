@@ -588,6 +588,7 @@ extern bool fadingOut;
 
 bool drm_update_color_mgmt(struct drm_t *drm);
 bool drm_supports_color_mgmt(struct drm_t *drm);
+bool drm_supports_blend_tf(struct drm_t *drm);
 bool drm_set_connector( struct drm_t *drm, gamescope::CDRMConnector *conn );
 
 struct drm_color_ctm2 {
@@ -2802,13 +2803,16 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				}
 			}
 
-			if ( drm_supports_color_mgmt( drm ) )
+			if ( drm_supports_blend_tf( drm ) )
 			{
 				if (!cv_drm_debug_disable_blend_tf && !bSinglePlane)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", drm->pending.output_tf );
 				else
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
+			}
 
+			if ( drm_supports_color_mgmt( drm ) )
+			{
 				if (!cv_drm_debug_disable_ctm && frameInfo->layers.get( i ).ctm != nullptr)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", frameInfo->layers.get( i ).ctm->GetBlobValue() );
 				else
@@ -2830,9 +2834,11 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_LUT", 0 );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_TF", 0 );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_LUT3D", 0 );
-				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", 0 );
 			}
+
+			if ( drm_supports_blend_tf( drm ) )
+				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 		}
 	}
 
@@ -3669,6 +3675,12 @@ std::pair<uint32_t, uint32_t> drm_get_connector_identifier(struct drm_t *drm)
 	return std::make_pair(drm->pConnector->GetModeConnector()->connector_type, drm->pConnector->GetModeConnector()->connector_type_id);
 }
 
+// Per-plane colour conversion: degamma, shaper LUT, 3D LUT and CTM.
+//
+// Deliberately does NOT include BLEND_TF. That is a separate capability, and
+// hardware exists that has everything here but not that; gating the whole
+// pipeline on it costs those cards degamma, shaper, 3D LUT and CTM for no
+// reason. Ask drm_supports_blend_tf() for that one.
 bool drm_supports_color_mgmt(struct drm_t *drm)
 {
 	if ( g_bForceDisableColorMgmt )
@@ -3677,7 +3689,23 @@ bool drm_supports_color_mgmt(struct drm_t *drm)
 	if ( !drm->pPrimaryPlane )
 		return false;
 
-	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_CTM.has_value() && drm->pPrimaryPlane->GetProperties().AMD_PLANE_BLEND_TF.has_value();
+	const auto &props = drm->pPrimaryPlane->GetProperties();
+	return props.AMD_PLANE_CTM.has_value()
+		&& props.AMD_PLANE_DEGAMMA_TF.has_value()
+		&& props.AMD_PLANE_SHAPER_LUT.has_value()
+		&& props.AMD_PLANE_LUT3D.has_value();
+}
+
+// The blend-space transfer function, asked for on its own.
+bool drm_supports_blend_tf(struct drm_t *drm)
+{
+	if ( g_bForceDisableColorMgmt )
+		return false;
+
+	if ( !drm->pPrimaryPlane )
+		return false;
+
+	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_BLEND_TF.has_value();
 }
 
 std::span<const uint32_t> drm_get_valid_refresh_rates( struct drm_t *drm )
@@ -4226,7 +4254,11 @@ namespace gamescope
 
 		bool SupportsColorManagement() const
 		{
-			return drm_supports_color_mgmt( &g_DRM );
+			// Stricter than drm_supports_color_mgmt() on purpose. This only
+			// decides whether the planes can handle HDR without compositing,
+			// and blending several layers in the wrong space is exactly what
+			// BLEND_TF is for. Without it, keep forcing the composite.
+			return drm_supports_color_mgmt( &g_DRM ) && drm_supports_blend_tf( &g_DRM );
 		}
 
 		int Commit( const FrameInfo_t *pFrameInfo )
