@@ -20,7 +20,7 @@ namespace gamescope
 	struct FrameGenerationConfig
 	{
 		bool enabled = false;
-		uint32_t flowScalePercent = 100;
+		uint32_t flowScalePercent = 75;
 		bool operator==( const FrameGenerationConfig &other ) const = default;
 	};
 

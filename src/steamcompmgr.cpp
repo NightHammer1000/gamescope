@@ -2592,10 +2592,31 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 		stats_printf( "framegen_fi_interpolation_gpu_ms=%f\n", frameGenerationTelemetry.gpu.interpolationAndInpaintingMilliseconds );
 		stats_printf( "framegen_generated_fsr_gpu_ms=%f\n", frameGenerationTelemetry.gpu.generatedFsrMilliseconds );
 		stats_printf( "framegen_total_gpu_ms=%f\n", frameGenerationTelemetry.gpu.totalMilliseconds );
+		stats_printf( "framegen_prepare_luma_gpu_ms=%f\n", frameGenerationTelemetry.gpu.prepareLumaMilliseconds );
+		stats_printf( "framegen_luma_pyramid_gpu_ms=%f\n", frameGenerationTelemetry.gpu.luminancePyramidMilliseconds );
+		stats_printf( "framegen_scene_change_gpu_ms=%f\n", frameGenerationTelemetry.gpu.sceneChangeMilliseconds );
+		stats_printf( "framegen_of_search_gpu_ms=%f\n", frameGenerationTelemetry.gpu.opticalFlowSearchMilliseconds );
+		stats_printf( "framegen_of_filter_gpu_ms=%f\n", frameGenerationTelemetry.gpu.opticalFlowFilterMilliseconds );
+		stats_printf( "framegen_of_scale_gpu_ms=%f\n", frameGenerationTelemetry.gpu.opticalFlowScaleMilliseconds );
+		stats_printf( "framegen_gui_mask_gpu_ms=%f\n", frameGenerationTelemetry.gpu.guiMaskMilliseconds );
+		stats_printf( "framegen_midpoint_gpu_ms=%f\n", frameGenerationTelemetry.gpu.midpointMilliseconds );
+		stats_printf( "framegen_inpainting_pyramid_gpu_ms=%f\n", frameGenerationTelemetry.gpu.inpaintingPyramidMilliseconds );
+		stats_printf( "framegen_inpainting_gpu_ms=%f\n", frameGenerationTelemetry.gpu.inpaintingMilliseconds );
+		stats_printf( "framegen_output_composite_gpu_ms=%f\n", frameGenerationTelemetry.gpu.outputCompositeMilliseconds );
+		stats_printf( "framegen_source_frames=%" PRIu64 "\n", frameGenerationTelemetry.sourceFrames );
+		stats_printf( "framegen_source_callbacks=%" PRIu64 "\n", frameGenerationTelemetry.sourceCallbacks );
+		stats_printf( "framegen_source_callbacks_blocked=%" PRIu64 "\n", frameGenerationTelemetry.sourceCallbacksBlocked );
+		stats_printf( "framegen_output_slots=%" PRIu64 "\n", frameGenerationTelemetry.outputSlots );
+		stats_printf( "framegen_output_slots_without_pending=%" PRIu64 "\n", frameGenerationTelemetry.outputSlotsWithoutPending );
+		stats_printf( "framegen_queue_underruns=%" PRIu64 "\n", frameGenerationTelemetry.queueUnderruns );
+		stats_printf( "framegen_repeated_real=%" PRIu64 "\n", frameGenerationTelemetry.repeatedRealFrames );
 		stats_printf( "framegen_generated=%" PRIu64 "\n", frameGenerationTelemetry.generatedFrames );
 		stats_printf( "framegen_presented=%" PRIu64 "\n", frameGenerationTelemetry.presentedGeneratedFrames );
+		stats_printf( "framegen_presented_real=%" PRIu64 "\n", frameGenerationTelemetry.presentedRealFrames );
 		stats_printf( "framegen_deadline_dropped=%" PRIu64 "\n", frameGenerationTelemetry.deadlineDroppedFrames );
 		stats_printf( "framegen_scene_cut_copies=%" PRIu64 "\n", frameGenerationTelemetry.sceneCutCopies );
+		stats_printf( "framegen_source_interval_ms=%f\n", frameGenerationTelemetry.sourceFrameIntervalMilliseconds );
+		stats_printf( "framegen_queue_depth=%u\n", frameGenerationTelemetry.queuedFrames );
 		stats_printf( "framegen_flow_scale_percent=%u\n", frameGenerationTelemetry.flowScalePercent );
 		stats_printf( "framegen_source_cadence_hz=%u\n", frameGenerationTelemetry.sourceCadenceHz );
 		stats_printf( "framegen_output_cadence_hz=%u\n", frameGenerationTelemetry.outputCadenceHz );
@@ -2875,6 +2896,14 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 		g_bFSRActive = ( heldCommit->upscaledTexture->eFilter == GamescopeUpscaleFilter::FSR );
 	}
 
+	// Screenshots of the composition should use the real application layer, not
+	// a queued frame-generation scanout.  Apart from being the expected image to
+	// archive, this keeps screenshot command buffers from retaining framegen's
+	// scanout pool across focus changes (for example when opening Steam).
+	std::optional<FrameInfo_t> frameInfoWithoutFrameGeneration;
+	if ( gamescope::CScreenshotManager::Get().HasPendingScreenshot() )
+		frameInfoWithoutFrameGeneration = frameInfo;
+
 	const gamescope::FrameGenerationConfig frameGeneration = gamescope::GetFrameGenerationConfig();
 	const bool frameGenerationEligible = frameGeneration.enabled &&
 		steamcompmgr_window_allows_frame_generation( w ) &&
@@ -2967,11 +2996,17 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 		return;
 	}
 
-	std::optional<gamescope::GamescopeScreenshotInfo> oScreenshotInfo =
-		gamescope::CScreenshotManager::Get().ProcessPendingScreenshot();
+	std::optional<gamescope::GamescopeScreenshotInfo> oScreenshotInfo;
+	if ( frameInfoWithoutFrameGeneration )
+		oScreenshotInfo = gamescope::CScreenshotManager::Get().ProcessPendingScreenshot();
 
 	if ( oScreenshotInfo )
 	{
+		FrameInfo_t screenshotFrameInfo =
+			oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER
+				? frameInfo
+				: *frameInfoWithoutFrameGeneration;
+
 		std::filesystem::path path = std::filesystem::path{ oScreenshotInfo->szScreenshotPath };
 
 		uint32_t drmCaptureFormat = DRM_FORMAT_INVALID;
@@ -3010,8 +3045,8 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 		if ( pScreenshotTexture )
 		{
 			bool bHDRScreenshot = path.extension() == ".avif" &&
-								  frameInfo.layers.count() > 0 &&
-								  ColorspaceIsHDR( frameInfo.layers.get( 0 ).colorspace ) &&
+								  screenshotFrameInfo.layers.count() > 0 &&
+								  ColorspaceIsHDR( screenshotFrameInfo.layers.get( 0 ).colorspace ) &&
 								  oScreenshotInfo->eScreenshotType != GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER;
 
 			if ( drmCaptureFormat == DRM_FORMAT_NV12 || oScreenshotInfo->eScreenshotType != GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
@@ -3020,18 +3055,18 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 				for ( uint32_t nInputEOTF = 0; nInputEOTF < EOTF_Count; nInputEOTF++ )
 				{
 					auto& luts = bHDRScreenshot ? g_ScreenshotColorMgmtLutsHDR : g_ScreenshotColorMgmtLuts;
-					frameInfo.lut3D[nInputEOTF] = luts[nInputEOTF].vk_lut3d;
-					frameInfo.shaperLut[nInputEOTF] = luts[nInputEOTF].vk_lut1d;
+					screenshotFrameInfo.lut3D[nInputEOTF] = luts[nInputEOTF].vk_lut3d;
+					screenshotFrameInfo.shaperLut[nInputEOTF] = luts[nInputEOTF].vk_lut1d;
 				}
 
 				if ( oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_BASE_PLANE_ONLY )
 				{
 					// Remove everything but base planes from the screenshot.
-					for (int i = 0; i < frameInfo.layers.count(); i++)
+					for (int i = 0; i < screenshotFrameInfo.layers.count(); i++)
 					{
-						if (frameInfo.layers.get( i ).zpos >= (int)g_zposExternalOverlay)
+						if (screenshotFrameInfo.layers.get( i ).zpos >= (int)g_zposExternalOverlay)
 						{
-							frameInfo.layers.truncate( i );
+							screenshotFrameInfo.layers.truncate( i );
 							break;
 						}
 					}
@@ -3041,11 +3076,11 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 					if ( is_mura_correction_enabled() )
 					{
 						// Remove the last layer which is for mura...
-						for (int i = 0; i < frameInfo.layers.count(); i++)
+						for (int i = 0; i < screenshotFrameInfo.layers.count(); i++)
 						{
-							if (frameInfo.layers.get( i ).zpos >= (int)g_zposMuraCorrection)
+							if (screenshotFrameInfo.layers.get( i ).zpos >= (int)g_zposMuraCorrection)
 							{
-								frameInfo.layers.truncate( i );
+								screenshotFrameInfo.layers.truncate( i );
 								break;
 							}
 						}
@@ -3053,10 +3088,10 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 				}
 
 				// Re-enable output color management (blending) if it was disabled by mura.
-				frameInfo.applyOutputColorMgmt = true;
+				screenshotFrameInfo.applyOutputColorMgmt = true;
 			}
 
-			frameInfo.outputEncodingEOTF = bHDRScreenshot ? EOTF_PQ : EOTF_Gamma22;
+			screenshotFrameInfo.outputEncodingEOTF = bHDRScreenshot ? EOTF_PQ : EOTF_Gamma22;
 
 			uint32_t uCompositeDebugBackup = g_uCompositeDebug;
 
@@ -3067,10 +3102,10 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 
 			std::optional<uint64_t> oScreenshotSeq;
 			if ( drmCaptureFormat == DRM_FORMAT_NV12 )
-				oScreenshotSeq = vulkan_composite( &frameInfo, pScreenshotTexture, false, pRGBTexture );
+				oScreenshotSeq = vulkan_composite( &screenshotFrameInfo, pScreenshotTexture, false, pRGBTexture );
 			else if ( oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_FULL_COMPOSITION ||
 					  oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
-				oScreenshotSeq = vulkan_composite( &frameInfo, nullptr, false, pScreenshotTexture );
+				oScreenshotSeq = vulkan_composite( &screenshotFrameInfo, nullptr, false, pScreenshotTexture );
 			else if ( bRenderSizeScreenshot )
 			{
 				FrameInfo_t screenshotFrameInfo{};
@@ -3109,7 +3144,7 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 				currentOutputHeight = uBackupHeight;
 			}
 			else
-				oScreenshotSeq = vulkan_screenshot( &frameInfo, pScreenshotTexture, nullptr );
+				oScreenshotSeq = vulkan_screenshot( &screenshotFrameInfo, pScreenshotTexture, nullptr );
 
 			if ( oScreenshotInfo->eScreenshotType != GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
 			{
@@ -6130,7 +6165,11 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 			? !vulkan_frame_generation_can_request_source_frame()
 			: !vulkan_frame_generation_can_accept_source_frame();
 		if ( blocked )
+		{
+			if ( frameCallback )
+				vulkan_frame_generation_note_source_callback( true );
 			return false;
+		}
 		// Source callbacks own the 60 Hz cadence. Once the midpoint drains and
 		// only its following real frame remains, latch the next source immediately
 		// so generation gets the complete interval before its output slot.
@@ -6151,6 +6190,8 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 			}
 			return false;
 		}
+		if ( frameCallback )
+			vulkan_frame_generation_note_source_callback( false );
 		return true;
 	}
 	if ( frameGenerationOverlayActive )
@@ -6559,7 +6600,7 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 	if ( ev->atom == ctx->atoms.gamescopeFrameGenerationFlowScale )
 	{
 		gamescope::SetFrameGenerationFlowScale(
-			get_prop( ctx, ctx->root, ctx->atoms.gamescopeFrameGenerationFlowScale, 100 ) );
+			get_prop( ctx, ctx->root, ctx->atoms.gamescopeFrameGenerationFlowScale, 75 ) );
 		hasRepaint = true;
 	}
 	if ( ev->atom == ctx->atoms.gamescopeXWaylandModeControl )
@@ -7057,6 +7098,7 @@ static void
 steamcompmgr_exit(void)
 {
 	g_ImageWaiter.Shutdown();
+	vulkan_frame_generation_reset();
 
 	// Clean up any commits.
 	{
@@ -9483,7 +9525,11 @@ steamcompmgr_main(int argc, char **argv)
 				: 0;
 			const bool frameGenerationFreeRunning = bFrameGeneration &&
 				( bVRR || eFlipType == FlipType::Async );
-			bool frameGenerationPending =
+			// A queued frame belongs to the frame-generating focus.  Do not let it
+			// suppress painting after focus has moved to an ineligible window (most
+			// notably Steam while transitioning to Settings or Media).  That paint
+			// will reset the stale frame-generation queue in paint_all().
+			bool frameGenerationPending = bFrameGeneration &&
 				vulkan_frame_generation_has_pending_frame();
 			const uint64_t frameGenerationNow = get_time_in_nanos();
 
@@ -9504,6 +9550,12 @@ steamcompmgr_main(int argc, char **argv)
 
 			const bool frameGenerationTimerOutputDue = frameGenerationFreeRunning &&
 				frameGenerationPending && s_bFrameGenerationOutputTimerDue;
+			const bool frameGenerationVblankOutputDue = bFrameGeneration &&
+				!frameGenerationFreeRunning && vblank &&
+				gamescope::FrameGenerationOutputSlotDue(
+					vblank_idx, frameGenerationOutputFPS, frameGenerationRefreshHz );
+			if ( frameGenerationVblankOutputDue )
+				vulkan_frame_generation_note_output_slot( frameGenerationPending );
 
 			if ( frameGenerationTimerOutputDue &&
 				vulkan_frame_generation_drop_stale_generated_frame(
@@ -9580,8 +9632,7 @@ steamcompmgr_main(int argc, char **argv)
 				if ( frameGenerationFreeRunning )
 					bShouldPaint = frameGenerationTimerOutputDue;
 				else if ( vblank )
-					bShouldPaint = gamescope::FrameGenerationOutputSlotDue(
-						vblank_idx, frameGenerationOutputFPS, frameGenerationRefreshHz );
+					bShouldPaint = frameGenerationVblankOutputDue;
 				else
 					bShouldPaint = false;
 

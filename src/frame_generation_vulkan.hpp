@@ -15,14 +15,16 @@ bool vulkan_frame_generation_record_optical_flow(
 	bool reset );
 
 // Run the optical-flow-only FI vector field, midpoint, SPD inpainting pyramid,
-// and final inpainting after a successful optical-flow record. The returned
-// FP16 texture remains in raw pre-FSR dimensions. SDR remains in its source
-// encoding; HDR is converted to linear scRGB for interpolation and inpainting.
+// and final inpainting after a successful optical-flow record. The output
+// remains in raw pre-FSR dimensions. SDR remains in its source encoding; HDR
+// is converted to linear scRGB for interpolation and inpainting. When supplied,
+// finalOutput is used for the complete midpoint/inpainting chain and returned.
 gamescope::Rc<CVulkanTexture> vulkan_frame_generation_record_interpolation(
 	CVulkanCmdBuffer *cmdBuffer,
 	gamescope::Rc<CVulkanTexture> previous,
 	gamescope::Rc<CVulkanTexture> current,
-	bool reset );
+	bool reset,
+	gamescope::Rc<CVulkanTexture> finalOutput = nullptr );
 
 // Associate the most recently recorded work with Gamescope's submission
 // timeline so descriptor and image resources are never reused while in flight.
@@ -30,6 +32,7 @@ void vulkan_frame_generation_notify_submit( uint64_t sequence );
 bool vulkan_frame_generation_work_complete();
 void vulkan_frame_generation_reset_optical_flow();
 bool vulkan_frame_generation_ab_enabled();
+bool vulkan_frame_generation_direct_output_enabled();
 
 void vulkan_frame_generation_record_output_timestamp(
 	CVulkanCmdBuffer *cmdBuffer, bool usedFsr );

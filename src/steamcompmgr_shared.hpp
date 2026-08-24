@@ -293,6 +293,7 @@ namespace gamescope
 		{
 			std::unique_lock lock{ m_ScreenshotInfoMutex };
 			m_ScreenshotInfo = std::move( info );
+			m_bScreenshotPending.store( true, std::memory_order_release );
 			hasRepaint = true;
 		}
 
@@ -309,16 +310,25 @@ namespace gamescope
 			} );
 		}
 
+		bool HasPendingScreenshot() const
+		{
+			return m_bScreenshotPending.load( std::memory_order_acquire );
+		}
+
 		std::optional<GamescopeScreenshotInfo> ProcessPendingScreenshot()
 		{
 			std::unique_lock lock{ m_ScreenshotInfoMutex };
-			return std::exchange( m_ScreenshotInfo, std::nullopt );
+			std::optional<GamescopeScreenshotInfo> result =
+				std::exchange( m_ScreenshotInfo, std::nullopt );
+			m_bScreenshotPending.store( false, std::memory_order_release );
+			return result;
 		}
 
 		static CScreenshotManager &Get();
 	private:
 		std::mutex m_ScreenshotInfoMutex;
 		std::optional<GamescopeScreenshotInfo> m_ScreenshotInfo;
+		std::atomic<bool> m_bScreenshotPending = false;
 	};
 
 	extern CScreenshotManager g_ScreenshotMgr;

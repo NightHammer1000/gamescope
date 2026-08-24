@@ -471,6 +471,17 @@ void vulkan_frame_generation_reset();
 
 struct FrameGenerationGpuTimings
 {
+	double prepareLumaMilliseconds = 0.0;
+	double luminancePyramidMilliseconds = 0.0;
+	double sceneChangeMilliseconds = 0.0;
+	double opticalFlowSearchMilliseconds = 0.0;
+	double opticalFlowFilterMilliseconds = 0.0;
+	double opticalFlowScaleMilliseconds = 0.0;
+	double guiMaskMilliseconds = 0.0;
+	double midpointMilliseconds = 0.0;
+	double inpaintingPyramidMilliseconds = 0.0;
+	double inpaintingMilliseconds = 0.0;
+	double outputCompositeMilliseconds = 0.0;
 	double preparationAndPyramidMilliseconds = 0.0;
 	double searchAndFilterMilliseconds = 0.0;
 	double vectorFieldMilliseconds = 0.0;
@@ -482,15 +493,27 @@ struct FrameGenerationGpuTimings
 struct FrameGenerationTelemetry
 {
 	FrameGenerationGpuTimings gpu;
+	uint64_t sourceFrames = 0;
+	uint64_t sourceCallbacks = 0;
+	uint64_t sourceCallbacksBlocked = 0;
+	uint64_t outputSlots = 0;
+	uint64_t outputSlotsWithoutPending = 0;
+	uint64_t queueUnderruns = 0;
+	uint64_t repeatedRealFrames = 0;
 	uint64_t generatedFrames = 0;
 	uint64_t presentedGeneratedFrames = 0;
+	uint64_t presentedRealFrames = 0;
 	uint64_t deadlineDroppedFrames = 0;
 	uint64_t sceneCutCopies = 0;
-	uint32_t flowScalePercent = 100;
+	double sourceFrameIntervalMilliseconds = 0.0;
+	uint32_t queuedFrames = 0;
+	uint32_t flowScalePercent = 75;
 	uint32_t sourceCadenceHz = 0;
 	uint32_t outputCadenceHz = 0;
 };
 FrameGenerationTelemetry vulkan_frame_generation_get_telemetry();
+void vulkan_frame_generation_note_source_callback( bool blocked );
+void vulkan_frame_generation_note_output_slot( bool hasPendingFrame );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);

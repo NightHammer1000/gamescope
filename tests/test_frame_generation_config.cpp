@@ -14,7 +14,7 @@ int main()
 	static_assert( static_cast<uint32_t>( FrameGenerationStatus::DeadlineMiss ) == 5 );
 
 	SetFrameGenerationEnabled( 0 );
-	SetFrameGenerationFlowScale( 100 );
+	SetFrameGenerationFlowScale( 75 );
 	assert( GetFrameGenerationConfig() == FrameGenerationConfig{} );
 	assert( GetFrameGenerationStatus() == FrameGenerationStatus::Disabled );
 
@@ -29,8 +29,8 @@ int main()
 	SetFrameGenerationStatus( FrameGenerationStatus::Active );
 	assert( GetFrameGenerationConfigSerial() == enabledConfigSerial );
 
-	SetFrameGenerationFlowScale( 75 );
-	assert( GetFrameGenerationConfig().flowScalePercent == 75 );
+	SetFrameGenerationFlowScale( 60 );
+	assert( GetFrameGenerationConfig().flowScalePercent == 60 );
 	assert( GetFrameGenerationStatus() == FrameGenerationStatus::WarmingUp );
 	assert( GetFrameGenerationConfigSerial() > enabledConfigSerial );
 	assert( GetFrameGenerationStateSerial() > enabledSerial );
