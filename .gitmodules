@@ -10,3 +10,6 @@
 [submodule "subprojects/libdisplay-info"]
 	path = subprojects/libdisplay-info
 	url = https://gitlab.freedesktop.org/emersion/libdisplay-info
+[submodule "subprojects/FidelityFX-SDK"]
+	path = subprojects/FidelityFX-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK

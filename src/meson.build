@@ -77,6 +77,76 @@ shader_src = [
 
 spirv_shaders = glsl_generator.process(shader_src)
 
+# FidelityFX SDK 1.1.4 is the last upstream SDK release with maintained
+# Vulkan/GLSL frame-generation shaders. Keep these as standalone shader
+# modules; Gamescope owns resource allocation and scheduling.
+ffx_gpu_path = meson.current_source_dir() / '../subprojects/FidelityFX-SDK/sdk/include/FidelityFX/gpu'
+ffx_shader_path = meson.current_source_dir() / '../subprojects/FidelityFX-SDK/sdk/src/backends/vk/shaders/opticalflow'
+ffx_fi_shader_path = meson.current_source_dir() / '../subprojects/FidelityFX-SDK/sdk/src/backends/vk/shaders/frameinterpolation'
+ffx_opticalflow_shader_names = [
+  'ffx_opticalflow_prepare_luma_pass',
+  'ffx_opticalflow_compute_luminance_pyramid_pass',
+  'ffx_opticalflow_generate_scd_histogram_pass',
+  'ffx_opticalflow_compute_scd_divergence_pass',
+  'ffx_opticalflow_compute_optical_flow_advanced_pass_v5',
+  'ffx_opticalflow_filter_optical_flow_pass_v5',
+  'ffx_opticalflow_scale_optical_flow_advanced_pass_v5',
+]
+
+ffx_spirv_shaders = []
+foreach shader_name : ffx_opticalflow_shader_names
+  ffx_spirv_shaders += custom_target(
+    shader_name + '.h',
+    output: shader_name + '.h',
+    command: [
+      glsl_compiler,
+      '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+      '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+      ffx_shader_path / (shader_name + '.glsl'),
+      '--vn', shader_name, '-o', '@OUTPUT@',
+      '--depfile', '@DEPFILE@', '--quiet',
+    ],
+    depfile: shader_name + '.h.d',
+  )
+endforeach
+
+ffx_frameinterpolation_shader_names = [
+  'ffx_frameinterpolation_optical_flow_vector_field_pass',
+  'ffx_frameinterpolation_compute_inpainting_pyramid_pass',
+  'ffx_frameinterpolation_inpainting_pass',
+]
+
+foreach shader_name : ffx_frameinterpolation_shader_names
+  ffx_spirv_shaders += custom_target(
+    shader_name + '.h',
+    output: shader_name + '.h',
+    command: [
+      glsl_compiler,
+      '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+      '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+      ffx_fi_shader_path / (shader_name + '.glsl'),
+      '--vn', shader_name, '-o', '@OUTPUT@',
+      '--depfile', '@DEPFILE@', '--quiet',
+    ],
+    depfile: shader_name + '.h.d',
+  )
+endforeach
+
+ffx_midpoint_shader_name = 'cs_ffx_frameinterpolation_midpoint'
+ffx_spirv_shaders += custom_target(
+  ffx_midpoint_shader_name + '.h',
+  output: ffx_midpoint_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_midpoint_shader_name + '.comp'),
+    '--vn', ffx_midpoint_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_midpoint_shader_name + '.h.d',
+)
+
 sol2_include = include_directories(['../thirdparty'])
 
 required_wlroots_features = ['xwayland']
@@ -140,6 +210,7 @@ gamescope_cpp_args += '-DHAVE_LIBEIS=@0@'.format(eis_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_SCRIPTING=1'
 
 src += spirv_shaders
+src += ffx_spirv_shaders
 src += protocols_server_src
 src += protocols_client_src
 
