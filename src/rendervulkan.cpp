@@ -1048,10 +1048,15 @@ bool CVulkanDevice::createScratchResources()
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
 		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
 	};
+	VkExportSemaphoreCreateInfo exportCreateInfo = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+		.pNext = &timelineCreateInfo,
+		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+	};
 
 	VkSemaphoreCreateInfo semCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-		.pNext = &timelineCreateInfo,
+		.pNext = &exportCreateInfo,
 	};
 
 	res = vk.CreateSemaphore( device(), &semCreateInfo, NULL, &m_scratchTimelineSemaphore );
@@ -1321,7 +1326,14 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	{
 		pWaitSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
 		ulWaitPoints.push_back( dep.ulPoint );
-		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT );
+		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_ALL_COMMANDS_BIT );
+	}
+
+	for ( auto &dep : cmdBuffer->GetExternalBinaryDependencies() )
+	{
+		pWaitSemaphores.push_back( dep->pVkSemaphore );
+		ulWaitPoints.push_back( 0 );
+		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_ALL_COMMANDS_BIT );
 	}
 
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
@@ -1368,6 +1380,15 @@ void CVulkanDevice::garbageCollect( void )
 }
 
 VulkanTimelineSemaphore_t::~VulkanTimelineSemaphore_t()
+{
+	if ( pVkSemaphore != VK_NULL_HANDLE )
+	{
+		pDevice->vk.DestroySemaphore( pDevice->device(), pVkSemaphore, nullptr );
+		pVkSemaphore = VK_NULL_HANDLE;
+	}
+}
+
+VulkanBinarySemaphore_t::~VulkanBinarySemaphore_t()
 {
 	if ( pVkSemaphore != VK_NULL_HANDLE )
 	{
@@ -1481,9 +1502,70 @@ std::shared_ptr<VulkanTimelineSemaphore_t> CVulkanDevice::ImportTimelineSemaphor
 	return pSemaphore;
 }
 
+std::shared_ptr<VulkanBinarySemaphore_t> CVulkanDevice::ImportSyncFile( int32_t nSyncFile )
+{
+	if ( nSyncFile < 0 )
+		return nullptr;
+
+	std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore = std::make_shared<VulkanBinarySemaphore_t>();
+	pSemaphore->pDevice = this;
+
+	const VkSemaphoreCreateInfo createInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+	};
+
+	VkResult res = vk.CreateSemaphore( m_device, &createInfo, nullptr, &pSemaphore->pVkSemaphore );
+	if ( res != VK_SUCCESS )
+	{
+		close( nSyncFile );
+		vk_errorf( res, "vkCreateSemaphore failed" );
+		return nullptr;
+	}
+
+	const VkImportSemaphoreFdInfoKHR importInfo = {
+		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+		.semaphore = pSemaphore->pVkSemaphore,
+		.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+		.fd = nSyncFile,
+	};
+	res = vk.ImportSemaphoreFdKHR( m_device, &importInfo );
+	if ( res != VK_SUCCESS )
+	{
+		close( nSyncFile );
+		vk_errorf( res, "vkImportSemaphoreFdKHR(sync_file) failed" );
+		return nullptr;
+	}
+
+	return pSemaphore;
+}
+
+int CVulkanDevice::ExportSubmissionTimelineFd() const
+{
+	const VkSemaphoreGetFdInfoKHR getInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+		.semaphore = m_scratchTimelineSemaphore,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+	};
+
+	int fd = -1;
+	const VkResult res = vk.GetSemaphoreFdKHR( m_device, &getInfo, &fd );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkGetSemaphoreFdKHR(submission timeline) failed" );
+		return -1;
+	}
+	return fd;
+}
+
 void CVulkanCmdBuffer::AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
 {
 	m_ExternalDependencies.emplace_back( std::move( pTimelineSemaphore ), ulPoint );
+}
+
+void CVulkanCmdBuffer::AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore )
+{
+	m_ExternalBinaryDependencies.emplace_back( std::move( pSemaphore ) );
 }
 
 void CVulkanCmdBuffer::AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
@@ -1548,6 +1630,7 @@ void CVulkanCmdBuffer::reset()
 	m_textureState.clear();
 
 	m_ExternalDependencies.clear();
+	m_ExternalBinaryDependencies.clear();
 	m_ExternalSignals.clear();
 }
 

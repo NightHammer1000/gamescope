@@ -88,6 +88,7 @@ src = [
   'Utils/Process.cpp',
   'Script/Script.cpp',
   'BufferMemo.cpp',
+  'DmabufSync.cpp',
   'steamcompmgr.cpp',
   'convar.cpp',
   'convar_script.cpp',

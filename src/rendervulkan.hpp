@@ -803,6 +803,14 @@ struct VulkanTimelineSemaphore_t
 	int GetFd() const;
 };
 
+struct VulkanBinarySemaphore_t
+{
+	~VulkanBinarySemaphore_t();
+
+	CVulkanDevice *pDevice = nullptr;
+	VkSemaphore pVkSemaphore = VK_NULL_HANDLE;
+};
+
 struct VulkanTimelinePoint_t
 {
 	std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore;
@@ -832,6 +840,9 @@ public:
 
 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
+	// Consumes nSyncFile regardless of success.
+	std::shared_ptr<VulkanBinarySemaphore_t> ImportSyncFile( int32_t nSyncFile );
+	int ExportSubmissionTimelineFd() const;
 
 	static const uint32_t upload_buffer_size = 1920 * 1080 * 4;
 
@@ -1006,9 +1017,11 @@ public:
 	uint32_t queueFamily() { return m_queueFamily; }
 
 	void AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
+	void AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore );
 	void AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 
 	const std::vector<VulkanTimelinePoint_t> &GetExternalDependencies() const { return m_ExternalDependencies; }
+	const std::vector<std::shared_ptr<VulkanBinarySemaphore_t>> &GetExternalBinaryDependencies() const { return m_ExternalBinaryDependencies; }
 	const std::vector<VulkanTimelinePoint_t> &GetExternalSignals() const { return m_ExternalSignals; }
 
 private:
@@ -1032,6 +1045,7 @@ private:
 	std::array<CVulkanTexture *, VKR_LUT3D_COUNT> m_lut3D;
 
 	std::vector<VulkanTimelinePoint_t> m_ExternalDependencies;
+	std::vector<std::shared_ptr<VulkanBinarySemaphore_t>> m_ExternalBinaryDependencies;
 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
 
 	uint32_t m_renderBufferOffset = 0;

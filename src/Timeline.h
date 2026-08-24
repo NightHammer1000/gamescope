@@ -45,6 +45,8 @@ namespace gamescope
         int32_t GetSyncobjFd() const { return m_nSyncobjFd; }
         uint32_t GetSyncobjHandle() const { return m_uSyncobjHandle; }
 
+        int32_t ExportSyncFile( uint64_t ulPoint ) const;
+
         std::shared_ptr<VulkanTimelineSemaphore_t> ToVkSemaphore();
         
     private:

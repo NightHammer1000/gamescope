@@ -68,6 +68,37 @@ namespace gamescope
         return m_pVkSemaphore;
     }
 
+    // Materialize a timeline point as a sync_file fd.
+    //
+    // drmSyncobjExportSyncFile only works on binary syncobjs, so transfer the
+    // point into a throwaway binary one and export that. The caller owns the fd.
+    int32_t CTimeline::ExportSyncFile( uint64_t ulPoint ) const
+    {
+        const int32_t nDrmFd = GetDrmRenderFD();
+        uint32_t uBinarySyncobj = 0;
+        if ( drmSyncobjCreate( nDrmFd, 0, &uBinarySyncobj ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjCreate failed" );
+            return -1;
+        }
+
+        int32_t nSyncFile = -1;
+        if ( drmSyncobjTransfer( nDrmFd, uBinarySyncobj, 0,
+                m_uSyncobjHandle, ulPoint, 0 ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjTransfer failed" );
+        }
+        else if ( drmSyncobjExportSyncFile( nDrmFd, uBinarySyncobj, &nSyncFile ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjExportSyncFile failed" );
+            nSyncFile = -1;
+        }
+
+        drmSyncobjDestroy( nDrmFd, uBinarySyncobj );
+
+        return nSyncFile;
+    }
+
     // CTimelinePoint
 
     template <TimelinePointType Type>
