@@ -1,4 +1,5 @@
 #include "DRMGbmScanout.h"
+#include "DRMVendorQuirks.h"
 
 #include "drm_include.h"
 #include "log.hpp"
@@ -15,17 +16,6 @@ namespace gamescope
 {
 	static LogScope gbm_log( "gbm_scanout" );
 
-	static bool IsNvidiaDrm( int nDrmFd )
-	{
-		bool bIsNvidia = false;
-		if ( drmVersion *pVersion = drmGetVersion( nDrmFd ) )
-		{
-			bIsNvidia = pVersion->name && strcmp( pVersion->name, "nvidia-drm" ) == 0;
-			drmFreeVersion( pVersion );
-		}
-		return bIsNvidia;
-	}
-
 	CGbmScanoutAllocator::~CGbmScanoutAllocator()
 	{
 		Shutdown();
@@ -33,14 +23,16 @@ namespace gamescope
 
 	bool CGbmScanoutAllocator::Init( int nDrmFd )
 	{
-		if ( !IsNvidiaDrm( nDrmFd ) )
+		// Only drivers that need it pay for it. Everywhere else Vulkan-allocated
+		// scanout works and direct scanout stays available.
+		if ( !DetectDrmVendorQuirks( nDrmFd ).bRequiresGbmScanoutAllocation )
 			return false;
 #if HAVE_GBM
 		m_pGbmDevice = gbm_create_device( nDrmFd );
 		if ( !m_pGbmDevice )
-			gbm_log.errorf( "Failed to create GBM device; Vulkan scanout allocation will be used." );
+			gbm_log.errorf_errno( "Failed to create GBM device" );
 #else
-		gbm_log.errorf( "Gamescope was built without GBM support; Vulkan scanout allocation will be used on NVIDIA." );
+		gbm_log.errorf( "Built without GBM support, but this driver requires GBM-allocated scanout buffers." );
 #endif
 		return m_pGbmDevice != nullptr;
 	}

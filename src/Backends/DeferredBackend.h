@@ -163,6 +163,12 @@ namespace gamescope
             return m_pChild->ImportDmabufToBackend( pDmaBuf );
 		}
 
+		virtual bool RequiresBackendAllocatedScanout() const override
+		{
+            std::shared_lock lock{ m_mutInit };
+            return m_bInittedChild && m_pChild->RequiresBackendAllocatedScanout();
+		}
+
 		virtual bool UsesBackendAllocatedScanout() const override
 		{
             std::shared_lock lock{ m_mutInit };

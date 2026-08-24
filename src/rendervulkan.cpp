@@ -24,6 +24,7 @@
 
 #include <drm_fourcc.h>
 #include "hdmi.h"
+#include "Backends/ScanoutModifiers.h"
 #if HAVE_DRM
 #include "drm_include.h"
 #endif
@@ -3309,6 +3310,27 @@ bool vulkan_remake_swapchain( void )
 	return bRet;
 }
 
+// What Vulkan reported it understands for this DRM format. Membership only --
+// the negotiator does not care about the order here.
+static std::vector<uint64_t> vulkan_modifiers_for_drm_format( uint32_t uDrmFormat )
+{
+	std::vector<uint64_t> modifiers;
+
+	const VkFormat format = DRMFormatToVulkan( uDrmFormat, false );
+	if ( format == VK_FORMAT_UNDEFINED )
+		return modifiers;
+
+	auto iter = DRMModifierProps.find( format );
+	if ( iter == DRMModifierProps.end() )
+		return modifiers;
+
+	modifiers.reserve( iter->second.size() );
+	for ( const auto &entry : iter->second )
+		modifiers.push_back( entry.first );
+
+	return modifiers;
+}
+
 static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 	const CVulkanTexture::createFlags &outputImageflags,
 	uint32_t uWidth, uint32_t uHeight )
@@ -3317,18 +3339,36 @@ static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 
 	// Overlay images alias the primary buffer with a different format, so the
 	// modifier must be valid for both.
-	std::vector<uint64_t> modifiers;
-	for ( uint64_t ulModifier : GetBackend()->GetSupportedModifiers( pOutput->uOutputFormat ) )
+	const std::vector<uint64_t> vulkanPrimary = vulkan_modifiers_for_drm_format( pOutput->uOutputFormat );
+	const std::vector<uint64_t> vulkanOverlay = bHasOverlay
+		? vulkan_modifiers_for_drm_format( pOutput->uOutputFormatOverlay )
+		: std::vector<uint64_t>{};
+
+	const gamescope::ScanoutModifierRequest request
 	{
-		if ( ulModifier == DRM_FORMAT_MOD_INVALID )
-			continue;
-		if ( bHasOverlay &&
-		     !gamescope::Algorithm::Contains( GetBackend()->GetSupportedModifiers( pOutput->uOutputFormatOverlay ), ulModifier ) )
-			continue;
-		modifiers.push_back( ulModifier );
-	}
-	if ( modifiers.empty() )
+		.kmsPrimary    = GetBackend()->GetSupportedModifiers( pOutput->uOutputFormat ),
+		.vulkanPrimary = vulkanPrimary,
+		.bNeedsOverlay = bHasOverlay,
+		.kmsOverlay    = bHasOverlay
+			? GetBackend()->GetSupportedModifiers( pOutput->uOutputFormatOverlay )
+			: std::span<const uint64_t>{},
+		.vulkanOverlay = vulkanOverlay,
+	};
+
+	const gamescope::ScanoutModifierChoice choice = gamescope::NegotiateScanoutModifiers( request );
+	if ( !choice.bOk() )
+	{
+		vk_log.errorf( "No usable scanout modifier: %s.", choice.sRejectReason.c_str() );
 		return false;
+	}
+
+	if ( choice.bDegradedToLinear )
+	{
+		vk_log.warnf( "No tiled modifier is both KMS-flippable and Vulkan-importable; falling back to LINEAR scanout buffers. "
+		              "This costs real performance -- please report it." );
+	}
+
+	const std::vector<uint64_t> &modifiers = choice.candidates;
 
 	for ( size_t i = 0; i < pOutput->outputImages.size(); i++ )
 	{
@@ -3399,6 +3439,17 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	if ( GetBackend()->UsesBackendAllocatedScanout() )
 	{
 		bBackendAllocated = vulkan_make_backend_output_images( pOutput, outputImageflags, uOutputWidth, uOutputHeight );
+
+		if ( !bBackendAllocated && GetBackend()->RequiresBackendAllocatedScanout() )
+		{
+			// Deliberately fatal. This driver's display engine cannot scan out
+			// Vulkan-allocated memory, so falling back would not fail -- it
+			// would quietly produce a corrupt image, which is the bug we are
+			// here to avoid.
+			vk_log.errorf( "Failed to allocate scanout buffers through GBM, and this driver has no safe fallback. Refusing to start." );
+			return false;
+		}
+
 		if ( !bBackendAllocated )
 			vk_log.errorf( "Failed to create backend-allocated scanout buffers, falling back to Vulkan allocation." );
 	}

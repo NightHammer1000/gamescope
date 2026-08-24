@@ -113,6 +113,8 @@ gamescope_cpp_args = []
 if drm_dep.found()
   src += 'Backends/DRMBackend.cpp'
   src += 'Backends/DRMGbmScanout.cpp'
+  src += 'Backends/DRMVendorQuirks.cpp'
+  src += 'Backends/ScanoutModifiers.cpp'
   src += 'modegen.cpp'
   required_wlroots_features += 'libinput_backend'
   liftoff_dep = dependency(

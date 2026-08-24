@@ -338,6 +338,10 @@ namespace gamescope
         // Some KMS drivers (nvidia-drm) need scanout memory placement that Vulkan
         // cannot express; such backends allocate scanout buffers for Vulkan to import.
         virtual bool UsesBackendAllocatedScanout() const { return false; }
+        // When true, CreateScanoutDmabuf failing is fatal: this driver cannot
+        // scan out Vulkan-allocated memory, so "fall back" means "render
+        // corruption".
+        virtual bool RequiresBackendAllocatedScanout() const { return false; }
         virtual bool CreateScanoutDmabuf( uint32_t /*uWidth*/, uint32_t /*uHeight*/, uint32_t /*uDrmFormat*/,
                                           std::span<const uint64_t> /*ulModifiers*/,
                                           wlr_dmabuf_attributes * /*pDmaBuf*/ ) { return false; }
