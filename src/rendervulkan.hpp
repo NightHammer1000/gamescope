@@ -17,6 +17,7 @@
 
 #include "gamescope_shared.h"
 #include "backend.h"
+#include "Timeline.h"
 
 #include "shaders/descriptor_set_constants.h"
 
@@ -291,6 +292,7 @@ struct FrameInfo_t
 	gamescope::Rc<CVulkanTexture> lut3D[EOTF_Count];
 
 	bool allowVRR;
+	bool frameGenerationActive = false;
 	bool applyOutputColorMgmt; // drm only
 	EOTF outputEncodingEOTF;
 
@@ -313,6 +315,7 @@ struct FrameInfo_t
 
 		std::shared_ptr<gamescope::BackendBlob> ctm;
 		std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
+		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
 
 		GamescopeAppTextureColorspace colorspace;
 
@@ -451,7 +454,39 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr );
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride = nullptr );
+
+void vulkan_frame_generation_apply( FrameInfo_t *frameInfo,
+	gamescope::Rc<CVulkanTexture> rawSource, uint64_t sourceId, uint32_t appId,
+	bool prepareOnly = false );
+bool vulkan_frame_generation_has_pending_frame();
+bool vulkan_frame_generation_is_draining();
+bool vulkan_frame_generation_can_request_source_frame();
+bool vulkan_frame_generation_last_presented_generated();
+void vulkan_frame_generation_reset();
+
+struct FrameGenerationGpuTimings
+{
+	double preparationAndPyramidMilliseconds = 0.0;
+	double searchAndFilterMilliseconds = 0.0;
+	double vectorFieldMilliseconds = 0.0;
+	double interpolationAndInpaintingMilliseconds = 0.0;
+	double generatedFsrMilliseconds = 0.0;
+	double totalMilliseconds = 0.0;
+};
+
+struct FrameGenerationTelemetry
+{
+	FrameGenerationGpuTimings gpu;
+	uint64_t generatedFrames = 0;
+	uint64_t presentedGeneratedFrames = 0;
+	uint64_t deadlineDroppedFrames = 0;
+	uint64_t sceneCutCopies = 0;
+	uint32_t flowScalePercent = 100;
+	uint32_t sourceCadenceHz = 0;
+	uint32_t outputCadenceHz = 0;
+};
+FrameGenerationTelemetry vulkan_frame_generation_get_telemetry();
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
@@ -737,6 +772,8 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdEndRendering) \
 	VK_FUNC(CmdPipelineBarrier) \
 	VK_FUNC(CmdPushConstants) \
+	VK_FUNC(CmdResetQueryPool) \
+	VK_FUNC(CmdWriteTimestamp) \
 	VK_FUNC(CreateBuffer) \
 	VK_FUNC(CreateCommandPool) \
 	VK_FUNC(CreateComputePipelines) \
@@ -747,6 +784,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CreateImage) \
 	VK_FUNC(CreateImageView) \
 	VK_FUNC(CreatePipelineLayout) \
+	VK_FUNC(CreateQueryPool) \
 	VK_FUNC(CreateSampler) \
 	VK_FUNC(CreateSamplerYcbcrConversion) \
 	VK_FUNC(CreateSemaphore) \
@@ -762,6 +800,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(DestroyPipeline) \
 	VK_FUNC(DestroySemaphore) \
 	VK_FUNC(DestroyPipelineLayout) \
+	VK_FUNC(DestroyQueryPool) \
 	VK_FUNC(DestroySampler) \
 	VK_FUNC(DestroyShaderModule) \
 	VK_FUNC(DestroySwapchainKHR) \
@@ -775,6 +814,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(GetImageMemoryRequirements) \
 	VK_FUNC(GetImageSubresourceLayout) \
 	VK_FUNC(GetMemoryFdKHR) \
+	VK_FUNC(GetQueryPoolResults) \
 	VK_FUNC(GetMemoryFdPropertiesKHR) \
 	VK_FUNC(GetSemaphoreCounterValue) \
 	VK_FUNC(GetSwapchainImagesKHR) \

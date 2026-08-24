@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <deque>
 #include <dlfcn.h>
 #include "vulkan_include.h"
 #include "Utils/Algorithm.h"
@@ -35,6 +36,9 @@
 #include "rendervulkan.hpp"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
+#include "frame_generation_config.hpp"
+#include "frame_generation_pacing.hpp"
+#include "frame_generation_vulkan.hpp"
 #include "log.hpp"
 #include "Utils/Process.h"
 
@@ -4318,7 +4322,7 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 	return true;
 }
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
 {
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
 	if (!frameInfo->applyOutputColorMgmt)
@@ -4346,10 +4350,14 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		uint32_t tempX = frameInfo->layers.get( 0 ).integerWidth();
 		uint32_t tempY = frameInfo->layers.get( 0 ).integerHeight();
 
-		update_tmp_images(tempX, tempY);
+		if ( !pFsrIntermediateOverride )
+			update_tmp_images(tempX, tempY);
+		gamescope::Rc<CVulkanTexture> fsrIntermediate = pFsrIntermediateOverride;
+		if ( !fsrIntermediate )
+			fsrIntermediate = g_output.tmpOutput;
 
 		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_EASU));
-		cmdBuffer->bindTarget(g_output.tmpOutput);
+		cmdBuffer->bindTarget(fsrIntermediate);
 		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
 		cmdBuffer->setTextureSrgb(0, true);
 		cmdBuffer->setSamplerUnnormalized(0, false);
@@ -4366,7 +4374,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			: SHADER_TYPE_RCAS;
 		cmdBuffer->bindPipeline(g_device.pipeline(rcasShader, frameInfo->layers.count(), frameInfo->ycbcrMask() & ~1, 0u, frameInfo->colorspaceMask(), outputTF, false, simpleFsrOutput ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
-		cmdBuffer->bindTexture(0, g_output.tmpOutput);
+		cmdBuffer->bindTexture(0, fsrIntermediate);
 		cmdBuffer->setTextureSrgb(0, true);
 		cmdBuffer->setSamplerUnnormalized(0, false);
 		cmdBuffer->setSamplerNearest(0, false);
@@ -4471,6 +4479,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
 
+	if ( frameInfo->frameGenerationActive )
+		vulkan_frame_generation_record_output_timestamp(
+			cmdBuffer.get(), frameInfo->useFSRLayer0 );
+
 	if ( pPipewireTexture != nullptr )
 	{
 
@@ -4526,6 +4538,492 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 
 	return sequence;
+}
+
+namespace
+{
+	struct FrameGenerationQueuedFrame
+	{
+		FrameInfo_t::Layer_t layer;
+		bool generated = false;
+		bool useFSR = false;
+		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
+	};
+
+	static bool FrameGenerationSupportedFormat( VkFormat format )
+	{
+		return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ||
+			format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB ||
+			format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+			format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ||
+			format == VK_FORMAT_R16G16B16A16_SFLOAT;
+	}
+
+	class VulkanFrameGenerationPacingContext
+	{
+	public:
+		void Reset()
+		{
+			m_history = nullptr;
+			RetireScanouts();
+			m_fsrIntermediate = nullptr;
+			m_queue.clear();
+			m_lastSourceId = 0;
+			m_lastSourceValid = false;
+			m_hasHistory = false;
+			m_lastPresentedGenerated = false;
+			m_width = 0;
+			m_height = 0;
+			m_format = VK_FORMAT_UNDEFINED;
+			m_drmFormat = DRM_FORMAT_INVALID;
+			m_appId = 0;
+			m_connector = nullptr;
+			m_config = {};
+			m_fsrEnabled = false;
+			vulkan_frame_generation_reset_optical_flow();
+		}
+
+		bool HasPendingFrame() const
+		{
+			return !m_queue.empty();
+		}
+
+		bool IsDraining() const
+		{
+			return !m_queue.empty();
+		}
+
+		bool CanRequestSourceFrame() const
+		{
+			return gamescope::FrameGenerationCanRequestSourceFrame(
+				uint32_t( m_queue.size() ),
+				!m_queue.empty() && m_queue.front().generated );
+		}
+
+		bool LastPresentedGenerated() const
+		{
+			return m_lastPresentedGenerated;
+		}
+
+		FrameGenerationTelemetry Telemetry() const
+		{
+			FrameGenerationTelemetry result = m_telemetry;
+			result.gpu = vulkan_frame_generation_get_gpu_timings();
+			result.sceneCutCopies = vulkan_frame_generation_get_scene_cut_copy_count();
+			result.flowScalePercent = m_config.flowScalePercent;
+			return result;
+		}
+
+		void Apply( FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> rawSource,
+			uint64_t sourceId, uint32_t appId, bool fsrEnabled, bool prepareOnly )
+		{
+			CollectRetiredScanouts();
+			const gamescope::FrameGenerationConfig config = gamescope::GetFrameGenerationConfig();
+			if ( !config.enabled )
+			{
+				if ( m_lastSourceValid || m_hasHistory || !m_queue.empty() )
+					Reset();
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::Disabled );
+				return;
+			}
+
+			if ( !frameInfo || frameInfo->layers.count() < 1 || !frameInfo->layers.get( 0 ).tex || !rawSource )
+				return;
+
+			FrameInfo_t::Layer_t &realLayer = frameInfo->layers.get( 0 );
+			if ( rawSource->isYcbcr() || !FrameGenerationSupportedFormat( rawSource->format() ) )
+			{
+				Reset();
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedFormat );
+				return;
+			}
+
+			const bool stateChanged =
+				m_width != rawSource->width() || m_height != rawSource->height() ||
+				m_format != rawSource->format() || m_drmFormat != rawSource->drmFormat() ||
+				m_colorspace != realLayer.colorspace || m_appId != appId ||
+				m_connector != GetBackend()->GetCurrentConnector() || m_config != config ||
+				m_fsrEnabled != fsrEnabled ||
+				m_scale.x != realLayer.scale.x || m_scale.y != realLayer.scale.y ||
+				m_offset.x != realLayer.offset.x || m_offset.y != realLayer.offset.y;
+			if ( stateChanged )
+			{
+				Reset();
+				m_width = rawSource->width();
+				m_height = rawSource->height();
+				m_format = rawSource->format();
+				m_drmFormat = rawSource->drmFormat();
+				m_colorspace = realLayer.colorspace;
+				m_appId = appId;
+				m_connector = GetBackend()->GetCurrentConnector();
+				m_config = config;
+				m_fsrEnabled = fsrEnabled;
+				m_scale = realLayer.scale;
+				m_offset = realLayer.offset;
+			}
+
+			frameInfo->frameGenerationActive = true;
+
+			if ( m_lastSourceValid && sourceId == m_lastSourceId )
+			{
+				if ( !prepareOnly )
+					PresentQueued( frameInfo );
+				return;
+			}
+
+			if ( !m_queue.empty() )
+			{
+				m_queue.clear();
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::DeadlineMiss );
+			}
+
+			if ( !vulkan_frame_generation_work_complete() )
+			{
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::DeadlineMiss );
+				return;
+			}
+
+			if ( !m_history && !AllocateHistory( rawSource ) )
+			{
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+				return;
+			}
+
+			auto cmdBuffer = g_device.commandBuffer();
+			const bool reset = !m_hasHistory;
+			if ( !vulkan_frame_generation_record_optical_flow(
+					cmdBuffer.get(), rawSource, realLayer.colorspace,
+					config.flowScalePercent, reset ) )
+			{
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+				return;
+			}
+
+			m_lastSourceId = sourceId;
+			m_lastSourceValid = true;
+
+			if ( !m_hasHistory )
+			{
+				cmdBuffer->copyImage( rawSource, m_history );
+				const uint64_t sequence = g_device.submit( std::move( cmdBuffer ) );
+				vulkan_frame_generation_notify_submit( sequence );
+				m_hasHistory = true;
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::WarmingUp );
+				return;
+			}
+
+			gamescope::Rc<CVulkanTexture> midpoint =
+				vulkan_frame_generation_record_interpolation(
+					cmdBuffer.get(), m_history, rawSource, false );
+			if ( !midpoint )
+			{
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+				return;
+			}
+
+			cmdBuffer->copyImage( rawSource, m_history );
+
+			FrameGenerationQueuedFrame generated = {};
+			generated.generated = true;
+			generated.layer = realLayer;
+			generated.useFSR = false;
+
+			const bool abDuplicate = vulkan_frame_generation_ab_enabled();
+			std::optional<uint64_t> sequence;
+			if ( abDuplicate )
+			{
+				generated.layer = realLayer;
+				vulkan_frame_generation_record_output_timestamp( cmdBuffer.get(), false );
+				sequence = g_device.submit( std::move( cmdBuffer ) );
+			}
+			else
+			{
+				const uint32_t outputWidth = fsrEnabled ? uint32_t( g_nOutputWidth ) : rawSource->width();
+				const uint32_t outputHeight = fsrEnabled ? uint32_t( g_nOutputHeight ) : rawSource->height();
+				const uint32_t outputFormat = fsrEnabled
+					? ( realLayer.tex->drmFormat() != DRM_FORMAT_INVALID
+						? realLayer.tex->drmFormat() : g_output.uOutputFormat )
+					: rawSource->drmFormat();
+				gamescope::Rc<CVulkanTexture> scanout = AcquireScanout(
+					outputWidth, outputHeight, outputFormat );
+				if ( !scanout )
+				{
+					gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+					return;
+				}
+
+				FrameInfo_t generatedFrame = {};
+				*generatedFrame.layers.push() = realLayer;
+				generatedFrame.frameGenerationActive = true;
+				generatedFrame.layers.get( 0 ).tex = midpoint;
+				if ( ColorspaceIsHDR( realLayer.colorspace ) )
+					generatedFrame.layers.get( 0 ).colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB;
+				generatedFrame.layers.get( 0 ).acquirePoint = nullptr;
+				generatedFrame.layers.get( 0 ).opacity = 1.0f;
+				generatedFrame.useFSRLayer0 = fsrEnabled;
+				generatedFrame.applyOutputColorMgmt = fsrEnabled
+					? frameInfo->applyOutputColorMgmt : false;
+				generatedFrame.outputEncodingEOTF = fsrEnabled
+					? frameInfo->outputEncodingEOTF : EOTF_Count;
+
+				gamescope::Rc<CVulkanTexture> fsrIntermediate;
+				if ( fsrEnabled )
+				{
+					const uint32_t contentWidth = generatedFrame.layers.get( 0 ).integerWidth();
+					const uint32_t contentHeight = generatedFrame.layers.get( 0 ).integerHeight();
+					fsrIntermediate = AcquireFsrIntermediate(
+						contentWidth, contentHeight, ColorspaceIsHDR( realLayer.colorspace ) );
+					if ( !fsrIntermediate )
+					{
+						gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+						return;
+					}
+				}
+				else
+				{
+					// FI's SDR midpoint is raw encoded color in FP16. Treat it as
+					// passthrough data for this format conversion, then retain the
+					// game's colorspace metadata on the scanout layer.
+					if ( !ColorspaceIsHDR( realLayer.colorspace ) )
+						generatedFrame.layers.get( 0 ).colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
+					else if ( realLayer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ )
+					{
+						generatedFrame.applyOutputColorMgmt = true;
+						generatedFrame.outputEncodingEOTF = EOTF_PQ;
+					}
+					generatedFrame.layers.get( 0 ).scale = { 1.0f, 1.0f };
+					generatedFrame.layers.get( 0 ).offset = { 0.0f, 0.0f };
+					generatedFrame.layers.get( 0 ).blackBorder = false;
+					generatedFrame.layers.get( 0 ).ctm = nullptr;
+				}
+
+				if ( !m_completionTimeline )
+					m_completionTimeline = gamescope::CTimeline::Create();
+				if ( !m_completionTimeline )
+				{
+					gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+					return;
+				}
+				const uint64_t completionPoint = ++m_completionPoint;
+				cmdBuffer->AddSignal( m_completionTimeline->ToVkSemaphore(), completionPoint );
+				generated.acquirePoint = std::make_shared<gamescope::CAcquireTimelinePoint>(
+					m_completionTimeline, completionPoint );
+
+				sequence = vulkan_composite( &generatedFrame, nullptr, false, scanout,
+					false, std::move( cmdBuffer ), fsrIntermediate );
+				if ( !sequence )
+				{
+					gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+					return;
+				}
+
+				generated.layer.tex = scanout;
+				if ( ColorspaceIsHDR( realLayer.colorspace ) )
+					generated.layer.colorspace = generatedFrame.outputEncodingEOTF == EOTF_PQ
+						? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ
+						: GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB;
+				if ( fsrEnabled )
+				{
+					generated.layer.scale = { 1.0f, 1.0f };
+					generated.layer.offset = { 0.0f, 0.0f };
+					generated.layer.blackBorder = false;
+				}
+			}
+
+			vulkan_frame_generation_notify_submit( *sequence );
+			m_queue.push_back( std::move( generated ) );
+			m_queue.push_back( { realLayer, false, frameInfo->useFSRLayer0, nullptr } );
+			m_telemetry.generatedFrames++;
+			gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::Active );
+
+			if ( !prepareOnly )
+				PresentQueued( frameInfo );
+		}
+
+	private:
+		bool AllocateHistory( const gamescope::Rc<CVulkanTexture> &source )
+		{
+			uint32_t drmFormat = source->drmFormat();
+			if ( drmFormat == DRM_FORMAT_INVALID )
+				drmFormat = VulkanFormatToDRM( source->format(), true );
+			if ( drmFormat == DRM_FORMAT_INVALID )
+				return false;
+
+			CVulkanTexture::createFlags flags;
+			flags.bSampled = true;
+			flags.bTransferDst = true;
+			flags.bTransferSrc = true;
+			m_history = new CVulkanTexture;
+			return m_history->BInit( source->width(), source->height(), 1, drmFormat, flags );
+		}
+
+		gamescope::Rc<CVulkanTexture> AcquireScanout(
+			uint32_t width, uint32_t height, uint32_t drmFormat )
+		{
+			CollectRetiredScanouts();
+			if ( drmFormat == DRM_FORMAT_INVALID )
+				return nullptr;
+			if ( !m_scanoutImages.empty() &&
+				( m_scanoutImages.front()->width() != width ||
+				  m_scanoutImages.front()->height() != height ||
+				  m_scanoutImages.front()->drmFormat() != drmFormat ) )
+				RetireScanouts();
+
+			for ( auto &image : m_scanoutImages )
+			{
+				if ( !image->IsInUse() )
+					return image;
+			}
+			if ( m_scanoutImages.size() >= 4 )
+				return nullptr;
+
+			CVulkanTexture::createFlags flags;
+			flags.bFlippable = true;
+			flags.bSampled = true;
+			flags.bStorage = true;
+			flags.bTransferSrc = true;
+			gamescope::OwningRc<CVulkanTexture> image = new CVulkanTexture;
+			if ( !image->BInit( width, height, 1, drmFormat, flags ) )
+				return nullptr;
+			if ( GetBackend()->IsSessionBased() && !image->GetBackendFb() )
+				return nullptr;
+			m_scanoutImages.push_back( std::move( image ) );
+			return m_scanoutImages.back();
+		}
+
+		void RetireScanouts()
+		{
+			for ( auto &image : m_scanoutImages )
+				m_retiredScanoutImages.push_back( std::move( image ) );
+			m_scanoutImages.clear();
+		}
+
+		void CollectRetiredScanouts()
+		{
+			std::erase_if( m_retiredScanoutImages,
+				[]( const gamescope::OwningRc<CVulkanTexture> &image ) {
+					return image && !image->IsInUse();
+				} );
+		}
+
+		gamescope::Rc<CVulkanTexture> AcquireFsrIntermediate(
+			uint32_t width, uint32_t height, bool hdr )
+		{
+			const uint32_t drmFormat = hdr ? DRM_FORMAT_ABGR16161616F : DRM_FORMAT_ARGB8888;
+			if ( m_fsrIntermediate && m_fsrIntermediate->width() == width &&
+				m_fsrIntermediate->height() == height &&
+				m_fsrIntermediate->drmFormat() == drmFormat )
+				return m_fsrIntermediate;
+			CVulkanTexture::createFlags flags;
+			flags.bSampled = true;
+			flags.bStorage = true;
+			m_fsrIntermediate = new CVulkanTexture;
+			if ( !m_fsrIntermediate->BInit( width, height, 1, drmFormat, flags ) )
+			{
+				m_fsrIntermediate = nullptr;
+				return nullptr;
+			}
+			return m_fsrIntermediate;
+		}
+
+		void PresentQueued( FrameInfo_t *frameInfo )
+		{
+			m_lastPresentedGenerated = false;
+			if ( m_queue.empty() )
+				return;
+
+			if ( m_queue.front().generated && m_queue.front().acquirePoint &&
+				!m_queue.front().acquirePoint->Wait( 0 ) )
+			{
+				m_queue.pop_front();
+				m_telemetry.deadlineDroppedFrames++;
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::DeadlineMiss );
+				if ( m_queue.empty() )
+					return;
+			}
+
+			FrameGenerationQueuedFrame queued = std::move( m_queue.front() );
+			m_queue.pop_front();
+			frameInfo->layers.get( 0 ) = std::move( queued.layer );
+			frameInfo->layers.get( 0 ).acquirePoint = std::move( queued.acquirePoint );
+			frameInfo->useFSRLayer0 = queued.useFSR;
+			frameInfo->useNISLayer0 = false;
+			frameInfo->frameGenerationActive = true;
+			m_lastPresentedGenerated = queued.generated;
+			m_telemetry.presentedGeneratedFrames += queued.generated ? 1u : 0u;
+		}
+
+		gamescope::OwningRc<CVulkanTexture> m_history;
+		std::vector<gamescope::OwningRc<CVulkanTexture>> m_scanoutImages;
+		std::vector<gamescope::OwningRc<CVulkanTexture>> m_retiredScanoutImages;
+		gamescope::OwningRc<CVulkanTexture> m_fsrIntermediate;
+		std::deque<FrameGenerationQueuedFrame> m_queue;
+		std::shared_ptr<gamescope::CTimeline> m_completionTimeline;
+		uint64_t m_completionPoint = 0;
+		gamescope::FrameGenerationConfig m_config;
+		gamescope::IBackendConnector *m_connector = nullptr;
+		uint64_t m_lastSourceId = 0;
+		uint32_t m_appId = 0;
+		uint32_t m_width = 0;
+		uint32_t m_height = 0;
+		uint32_t m_drmFormat = DRM_FORMAT_INVALID;
+		VkFormat m_format = VK_FORMAT_UNDEFINED;
+		GamescopeAppTextureColorspace m_colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
+		vec2_t m_scale = {};
+		vec2_t m_offset = {};
+		bool m_hasHistory = false;
+		bool m_lastSourceValid = false;
+		bool m_fsrEnabled = false;
+		bool m_lastPresentedGenerated = false;
+		FrameGenerationTelemetry m_telemetry;
+	};
+
+	VulkanFrameGenerationPacingContext s_frameGenerationPacingContext;
+}
+
+void vulkan_frame_generation_apply( FrameInfo_t *frameInfo,
+	gamescope::Rc<CVulkanTexture> rawSource, uint64_t sourceId, uint32_t appId,
+	bool prepareOnly )
+{
+	bool fsrEnabled = false;
+	if ( frameInfo && frameInfo->layers.count() > 0 )
+	{
+		fsrEnabled = frameInfo->useFSRLayer0 ||
+			( rawSource && frameInfo->layers.get( 0 ).tex.get() != rawSource.get() &&
+			  frameInfo->layers.get( 0 ).filter == GamescopeUpscaleFilter::FSR );
+	}
+	s_frameGenerationPacingContext.Apply(
+		frameInfo, std::move( rawSource ), sourceId, appId, fsrEnabled, prepareOnly );
+}
+
+bool vulkan_frame_generation_has_pending_frame()
+{
+	return s_frameGenerationPacingContext.HasPendingFrame();
+}
+
+bool vulkan_frame_generation_is_draining()
+{
+	return s_frameGenerationPacingContext.IsDraining();
+}
+
+bool vulkan_frame_generation_can_request_source_frame()
+{
+	return s_frameGenerationPacingContext.CanRequestSourceFrame();
+}
+
+bool vulkan_frame_generation_last_presented_generated()
+{
+	return s_frameGenerationPacingContext.LastPresentedGenerated();
+}
+
+void vulkan_frame_generation_reset()
+{
+	s_frameGenerationPacingContext.Reset();
+}
+
+FrameGenerationTelemetry vulkan_frame_generation_get_telemetry()
+{
+	return s_frameGenerationPacingContext.Telemetry();
 }
 
 void vulkan_wait( uint64_t ulSeqNo, bool bReset )

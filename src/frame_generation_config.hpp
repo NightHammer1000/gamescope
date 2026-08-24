@@ -29,5 +29,6 @@ namespace gamescope
 	FrameGenerationConfig GetFrameGenerationConfig();
 	void SetFrameGenerationStatus( FrameGenerationStatus status );
 	FrameGenerationStatus GetFrameGenerationStatus();
+	uint64_t GetFrameGenerationConfigSerial();
 	uint64_t GetFrameGenerationStateSerial();
 }

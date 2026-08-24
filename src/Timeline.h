@@ -77,6 +77,7 @@ namespace gamescope
         bool Wait( int64_t lTimeout = std::numeric_limits<int64_t>::max() );
 
         std::pair<int32_t, bool> CreateEventFd();
+        int32_t CreateSyncFile();
     private:
 
         std::shared_ptr<CTimeline> m_pTimeline;

@@ -109,6 +109,36 @@ namespace gamescope
     }
 
     template <TimelinePointType Type>
+    int32_t CTimelinePoint<Type>::CreateSyncFile()
+    {
+        if constexpr ( Type != TimelinePointType::Acquire )
+            return -1;
+
+        const int32_t nDrmFd = m_pTimeline->GetDrmRenderFD();
+        uint32_t uBinarySyncobj = 0;
+        if ( drmSyncobjCreate( nDrmFd, 0, &uBinarySyncobj ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjCreate failed" );
+            return -1;
+        }
+
+        int32_t nSyncFile = -1;
+        if ( drmSyncobjTransfer( nDrmFd, uBinarySyncobj, 0,
+                m_pTimeline->GetSyncobjHandle(), m_ulPoint, 0 ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjTransfer failed" );
+        }
+        else if ( drmSyncobjExportSyncFile( nDrmFd, uBinarySyncobj, &nSyncFile ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjExportSyncFile failed" );
+            nSyncFile = -1;
+        }
+
+        drmSyncobjDestroy( nDrmFd, uBinarySyncobj );
+        return nSyncFile;
+    }
+
+    template <TimelinePointType Type>
     CTimelinePoint<Type>::~CTimelinePoint()
     {
         if ( ShouldSignalOnDestruction() )

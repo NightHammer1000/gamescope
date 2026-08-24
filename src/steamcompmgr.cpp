@@ -86,6 +86,7 @@
 #include "steamcompmgr.hpp"
 #include "vblankmanager.hpp"
 #include "frame_generation_config.hpp"
+#include "frame_generation_pacing.hpp"
 #include "log.hpp"
 #include "Utils/Defer.h"
 #include "win32_styles.h"
@@ -2510,7 +2511,7 @@ gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
 gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
 
 static void
-paint_all( global_focus_t *pFocus, bool async )
+paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly = false )
 {
 	if ( !pFocus )
 		return;
@@ -2545,7 +2546,7 @@ paint_all( global_focus_t *pFocus, bool async )
 	override = pFocus->overrideWindow;
 	input = pFocus->inputFocusWindow;
 
-	if (++frameCounter == 300)
+	if ( !frameGenerationPrepareOnly && ++frameCounter == 300 )
 	{
 		currentFrameRate = 300 * 1000.0f / (currentTime - lastSampledFrameTime);
 		lastSampledFrameTime = currentTime;
@@ -2815,10 +2816,33 @@ paint_all( global_focus_t *pFocus, bool async )
 		frameInfo.useNISLayer0 = false;
 	}
 
+	// Capture FSR activity before frame generation replaces the raw base layer
+	// with its queued midpoint/real scanout buffers. Those buffers have already
+	// had FSR applied and therefore no longer carry useFSRLayer0 themselves.
 	g_bFSRActive = frameInfo.useFSRLayer0;
 	if ( const auto& heldCommit = g_HeldCommits[HELD_COMMIT_BASE]; heldCommit && heldCommit->upscaledTexture ) {
 		g_bFSRActive = ( heldCommit->upscaledTexture->eFilter == GamescopeUpscaleFilter::FSR );
 	}
+
+	const gamescope::FrameGenerationConfig frameGeneration = gamescope::GetFrameGenerationConfig();
+	const bool frameGenerationEligible = frameGeneration.enabled && w &&
+		!w->isSteamStreamingClient && !fadingOut && frameInfo.layers.count() > 0 &&
+		g_HeldCommits[HELD_COMMIT_BASE] &&
+		g_HeldCommits[HELD_COMMIT_BASE]->commitID == g_uCurrentBasePlaneCommitID;
+	if ( frameGenerationEligible )
+	{
+		vulkan_frame_generation_apply( &frameInfo,
+			g_HeldCommits[HELD_COMMIT_BASE]->vulkanTex,
+			g_uCurrentBasePlaneCommitID, g_uCurrentBasePlaneAppID,
+			frameGenerationPrepareOnly );
+	}
+	else if ( frameGeneration.enabled )
+	{
+		vulkan_frame_generation_reset();
+		gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedFormat );
+	}
+	if ( frameGenerationPrepareOnly )
+		return;
 
 	g_bFirstFrame = false;
 
@@ -6025,18 +6049,56 @@ steamcompmgr_flush_frame_done( steamcompmgr_win_t *w )
 
 static std::optional<uint64_t> s_oLowestFPSLimitScheduleVRR;
 
-static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vblank_idx, steamcompmgr_win_t *w = nullptr, uint64_t now = 0 )
+static bool steamcompmgr_can_latch_frame_generation_between_vblanks()
+{
+	return gamescope::GetFrameGenerationConfig().enabled;
+}
+
+static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vblank_idx,
+	steamcompmgr_win_t *w = nullptr, uint64_t now = 0, bool frameCallback = false )
 {
 	bool bSendCallback = true;
 
 	int nRefreshHz = gamescope::ConvertmHzToHz( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
-	int nTargetFPS = g_nSteamCompMgrTargetFPS;
+	int nTargetFPS = g_nSteamCompMgrTargetFPS
+		? std::min( g_nSteamCompMgrTargetFPS, nRefreshHz ) : nRefreshHz;
+	const global_focus_t *currentFocus = GetCurrentFocus();
+	const bool frameGenerationActive = gamescope::GetFrameGenerationConfig().enabled &&
+		w && currentFocus && w == currentFocus->focusWindow;
+	const bool shouldLimit = frameGenerationActive ||
+		( g_nSteamCompMgrTargetFPS && bShouldLimitFPS );
+
+	if ( frameGenerationActive && w )
+	{
+		const bool blocked = frameCallback
+			? !vulkan_frame_generation_can_request_source_frame()
+			: vulkan_frame_generation_is_draining();
+		if ( blocked )
+			return false;
+		const uint64_t schedule = w->last_commit_first_latch_time +
+			g_SteamCompMgrLimitedAppRefreshCycle;
+		static constexpr uint64_t kFrameGenerationScheduleFudge = 200'000;
+		if ( now + kFrameGenerationScheduleFudge < schedule )
+		{
+			if ( frameCallback )
+			{
+				if ( !s_oLowestFPSLimitScheduleVRR )
+					s_oLowestFPSLimitScheduleVRR = schedule;
+				else
+					s_oLowestFPSLimitScheduleVRR = std::min(
+						*s_oLowestFPSLimitScheduleVRR, schedule );
+			}
+			return false;
+		}
+		return true;
+	}
 
 	if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
 	{
-		bool bCloseEnough = std::abs( g_nSteamCompMgrTargetFPS - nRefreshHz ) < 2;
+		bool bCloseEnough = !frameGenerationActive &&
+			std::abs( g_nSteamCompMgrTargetFPS - nRefreshHz ) < 2;
 
-		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && w && !bCloseEnough )
+		if ( shouldLimit && w && !bCloseEnough )
 		{
 			uint64_t schedule = w->last_commit_first_latch_time + g_SteamCompMgrLimitedAppRefreshCycle;
 
@@ -6054,27 +6116,35 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 	}
 	else
 	{
-		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
+		if ( shouldLimit && ( frameGenerationActive || nRefreshHz > nTargetFPS ) )
 		{
-			int nVblankDivisor = nRefreshHz / nTargetFPS;
-
-			if ( vblank_idx % nVblankDivisor != 0 )
-				bSendCallback = false;
+			if ( frameGenerationActive )
+			{
+				const uint64_t denominator = uint64_t( nRefreshHz ) * 2u;
+				const uint64_t slot = vblank_idx * uint64_t( nTargetFPS ) / denominator;
+				const uint64_t previousSlot = vblank_idx > 0
+					? ( vblank_idx - 1 ) * uint64_t( nTargetFPS ) / denominator
+					: uint64_t( -1 );
+				bSendCallback = slot != previousSlot;
+			}
+			else
+			{
+				int nVblankDivisor = nRefreshHz / nTargetFPS;
+				if ( vblank_idx % nVblankDivisor != 0 )
+					bSendCallback = false;
+			}
 		}
 	}
 
 	return bSendCallback;
 }
 
-static bool steamcompmgr_should_vblank_window( steamcompmgr_win_t *w, uint64_t vblank_idx, uint64_t now )
-{
-	return steamcompmgr_should_vblank_window( steamcompmgr_window_should_limit_fps( w ), vblank_idx, w, now );
-}
 
 static void
 steamcompmgr_latch_frame_done( steamcompmgr_win_t *w, uint64_t vblank_idx, uint64_t now )
 {
-	if ( steamcompmgr_should_vblank_window( w, vblank_idx, now ) )
+	if ( steamcompmgr_should_vblank_window(
+			steamcompmgr_window_should_limit_fps( w ), vblank_idx, w, now, true ) )
 	{
 		w->unlockedForFrameCallback = true;
 	}
@@ -7173,22 +7243,19 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 	// very fast loop yes
 	for ( auto& entry : ctx->doneCommits.listCommitsDone )
 	{
-		bool entry_vblank = vblank;
-
-		if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
+		bool entry_vblank = vblank || steamcompmgr_can_latch_frame_generation_between_vblanks();
+		steamcompmgr_win_t *entry_window = nullptr;
+		for ( steamcompmgr_win_t *w = ctx->list; w; w = w->xwayland().next )
 		{
-			for ( steamcompmgr_win_t *w = ctx->list; w; w = w->xwayland().next )
+			if ( w->seq == entry.winSeq )
 			{
-				if (w->seq != entry.winSeq)
-					continue;
-
-				entry_vblank = entry_vblank && steamcompmgr_should_vblank_window( true, vblank_idx, w, now );
+				entry_window = w;
+				break;
 			}
 		}
-		else
-		{
-			entry_vblank = entry_vblank && steamcompmgr_should_vblank_window( true, vblank_idx );
-		}
+		entry_vblank = entry_vblank && ( entry_window
+			? steamcompmgr_should_vblank_window( true, vblank_idx, entry_window, now )
+			: steamcompmgr_should_vblank_window( true, vblank_idx ) );
 
 		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
 		{
@@ -7242,12 +7309,25 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 
 	uint64_t now = get_time_in_nanos();
 
-	vblank = vblank && steamcompmgr_should_vblank_window( true, vblank_idx );
-
 	// very fast loop yes
 	for ( auto& entry : g_steamcompmgr_xdg_done_commits.listCommitsDone )
 	{
-		if (entry.fifo && (!vblank || fifo_win_seqs.count(entry.winSeq) > 0))
+		steamcompmgr_win_t *entry_window = nullptr;
+		for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
+		{
+			if ( xdg_win->seq == entry.winSeq )
+			{
+				entry_window = xdg_win.get();
+				break;
+			}
+		}
+		const bool entry_vblank =
+			( vblank || steamcompmgr_can_latch_frame_generation_between_vblanks() ) &&
+			( entry_window
+				? steamcompmgr_should_vblank_window( true, vblank_idx, entry_window, now )
+				: steamcompmgr_should_vblank_window( true, vblank_idx ) );
+
+		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
 		{
 			commits_before_their_time.push_back( entry );
 			continue;
@@ -7294,7 +7374,11 @@ void handle_presented_for_window( steamcompmgr_win_t* w )
 		: g_SteamCompMgrAppRefreshCycle;
 
 	commit_t *lastCommit = get_window_last_done_commit_peek(w);
-	if (lastCommit)
+	const global_focus_t *currentFocus = GetCurrentFocus();
+	const bool generatedSlotForWindow = currentFocus &&
+		w == currentFocus->focusWindow &&
+		vulkan_frame_generation_last_presented_generated();
+	if ( lastCommit && !generatedSlotForWindow )
 	{
 		if ( !cv_mangoapp_use_output_timing )
 		{
@@ -8494,6 +8578,40 @@ static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []
 	g_FPSLimitVRRTimer.DisarmTimer();
 }};
 
+static bool s_bFrameGenerationOutputTimerDue = false;
+static uint64_t s_uFrameGenerationOutputDeadline = 0;
+static uint64_t s_uFrameGenerationOutputInterval = 0;
+static gamescope::CTimerFunction g_FrameGenerationOutputTimer{ []
+{
+	s_bFrameGenerationOutputTimerDue = true;
+	g_FrameGenerationOutputTimer.DisarmTimer();
+}};
+
+static void reset_frame_generation_output_timer()
+{
+	g_FrameGenerationOutputTimer.DisarmTimer();
+	s_bFrameGenerationOutputTimerDue = false;
+	s_uFrameGenerationOutputDeadline = 0;
+	s_uFrameGenerationOutputInterval = 0;
+}
+
+static void schedule_frame_generation_output_timer( uint64_t now, uint64_t interval )
+{
+	if ( interval == 0 )
+	{
+		reset_frame_generation_output_timer();
+		return;
+	}
+
+	if ( s_uFrameGenerationOutputInterval != interval )
+		s_uFrameGenerationOutputDeadline = 0;
+	s_uFrameGenerationOutputInterval = interval;
+	s_uFrameGenerationOutputDeadline = gamescope::FrameGenerationNextOutputDeadline(
+		s_uFrameGenerationOutputDeadline, now, interval );
+	s_bFrameGenerationOutputTimerDue = false;
+	g_FrameGenerationOutputTimer.ArmTimer( s_uFrameGenerationOutputDeadline );
+}
+
 void
 steamcompmgr_main(int argc, char **argv)
 {
@@ -8636,6 +8754,7 @@ steamcompmgr_main(int argc, char **argv)
 
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
 	g_SteamCompMgrWaiter.AddWaitable( &g_FPSLimitVRRTimer );
+	g_SteamCompMgrWaiter.AddWaitable( &g_FrameGenerationOutputTimer );
 	GetVBlankTimer().ArmNextVBlank( true );
 
 	{
@@ -8696,6 +8815,17 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		g_SteamCompMgrWaiter.PollEvents();
+
+		static uint64_t s_lastFrameGenerationConfigSerial = 0;
+		const uint64_t frameGenerationConfigSerial =
+			gamescope::GetFrameGenerationConfigSerial();
+		if ( frameGenerationConfigSerial != s_lastFrameGenerationConfigSerial )
+		{
+			s_lastFrameGenerationConfigSerial = frameGenerationConfigSerial;
+			vulkan_frame_generation_reset();
+			reset_frame_generation_output_timer();
+			hasRepaint = true;
+		}
 
 		static uint64_t s_lastFrameGenerationStateSerial = 0;
 		const uint64_t frameGenerationStateSerial = gamescope::GetFrameGenerationStateSerial();
@@ -9045,6 +9175,15 @@ steamcompmgr_main(int argc, char **argv)
 					g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle * nVblankDivisor;
 				}
 			}
+			if ( gamescope::GetFrameGenerationConfig().enabled )
+			{
+				const int nRealRefreshHz = gamescope::ConvertmHzToHz( nRealRefreshmHz );
+				const int nTotalFPS = g_nSteamCompMgrTargetFPS
+					? std::min( g_nSteamCompMgrTargetFPS, nRealRefreshHz )
+					: nRealRefreshHz;
+				g_SteamCompMgrLimitedAppRefreshCycle =
+					gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTotalFPS ) ) * 2u;
+			}
 		}
 
 		// Handle presentation-time stuff
@@ -9222,6 +9361,7 @@ steamcompmgr_main(int argc, char **argv)
 			// for composition to finish before submitting.
 			// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
 			const bool bSurfaceWantsAsync = (g_HeldCommits[HELD_COMMIT_BASE] != nullptr && g_HeldCommits[HELD_COMMIT_BASE]->async);
+			const bool bFrameGeneration = gamescope::GetFrameGenerationConfig().enabled;
 			const bool bTearing = cv_tearing_enabled && GetBackend()->SupportsTearing() && bSurfaceWantsAsync;
 
 			enum class FlipType
@@ -9250,6 +9390,39 @@ steamcompmgr_main(int argc, char **argv)
 			}
 			else
 				eFlipType = FlipType::Normal;
+
+			const uint64_t frameGenerationRefreshHz = gamescope::ConvertmHzToHz(
+				g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
+			const uint64_t frameGenerationOutputFPS = g_nSteamCompMgrTargetFPS > 0
+				? std::min<uint64_t>( g_nSteamCompMgrTargetFPS, frameGenerationRefreshHz )
+				: frameGenerationRefreshHz;
+			const uint64_t frameGenerationOutputInterval = frameGenerationOutputFPS > 0
+				? gamescope::mHzToRefreshCycle(
+					gamescope::ConvertHztomHz( uint32_t( frameGenerationOutputFPS ) ) )
+				: 0;
+			const bool frameGenerationFreeRunning = bFrameGeneration &&
+				( bVRR || eFlipType == FlipType::Async );
+			const bool frameGenerationPending =
+				vulkan_frame_generation_has_pending_frame();
+			const uint64_t frameGenerationNow = get_time_in_nanos();
+
+			if ( frameGenerationFreeRunning )
+			{
+				if ( frameGenerationPending &&
+					( s_uFrameGenerationOutputDeadline == 0 ||
+					  s_uFrameGenerationOutputInterval != frameGenerationOutputInterval ) )
+				{
+					schedule_frame_generation_output_timer(
+						frameGenerationNow, frameGenerationOutputInterval );
+				}
+			}
+			else if ( s_uFrameGenerationOutputDeadline != 0 )
+			{
+				reset_frame_generation_output_timer();
+			}
+
+			const bool frameGenerationTimerOutputDue = frameGenerationFreeRunning &&
+				frameGenerationPending && s_bFrameGenerationOutputTimerDue;
 
 			bool bShouldPaint = false;
 
@@ -9313,11 +9486,48 @@ steamcompmgr_main(int argc, char **argv)
 				bShouldPaint = false;
 			}
 
+			if ( frameGenerationPending )
+			{
+				if ( frameGenerationFreeRunning )
+					bShouldPaint = frameGenerationTimerOutputDue;
+				else if ( vblank )
+					bShouldPaint = gamescope::FrameGenerationOutputSlotDue(
+						vblank_idx, frameGenerationOutputFPS, frameGenerationRefreshHz );
+				else
+					bShouldPaint = false;
+
+				if ( bVRR && GetBackend()->GetCurrentConnector() &&
+					 GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0 )
+				{
+					bShouldPaint = false;
+				}
+			}
+
+			const bool frameGenerationPrepareOnly = bFrameGeneration && hasRepaint &&
+				( frameGenerationFreeRunning
+					? frameGenerationPending && !frameGenerationTimerOutputDue
+					: !vblank );
+			if ( frameGenerationPrepareOnly )
+				bShouldPaint = true;
+
 			if ( bShouldPaint )
 			{
-				paint_all( pPaintFocus, eFlipType == FlipType::Async );
+				paint_all( pPaintFocus, eFlipType == FlipType::Async,
+					frameGenerationPrepareOnly );
 
-				bPainted = true;
+				if ( !frameGenerationPrepareOnly )
+				{
+					bPainted = true;
+
+					if ( frameGenerationFreeRunning )
+					{
+						if ( vulkan_frame_generation_has_pending_frame() )
+							schedule_frame_generation_output_timer(
+								frameGenerationNow, frameGenerationOutputInterval );
+						else
+							reset_frame_generation_output_timer();
+					}
+				}
 			}
 		}
 

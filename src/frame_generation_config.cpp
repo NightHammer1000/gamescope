@@ -9,6 +9,7 @@ namespace gamescope
 	static std::mutex s_frameGenerationMutex;
 	static FrameGenerationConfig s_frameGenerationConfig;
 	static FrameGenerationStatus s_frameGenerationStatus = FrameGenerationStatus::Disabled;
+	static std::atomic<uint64_t> s_frameGenerationConfigSerial = 1;
 	static std::atomic<uint64_t> s_frameGenerationStateSerial = 1;
 
 	static void UpdateStatusForConfig()
@@ -27,6 +28,7 @@ namespace gamescope
 
 		s_frameGenerationConfig.enabled = newEnabled;
 		UpdateStatusForConfig();
+		s_frameGenerationConfigSerial.fetch_add( 1, std::memory_order_release );
 		s_frameGenerationStateSerial.fetch_add( 1, std::memory_order_release );
 	}
 
@@ -42,6 +44,7 @@ namespace gamescope
 
 		s_frameGenerationConfig.flowScalePercent = newPercent;
 		UpdateStatusForConfig();
+		s_frameGenerationConfigSerial.fetch_add( 1, std::memory_order_release );
 		s_frameGenerationStateSerial.fetch_add( 1, std::memory_order_release );
 	}
 
@@ -65,6 +68,11 @@ namespace gamescope
 	{
 		std::lock_guard lock{ s_frameGenerationMutex };
 		return s_frameGenerationStatus;
+	}
+
+	uint64_t GetFrameGenerationConfigSerial()
+	{
+		return s_frameGenerationConfigSerial.load( std::memory_order_acquire );
 	}
 
 	uint64_t GetFrameGenerationStateSerial()

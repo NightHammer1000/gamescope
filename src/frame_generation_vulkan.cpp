@@ -300,6 +300,8 @@ namespace
 				g_device.vk.DestroyDescriptorPool( g_device.device(), descriptorPool, nullptr );
 			if ( linearSampler )
 				g_device.vk.DestroySampler( g_device.device(), linearSampler, nullptr );
+			if ( timingQueryPool )
+				g_device.vk.DestroyQueryPool( g_device.device(), timingQueryPool, nullptr );
 		}
 
 		bool Create( uint32_t sourceWidth, uint32_t sourceHeight, uint32_t scalePercent )
@@ -316,6 +318,15 @@ namespace
 
 			if ( !CheckCapabilities() || !CreatePool() || !CreatePasses() )
 				return false;
+			const VkQueryPoolCreateInfo queryInfo = {
+				.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+				.queryType = VK_QUERY_TYPE_TIMESTAMP,
+				.queryCount = 6,
+			};
+			g_device.vk.CreateQueryPool( g_device.device(), &queryInfo, nullptr, &timingQueryPool );
+			VkPhysicalDeviceProperties properties = {};
+			g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &properties );
+			timestampPeriod = properties.limits.timestampPeriod;
 
 			for ( uint32_t ping = 0; ping < 2; ++ping )
 			{
@@ -356,8 +367,9 @@ namespace
 			const uint32_t pyramidMips = std::min( 13u,
 				uint32_t( std::floor( std::log2( std::max( pyramidWidth, pyramidHeight ) ) ) ) + 1u );
 			if ( !inpaintingPyramid.Create( pyramidWidth, pyramidHeight, VK_FORMAT_R16G16B16A16_SFLOAT, pyramidMips ) ||
-				 !counters.Create( 8 ) )
+				 !counters.Create( 8 ) || !telemetryCounters.Create( 4 ) )
 				return false;
+			memset( telemetryCounters.mapped, 0, size_t( telemetryCounters.size ) );
 
 			CVulkanTexture::createFlags midpointFlags;
 			midpointFlags.bSampled = true;
@@ -415,6 +427,7 @@ namespace
 		RawImage vectorFieldY;
 		RawImage inpaintingPyramid;
 		RawBuffer counters;
+		RawBuffer telemetryCounters;
 		gamescope::OwningRc<CVulkanTexture> midpoint;
 		VkSampler linearSampler = VK_NULL_HANDLE;
 		VkExtent2D sourceExtent = {};
@@ -422,6 +435,11 @@ namespace
 		uint32_t flowScalePercent = 100;
 		bool initializedLayouts = false;
 		uint64_t sequence = 0;
+		VkQueryPool timingQueryPool = VK_NULL_HANDLE;
+		float timestampPeriod = 0.0f;
+		bool timingPending = false;
+		bool timingUsedFsr = false;
+		uint32_t reportedSceneCutCopies = 0;
 
 	private:
 		bool CheckCapabilities()
@@ -571,7 +589,8 @@ namespace
 					Binding( 0, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 1, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
 					Binding( 2, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 3, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
 					Binding( 4, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 5, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ),
-					Binding( 6, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ), Binding( 1000, D::VK_DESCRIPTOR_TYPE_SAMPLER ),
+					Binding( 6, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ), Binding( 7, D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ),
+					Binding( 1000, D::VK_DESCRIPTOR_TYPE_SAMPLER ),
 				} ) &&
 				CreatePassBindings( inpaintingPyramidPass, ffx_frameinterpolation_compute_inpainting_pyramid_pass,
 					sizeof( ffx_frameinterpolation_compute_inpainting_pyramid_pass ), {
@@ -598,7 +617,11 @@ namespace
 	class OpticalFlowContext
 	{
 	public:
-		bool Record( CVulkanCmdBuffer *cmdBuffer, gamescope::Rc<CVulkanTexture> source, uint32_t scalePercent, bool reset )
+		FrameGenerationGpuTimings Timings() const { return timings; }
+		uint64_t SceneCutCopies() const { return sceneCutCopies; }
+
+		bool Record( CVulkanCmdBuffer *cmdBuffer, gamescope::Rc<CVulkanTexture> source,
+			GamescopeAppTextureColorspace colorspace, uint32_t scalePercent, bool reset )
 		{
 			if ( !cmdBuffer || !source || source->isYcbcr() )
 				return false;
@@ -612,6 +635,7 @@ namespace
 			{
 				if ( resources && !g_device.isComplete( resources->sequence ) )
 					return false;
+				CollectTimings();
 				resources.reset();
 				resources = std::make_shared<OpticalFlowResources>();
 				if ( !resources->Create( source->width(), source->height(), clampedScale ) )
@@ -623,8 +647,18 @@ namespace
 				reset = true;
 			}
 
-			if ( !g_device.isComplete( resources->sequence ) || !resources->ResetDescriptors() )
+			if ( !g_device.isComplete( resources->sequence ) )
 				return false;
+			CollectTimings();
+			if ( !resources->ResetDescriptors() )
+				return false;
+			if ( resources->timingQueryPool )
+			{
+				g_device.vk.CmdResetQueryPool( cmdBuffer->rawBuffer(), resources->timingQueryPool, 0, 6 );
+				g_device.vk.CmdWriteTimestamp( cmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+					resources->timingQueryPool, 0 );
+				resources->timingPending = false;
+			}
 
 			cmdBuffer->bindTexture( 0, source );
 			cmdBuffer->prepareSrcImage( source.get() );
@@ -647,12 +681,14 @@ namespace
 
 			const uint32_t current = resourceFrameIndex & 1u;
 			const uint32_t previous = current ^ 1u;
+			transferFunction = colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ ? 1u :
+				colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB ? 2u : 0u;
 			OpticalFlowConstants constants = {
 				.inputLumaResolution = { int32_t( resources->lumaExtent.width ), int32_t( resources->lumaExtent.height ) },
 				.opticalFlowPyramidLevel = 0,
 				.opticalFlowPyramidLevelCount = kPyramidLevels,
 				.frameIndex = frameIndex,
-				.backbufferTransferFunction = 0,
+				.backbufferTransferFunction = transferFunction,
 				.minMaxLuminance = { 0.0f, 1000.0f },
 				.sourceResolution = { int32_t( source->width() ), int32_t( source->height() ) },
 			};
@@ -694,6 +730,7 @@ namespace
 				  Storage( resources->scdOutput ), common }, 9, 3 ) )
 				return false;
 			Barrier( cmdBuffer->rawBuffer() );
+			WriteTimestamp( cmdBuffer->rawBuffer(), 1 );
 
 			for ( int32_t level = int32_t( kPyramidLevels ) - 1; level >= 0; --level )
 			{
@@ -732,6 +769,7 @@ namespace
 					Barrier( cmdBuffer->rawBuffer() );
 				}
 			}
+			WriteTimestamp( cmdBuffer->rawBuffer(), 2 );
 
 			resourceFrameIndex = ( resourceFrameIndex + 1 ) & 1u;
 			firstExecution = false;
@@ -782,6 +820,7 @@ namespace
 			constants.interpolationRectSize[0] = constants.displaySize[0];
 			constants.interpolationRectSize[1] = constants.displaySize[1];
 			constants.dispatchFlags = cv_frame_generation_debug_flow ? 0x80000000u : 0u;
+			constants.backBufferTransferFunction = transferFunction;
 			constants.minMaxLuminance[1] = 1000.0f;
 			const Descriptor fiConstants = Upload( constants );
 
@@ -792,11 +831,12 @@ namespace
 			}, ( resources->flowExtent[0].width + 7 ) / 8, ( resources->flowExtent[0].height + 7 ) / 8 ) )
 				return nullptr;
 			Barrier( cmdBuffer->rawBuffer() );
+			WriteTimestamp( cmdBuffer->rawBuffer(), 3 );
 
 			if ( !Dispatch( cmdBuffer->rawBuffer(), resources->midpointPass, {
 				Sampled( resources->vectorFieldX ), Sampled( resources->vectorFieldY ), Sampled( previous->srgbView() ),
 				Sampled( current->srgbView() ), Sampled( resources->scdOutput ), StorageView( resources->midpoint->srgbView() ),
-				fiConstants, Sampler( resources->linearSampler ),
+				fiConstants, StorageBuffer( resources->telemetryCounters ), Sampler( resources->linearSampler ),
 			}, ( resources->sourceExtent.width + 7 ) / 8, ( resources->sourceExtent.height + 7 ) / 8 ) )
 				return nullptr;
 			Barrier( cmdBuffer->rawBuffer() );
@@ -831,9 +871,20 @@ namespace
 				Sampler( resources->linearSampler ),
 			}, ( resources->sourceExtent.width + 7 ) / 8, ( resources->sourceExtent.height + 7 ) / 8 ) )
 				return nullptr;
+			WriteTimestamp( cmdBuffer->rawBuffer(), 4 );
 
 			cmdBuffer->markDirty( resources->midpoint.get() );
 			return resources->midpoint;
+		}
+
+		void RecordOutputTimestamp( CVulkanCmdBuffer *cmdBuffer, bool usedFsr )
+		{
+			if ( !cmdBuffer || !recordedResources || !recordedResources->timingQueryPool )
+				return;
+			g_device.vk.CmdWriteTimestamp( cmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+				recordedResources->timingQueryPool, 5 );
+			recordedResources->timingUsedFsr = usedFsr;
+			recordedResources->timingPending = true;
 		}
 
 		void NotifySubmit( uint64_t sequence )
@@ -856,6 +907,38 @@ namespace
 		}
 
 	private:
+		void WriteTimestamp( VkCommandBuffer commandBuffer, uint32_t query )
+		{
+			if ( resources && resources->timingQueryPool )
+				g_device.vk.CmdWriteTimestamp( commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					resources->timingQueryPool, query );
+		}
+
+		void CollectTimings()
+		{
+			if ( !resources || !resources->timingPending || !resources->timingQueryPool )
+				return;
+			std::array<uint64_t, 6> values = {};
+			if ( g_device.vk.GetQueryPoolResults( g_device.device(), resources->timingQueryPool,
+					0, values.size(), sizeof( values ), values.data(), sizeof( uint64_t ),
+					VK_QUERY_RESULT_64_BIT ) != VK_SUCCESS )
+				return;
+			const double milliseconds = double( resources->timestampPeriod ) / 1'000'000.0;
+			timings.preparationAndPyramidMilliseconds = double( values[1] - values[0] ) * milliseconds;
+			timings.searchAndFilterMilliseconds = double( values[2] - values[1] ) * milliseconds;
+			timings.vectorFieldMilliseconds = double( values[3] - values[2] ) * milliseconds;
+			timings.interpolationAndInpaintingMilliseconds = double( values[4] - values[3] ) * milliseconds;
+			timings.generatedFsrMilliseconds = resources->timingUsedFsr
+				? double( values[5] - values[4] ) * milliseconds : 0.0;
+			timings.totalMilliseconds = double( values[5] - values[0] ) * milliseconds;
+			resources->timingPending = false;
+			const uint32_t resourceSceneCutCopies =
+				*static_cast<const uint32_t *>( resources->telemetryCounters.mapped );
+			sceneCutCopies += uint32_t(
+				resourceSceneCutCopies - resources->reportedSceneCutCopies );
+			resources->reportedSceneCutCopies = resourceSceneCutCopies;
+		}
+
 		Descriptor UploadBytes( const void *data, size_t size )
 		{
 			VkPhysicalDeviceProperties properties = {};
@@ -1017,6 +1100,9 @@ namespace
 		uint32_t resourceFrameIndex = 0;
 		uint32_t frameIndex = 0;
 		bool firstExecution = true;
+		uint32_t transferFunction = 0;
+		FrameGenerationGpuTimings timings;
+		uint64_t sceneCutCopies = 0;
 	};
 
 	OpticalFlowContext &GetOpticalFlowContext()
@@ -1031,10 +1117,12 @@ namespace
 bool vulkan_frame_generation_record_optical_flow(
 	CVulkanCmdBuffer *cmdBuffer,
 	gamescope::Rc<CVulkanTexture> source,
+	GamescopeAppTextureColorspace colorspace,
 	uint32_t flowScalePercent,
 	bool reset )
 {
-	return GetOpticalFlowContext().Record( cmdBuffer, std::move( source ), flowScalePercent, reset );
+	return GetOpticalFlowContext().Record(
+		cmdBuffer, std::move( source ), colorspace, flowScalePercent, reset );
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_frame_generation_record_interpolation(
@@ -1065,4 +1153,20 @@ void vulkan_frame_generation_reset_optical_flow()
 bool vulkan_frame_generation_ab_enabled()
 {
 	return cv_frame_generation_ab;
+}
+
+void vulkan_frame_generation_record_output_timestamp(
+	CVulkanCmdBuffer *cmdBuffer, bool usedFsr )
+{
+	GetOpticalFlowContext().RecordOutputTimestamp( cmdBuffer, usedFsr );
+}
+
+FrameGenerationGpuTimings vulkan_frame_generation_get_gpu_timings()
+{
+	return GetOpticalFlowContext().Timings();
+}
+
+uint64_t vulkan_frame_generation_get_scene_cut_copy_count()
+{
+	return GetOpticalFlowContext().SceneCutCopies();
 }

@@ -158,6 +158,7 @@ struct drm_t {
 	// FBs in the atomic request, but not yet submitted to KMS
 	// Accessed only on req thread
 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_FbIdsInRequest;
+	std::vector<int> m_InFenceFdsInRequest;
 
 	// FBs currently queued to go on screen.
 	// May be accessed by page flip handler thread and req thread, thus mutex.
@@ -186,6 +187,13 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode );
 using namespace std::literals;
 
 struct drm_t g_DRM = {};
+
+static void drm_close_in_fences( struct drm_t *drm )
+{
+	for ( int nFd : drm->m_InFenceFdsInRequest )
+		close( nFd );
+	drm->m_InFenceFdsInRequest.clear();
+}
 
 // Flip handler thread control. Keep the thread object global so we
 // can join it during shutdown instead of detaching and risking the
@@ -1641,6 +1649,7 @@ void finish_drm(struct drm_t *drm)
 	wlr_drm_format_set_finish( &drm->formats );
 	wlr_drm_format_set_finish( &drm->primary_formats );
 	drm->m_FbIdsInRequest.clear();
+	drm_close_in_fences( drm );
 	{
 		std::unique_lock lock( drm->m_QueuedFbIdsMutex );
 		drm->m_QueuedFbIds.clear();
@@ -2698,7 +2707,13 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				return -EINVAL;
 			}
 
-			const int nFence = cv_drm_debug_disable_in_fence_fd ? -1 : g_nAlwaysSignalledSyncFile;
+			int nFence = cv_drm_debug_disable_in_fence_fd ? -1 : g_nAlwaysSignalledSyncFile;
+			if ( !cv_drm_debug_disable_in_fence_fd && pLayer->acquirePoint )
+			{
+				nFence = pLayer->acquirePoint->CreateSyncFile();
+				if ( nFence >= 0 )
+					drm->m_InFenceFdsInRequest.push_back( nFence );
+			}
 
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "FB_ID", pDrmFb->GetFbId());
@@ -3127,6 +3142,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	}
 
 	drm->m_FbIdsInRequest.clear();
+	drm_close_in_fences( drm );
 
 	bool needs_modeset = drm->needs_modeset.exchange(false);
 
@@ -3336,6 +3352,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 		drm->req = nullptr;
 
 		drm->m_FbIdsInRequest.clear();
+		drm_close_in_fences( drm );
 
 		if ( needs_modeset )
 			drm->needs_modeset = true;
@@ -4415,6 +4432,7 @@ namespace gamescope
 			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents );
 
 			ret = drmModeAtomicCommit(drm->fd, drm->req, drm->flags, &m_PresentCtxs[uCurrentPresentCtx] );
+			drm_close_in_fences( drm );
 			if ( ret != 0 )
 			{
 				drm_log.errorf_errno( "flip error" );
