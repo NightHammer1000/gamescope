@@ -177,20 +177,32 @@ ffx_spirv_shaders += custom_target(
   depfile: ffx_scaled_luma_shader_name + '.h.d',
 )
 
+# The dot-product SAD search needs GL_EXT_integer_dot_product, which older
+# glslang builds (Ubuntu 24.04) do not know. Probe, and fall back to the
+# regular search pass at build time; runtime already gates on device support.
+ffx_have_dot_search = run_command(
+  'sh', '-c',
+  'printf "#version 460\n#extension GL_EXT_integer_dot_product : require\nvoid main(){}\n" | ' +
+  glsl_compiler.full_path() + ' --stdin -S comp --target-env vulkan1.3 -V -o /dev/null',
+  check: false,
+).returncode() == 0
+
 ffx_dot_search_shader_name = 'cs_ffx_opticalflow_compute_optical_flow_dot'
-ffx_spirv_shaders += custom_target(
-  ffx_dot_search_shader_name + '.h',
-  output: ffx_dot_search_shader_name + '.h',
-  command: [
-    glsl_compiler,
-    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
-    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
-    meson.current_source_dir() / 'shaders' / (ffx_dot_search_shader_name + '.comp'),
-    '--vn', ffx_dot_search_shader_name, '-o', '@OUTPUT@',
-    '--depfile', '@DEPFILE@', '--quiet',
-  ],
-  depfile: ffx_dot_search_shader_name + '.h.d',
-)
+if ffx_have_dot_search
+  ffx_spirv_shaders += custom_target(
+    ffx_dot_search_shader_name + '.h',
+    output: ffx_dot_search_shader_name + '.h',
+    command: [
+      glsl_compiler,
+      '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+      '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+      meson.current_source_dir() / 'shaders' / (ffx_dot_search_shader_name + '.comp'),
+      '--vn', ffx_dot_search_shader_name, '-o', '@OUTPUT@',
+      '--depfile', '@DEPFILE@', '--quiet',
+    ],
+    depfile: ffx_dot_search_shader_name + '.h.d',
+  )
+endif
 
 ffx_vector_field_shader_name = 'cs_ffx_frameinterpolation_vector_field'
 ffx_spirv_shaders += custom_target(
@@ -269,6 +281,7 @@ gamescope_cpp_args += '-DHAVE_AVIF=@0@'.format(avif_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBCAP=@0@'.format(cap_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBEIS=@0@'.format(eis_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_SCRIPTING=1'
+gamescope_cpp_args += '-DHAVE_FFX_DOT_SEARCH=@0@'.format(ffx_have_dot_search.to_int())
 
 src += spirv_shaders
 src += ffx_spirv_shaders

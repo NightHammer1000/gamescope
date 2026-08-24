@@ -11,7 +11,9 @@
 
 #include "frame_generation_config.hpp"
 #include "cs_ffx_opticalflow_prepare_luma_scaled.h"
+#if HAVE_FFX_DOT_SEARCH
 #include "cs_ffx_opticalflow_compute_optical_flow_dot.h"
+#endif
 #include "cs_ffx_frameinterpolation_gui_mask.h"
 #include "cs_ffx_frameinterpolation_midpoint.h"
 #include "cs_ffx_frameinterpolation_vector_field.h"
@@ -641,11 +643,17 @@ namespace
 				} );
 			if ( !created || !g_device.supportsIntegerDotProduct() )
 				return created;
+#if HAVE_FFX_DOT_SEARCH
 			return CreatePass( searchDot, cs_ffx_opticalflow_compute_optical_flow_dot,
 				sizeof( cs_ffx_opticalflow_compute_optical_flow_dot ),
 				{ D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
 				  D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 				  D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER } );
+#else
+			// glslang at build time had no GL_EXT_integer_dot_product; the
+			// regular search pass carries the load.
+			return created;
+#endif
 		}
 	};
 
@@ -780,8 +788,11 @@ namespace
 				const uint32_t lumaHeight = std::max( resources->lumaExtent.height >> level, 1u );
 				const uint32_t searchX = ( ( ( lumaWidth + 3 ) / 4 ) * 16 + 63 ) / 64;
 				const uint32_t searchY = ( lumaHeight + 15 ) / 16;
-				Pass &searchPass = g_device.supportsIntegerDotProduct() &&
-					cv_frame_generation_dot_product_of ? resources->searchDot : resources->search;
+				Pass &searchPass = HAVE_FFX_DOT_SEARCH &&
+					g_device.supportsIntegerDotProduct() &&
+					cv_frame_generation_dot_product_of &&
+					resources->searchDot.pipeline != nullptr
+						? resources->searchDot : resources->search;
 				if ( !Dispatch( cmdBuffer->rawBuffer(), searchPass,
 					{ Sampled( resources->luma[current][level] ), Sampled( resources->luma[previous][level] ),
 					  Storage( resources->flow[a][level] ), Storage( resources->scdOutput ), levelConstants }, searchX, searchY ) )
