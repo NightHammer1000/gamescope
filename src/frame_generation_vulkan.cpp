@@ -11,6 +11,7 @@
 
 #include "frame_generation_config.hpp"
 #include "cs_ffx_opticalflow_prepare_luma_scaled.h"
+#include "cs_ffx_frameinterpolation_gui_mask.h"
 #include "cs_ffx_frameinterpolation_midpoint.h"
 #include "cs_ffx_frameinterpolation_vector_field.h"
 #include "ffx_frameinterpolation_compute_inpainting_pyramid_pass.h"
@@ -30,9 +31,19 @@ gamescope::ConVar<bool> cv_frame_generation_ab(
 gamescope::ConVar<bool> cv_frame_generation_debug_flow(
 	"frame_generation_debug_flow", false,
 	"Visualize FidelityFX optical-flow vectors and field confidence." );
+gamescope::ConVar<bool> cv_frame_generation_gui_correction(
+	"frame_generation_gui_correction", true,
+	"Keep temporally stable, screen-space GUI edges crisp in generated frames." );
+gamescope::ConVar<bool> cv_frame_generation_debug_gui(
+	"frame_generation_debug_gui", false,
+	"Visualize the screen-space GUI correction mask." );
 
 namespace
 {
+	constexpr uint32_t kFrameGenerationGuiCorrection = 1u << 28;
+	constexpr uint32_t kFrameGenerationDebugGui = 1u << 29;
+	constexpr uint32_t kFrameGenerationDebugFlow = 1u << 31;
+
 	constexpr uint32_t kPyramidLevels = 7;
 	constexpr uint32_t kHistogramWidth = 256 * 3 * 3;
 
@@ -359,7 +370,9 @@ namespace
 			if ( !scdPreviousHistogram.Create( kHistogramWidth, 1, VK_FORMAT_R32_SFLOAT ) ||
 				 !scdTemp.Create( 3, 1, VK_FORMAT_R32_UINT ) || !scdOutput.Create( 3, 1, VK_FORMAT_R32_UINT ) ||
 				 !vectorFieldX.Create( flowExtent[0].width, flowExtent[0].height, VK_FORMAT_R32_UINT ) ||
-				 !vectorFieldY.Create( flowExtent[0].width, flowExtent[0].height, VK_FORMAT_R32_UINT ) )
+				 !vectorFieldY.Create( flowExtent[0].width, flowExtent[0].height, VK_FORMAT_R32_UINT ) ||
+				 !guiMask[0].Create( lumaExtent.width, lumaExtent.height, VK_FORMAT_R8_UNORM ) ||
+				 !guiMask[1].Create( lumaExtent.width, lumaExtent.height, VK_FORMAT_R8_UNORM ) )
 				return false;
 
 			const uint32_t pyramidWidth = std::max( sourceWidth / 2, 1u );
@@ -396,10 +409,10 @@ namespace
 			return g_device.vk.ResetDescriptorPool( g_device.device(), descriptorPool, 0 ) == VK_SUCCESS;
 		}
 
-		std::array<Pass *, 12> AllPasses()
+		std::array<Pass *, 13> AllPasses()
 		{
 			return { &prepare, &prepareScaled, &pyramid, &histogram, &divergence, &search, &filter, &scale,
-				&vectorField, &midpointPass, &inpaintingPyramidPass, &inpaintingPass };
+				&vectorField, &guiMaskPass, &midpointPass, &inpaintingPyramidPass, &inpaintingPass };
 		}
 
 		VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -412,6 +425,7 @@ namespace
 		Pass filter;
 		Pass scale;
 		Pass vectorField;
+		Pass guiMaskPass;
 		Pass midpointPass;
 		Pass inpaintingPyramidPass;
 		Pass inpaintingPass;
@@ -425,6 +439,7 @@ namespace
 		RawImage scdOutput;
 		RawImage vectorFieldX;
 		RawImage vectorFieldY;
+		std::array<RawImage, 2> guiMask;
 		RawImage inpaintingPyramid;
 		RawBuffer counters;
 		RawBuffer telemetryCounters;
@@ -444,7 +459,7 @@ namespace
 	private:
 		bool CheckCapabilities()
 		{
-			for ( VkFormat format : { VK_FORMAT_R8_UINT, VK_FORMAT_R16G16_SINT, VK_FORMAT_R32_UINT,
+			for ( VkFormat format : { VK_FORMAT_R8_UINT, VK_FORMAT_R8_UNORM, VK_FORMAT_R16G16_SINT, VK_FORMAT_R32_UINT,
 				VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT } )
 			{
 				VkFormatProperties properties = {};
@@ -585,11 +600,19 @@ namespace
 					Binding( 4, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ), Binding( 5, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ),
 					Binding( 1000, D::VK_DESCRIPTOR_TYPE_SAMPLER ),
 				} ) &&
+				CreatePassBindings( guiMaskPass, cs_ffx_frameinterpolation_gui_mask, sizeof( cs_ffx_frameinterpolation_gui_mask ), {
+					Binding( 0, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 1, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
+					Binding( 2, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 3, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
+					Binding( 4, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 5, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
+					Binding( 6, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ), Binding( 7, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ),
+					Binding( 1000, D::VK_DESCRIPTOR_TYPE_SAMPLER ),
+				} ) &&
 				CreatePassBindings( midpointPass, cs_ffx_frameinterpolation_midpoint, sizeof( cs_ffx_frameinterpolation_midpoint ), {
 					Binding( 0, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 1, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
 					Binding( 2, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 3, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
 					Binding( 4, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ), Binding( 5, D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ),
 					Binding( 6, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ), Binding( 7, D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ),
+					Binding( 8, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ),
 					Binding( 1000, D::VK_DESCRIPTOR_TYPE_SAMPLER ),
 				} ) &&
 				CreatePassBindings( inpaintingPyramidPass, ffx_frameinterpolation_compute_inpainting_pyramid_pass,
@@ -673,6 +696,8 @@ namespace
 			{
 				ClearAll( cmdBuffer->rawBuffer() );
 				frameIndex = 0;
+				guiMaskIndex = 0;
+				guiMaskValid = false;
 			}
 			else
 			{
@@ -819,7 +844,10 @@ namespace
 			constants.maxRenderSize[1] = constants.displaySize[1];
 			constants.interpolationRectSize[0] = constants.displaySize[0];
 			constants.interpolationRectSize[1] = constants.displaySize[1];
-			constants.dispatchFlags = cv_frame_generation_debug_flow ? 0x80000000u : 0u;
+			constants.dispatchFlags =
+				( cv_frame_generation_gui_correction ? kFrameGenerationGuiCorrection : 0u ) |
+				( cv_frame_generation_debug_gui ? kFrameGenerationDebugGui : 0u ) |
+				( cv_frame_generation_debug_flow ? kFrameGenerationDebugFlow : 0u );
 			constants.backBufferTransferFunction = transferFunction;
 			constants.minMaxLuminance[1] = 1000.0f;
 			const Descriptor fiConstants = Upload( constants );
@@ -833,10 +861,48 @@ namespace
 			Barrier( cmdBuffer->rawBuffer() );
 			WriteTimestamp( cmdBuffer->rawBuffer(), 3 );
 
+			const bool guiMaskEnabled = cv_frame_generation_gui_correction || cv_frame_generation_debug_gui;
+			if ( guiMaskEnabled )
+			{
+				if ( !guiMaskValid )
+				{
+					const VkClearColorValue zero = {};
+					const VkImageSubresourceRange oneLevel = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+					for ( RawImage &mask : resources->guiMask )
+						g_device.vk.CmdClearColorImage( cmdBuffer->rawBuffer(), mask.image,
+							VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &oneLevel );
+					Barrier( cmdBuffer->rawBuffer() );
+					guiMaskIndex = 0;
+				}
+
+				const uint32_t previousGuiMask = guiMaskIndex;
+				const uint32_t currentGuiMask = previousGuiMask ^ 1u;
+				const uint32_t currentLuma = resourceFrameIndex ^ 1u;
+				const uint32_t previousLuma = currentLuma ^ 1u;
+				if ( !Dispatch( cmdBuffer->rawBuffer(), resources->guiMaskPass, {
+					Sampled( resources->vectorFieldX ), Sampled( resources->vectorFieldY ),
+					Sampled( resources->luma[previousLuma][0] ), Sampled( resources->luma[currentLuma][0] ),
+					Sampled( resources->scdOutput ),
+					Sampled( resources->guiMask[previousGuiMask] ), Storage( resources->guiMask[currentGuiMask] ),
+					fiConstants, Sampler( resources->linearSampler ),
+				}, ( resources->guiMask[currentGuiMask].width + 7 ) / 8,
+					( resources->guiMask[currentGuiMask].height + 7 ) / 8 ) )
+					return nullptr;
+				guiMaskIndex = currentGuiMask;
+				guiMaskValid = true;
+				Barrier( cmdBuffer->rawBuffer() );
+			}
+			else
+			{
+				guiMaskValid = false;
+			}
+
 			if ( !Dispatch( cmdBuffer->rawBuffer(), resources->midpointPass, {
 				Sampled( resources->vectorFieldX ), Sampled( resources->vectorFieldY ), Sampled( previous->srgbView() ),
 				Sampled( current->srgbView() ), Sampled( resources->scdOutput ), StorageView( resources->midpoint->srgbView() ),
-				fiConstants, StorageBuffer( resources->telemetryCounters ), Sampler( resources->linearSampler ),
+				fiConstants, StorageBuffer( resources->telemetryCounters ),
+				Sampled( resources->guiMask[guiMaskIndex] ),
+				Sampler( resources->linearSampler ),
 			}, ( resources->sourceExtent.width + 7 ) / 8, ( resources->sourceExtent.height + 7 ) / 8 ) )
 				return nullptr;
 			Barrier( cmdBuffer->rawBuffer() );
@@ -1048,6 +1114,8 @@ namespace
 			result.push_back( &resources->scdOutput );
 			result.push_back( &resources->vectorFieldX );
 			result.push_back( &resources->vectorFieldY );
+			result.push_back( &resources->guiMask[0] );
+			result.push_back( &resources->guiMask[1] );
 			result.push_back( &resources->inpaintingPyramid );
 			return result;
 		}
@@ -1099,6 +1167,8 @@ namespace
 		std::vector<std::shared_ptr<OpticalFlowResources>> retired;
 		uint32_t resourceFrameIndex = 0;
 		uint32_t frameIndex = 0;
+		uint32_t guiMaskIndex = 0;
+		bool guiMaskValid = false;
 		bool firstExecution = true;
 		uint32_t transferFunction = 0;
 		FrameGenerationGpuTimings timings;

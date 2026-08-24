@@ -147,6 +147,21 @@ ffx_spirv_shaders += custom_target(
   depfile: ffx_midpoint_shader_name + '.h.d',
 )
 
+ffx_gui_mask_shader_name = 'cs_ffx_frameinterpolation_gui_mask'
+ffx_spirv_shaders += custom_target(
+  ffx_gui_mask_shader_name + '.h',
+  output: ffx_gui_mask_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_gui_mask_shader_name + '.comp'),
+    '--vn', ffx_gui_mask_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_gui_mask_shader_name + '.h.d',
+)
+
 ffx_scaled_luma_shader_name = 'cs_ffx_opticalflow_prepare_luma_scaled'
 ffx_spirv_shaders += custom_target(
   ffx_scaled_luma_shader_name + '.h',

@@ -2553,6 +2553,30 @@ paint_all( global_focus_t *pFocus, bool async, bool frameGenerationPrepareOnly =
 		frameCounter = 0;
 
 		stats_printf( "fps=%f\n", currentFrameRate );
+		FrameGenerationTelemetry frameGenerationTelemetry = vulkan_frame_generation_get_telemetry();
+		const uint32_t frameGenerationOutputHz = g_nSteamCompMgrTargetFPS > 0
+			? uint32_t( g_nSteamCompMgrTargetFPS )
+			: uint32_t( gamescope::ConvertmHzToHz( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh ) );
+		frameGenerationTelemetry.outputCadenceHz = frameGenerationOutputHz;
+		frameGenerationTelemetry.sourceCadenceHz = frameGenerationOutputHz / 2u;
+		stats_printf( "framegen_of_prepare_pyramid_gpu_ms=%f\n", frameGenerationTelemetry.gpu.preparationAndPyramidMilliseconds );
+		stats_printf( "framegen_of_search_filter_gpu_ms=%f\n", frameGenerationTelemetry.gpu.searchAndFilterMilliseconds );
+		stats_printf( "framegen_fi_vector_gpu_ms=%f\n", frameGenerationTelemetry.gpu.vectorFieldMilliseconds );
+		stats_printf( "framegen_fi_interpolation_gpu_ms=%f\n", frameGenerationTelemetry.gpu.interpolationAndInpaintingMilliseconds );
+		stats_printf( "framegen_generated_fsr_gpu_ms=%f\n", frameGenerationTelemetry.gpu.generatedFsrMilliseconds );
+		stats_printf( "framegen_total_gpu_ms=%f\n", frameGenerationTelemetry.gpu.totalMilliseconds );
+		stats_printf( "framegen_generated=%" PRIu64 "\n", frameGenerationTelemetry.generatedFrames );
+		stats_printf( "framegen_presented=%" PRIu64 "\n", frameGenerationTelemetry.presentedGeneratedFrames );
+		stats_printf( "framegen_deadline_dropped=%" PRIu64 "\n", frameGenerationTelemetry.deadlineDroppedFrames );
+		stats_printf( "framegen_scene_cut_copies=%" PRIu64 "\n", frameGenerationTelemetry.sceneCutCopies );
+		stats_printf( "framegen_flow_scale_percent=%u\n", frameGenerationTelemetry.flowScalePercent );
+		stats_printf( "framegen_source_cadence_hz=%u\n", frameGenerationTelemetry.sourceCadenceHz );
+		stats_printf( "framegen_output_cadence_hz=%u\n", frameGenerationTelemetry.outputCadenceHz );
+		gpuvis_trace_printf( "framegen total %.3fms of %.3fms fi %.3fms fsr %.3fms",
+			frameGenerationTelemetry.gpu.totalMilliseconds,
+			frameGenerationTelemetry.gpu.preparationAndPyramidMilliseconds + frameGenerationTelemetry.gpu.searchAndFilterMilliseconds,
+			frameGenerationTelemetry.gpu.vectorFieldMilliseconds + frameGenerationTelemetry.gpu.interpolationAndInpaintingMilliseconds,
+			frameGenerationTelemetry.gpu.generatedFsrMilliseconds );
 
 		if ( window_is_steam( w ) )
 		{
@@ -6120,12 +6144,8 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 		{
 			if ( frameGenerationActive )
 			{
-				const uint64_t denominator = uint64_t( nRefreshHz ) * 2u;
-				const uint64_t slot = vblank_idx * uint64_t( nTargetFPS ) / denominator;
-				const uint64_t previousSlot = vblank_idx > 0
-					? ( vblank_idx - 1 ) * uint64_t( nTargetFPS ) / denominator
-					: uint64_t( -1 );
-				bSendCallback = slot != previousSlot;
+				bSendCallback = gamescope::FrameGenerationSourceSlotDue(
+					vblank_idx, uint64_t( nTargetFPS ), uint64_t( nRefreshHz ) );
 			}
 			else
 			{
