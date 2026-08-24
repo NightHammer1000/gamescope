@@ -913,6 +913,16 @@ static gamescope::ConCommand cc_debug_force_repaint( "debug_force_repaint", "For
 	hasRepaint = true;
 });
 
+// The main loop dumps this on the steamcompmgr thread, which owns the
+// focus state and the X connections.
+static std::atomic<bool> g_bPendingFocusInfo = { false };
+
+static gamescope::ConCommand cc_focus_info( "focus_info", "Dump debug info about the focus state",
+[]( std::span<std::string_view> args )
+{
+	g_bPendingFocusInfo = true;
+});
+
 unsigned long	damageSequence = 0;
 
 uint64_t		cursorHideTime = 10'000ul * 1'000'000ul;
@@ -3289,6 +3299,17 @@ get_prop(xwayland_ctx_t *ctx, Window win, Atom prop, unsigned int def, bool *fou
 								 &n, &left, &data);
 	if (result == Success && data != NULL)
 	{
+		// A zero-element property still hands back an allocation, so we would read uninitialized memory.
+		if ( n < 1 )
+		{
+			XFree((void *) data);
+			if ( found != nullptr )
+			{
+				*found = false;
+			}
+			return def;
+		}
+
 		unsigned int i;
 		memcpy(&i, data, sizeof(unsigned int));
 		XFree((void *) data);
@@ -4071,7 +4092,10 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 
 		if ( !ctx->focus.overrideWindow || ctx->focus.overrideWindow != keyboardFocusWin )
 		{
-			XSetInputFocus(ctx->dpy, keyboardFocusWin->xwayland().id, RevertToNone, CurrentTime);
+			// Retargeting the toplevel would unfocus CEF's browser subwindow.
+			// A subwindow reverts to its parent so it can't strand focus on None.
+			int nRevertMode = keyboardFocusWindow == keyboardFocusWin->xwayland().id ? RevertToNone : RevertToParent;
+			XSetInputFocus(ctx->dpy, keyboardFocusWindow, nRevertMode, CurrentTime);
 
 			// wine >= 10.0 treats _NET_ACTIVE_WINDOW as foreground, so it must track real keyboard focus.
 			Window activeWindow = keyboardFocusWin->xwayland().id;
@@ -4256,6 +4280,63 @@ steamcompmgr_xdg_determine_and_apply_focus( const std::vector< steamcompmgr_win_
 }
 
 uint32_t g_focusedBaseAppId = 0;
+
+static void
+DumpFocusInfo()
+{
+	global_focus_t *pFocus = GetCurrentFocus();
+	if ( !pFocus )
+		return;
+
+	auto dump_win = []( const char *pszRole, steamcompmgr_win_t *w )
+	{
+		if ( w )
+			focus_log.infof( "%s: 0x%x (%s) appID=%u", pszRole, w->id(), w->debug_name(), w->appID );
+		else
+			focus_log.infof( "%s: none", pszRole );
+	};
+
+	dump_win( "Global focus window", pFocus->focusWindow );
+	dump_win( "Global input focus window", pFocus->inputFocusWindow );
+	dump_win( "Global keyboard focus window", pFocus->keyboardFocusWindow );
+	dump_win( "Global override window", pFocus->overrideWindow );
+	dump_win( "Global overlay window", pFocus->overlayWindow );
+
+	// Only the current connector's focus gets published to Steam, so dump
+	// every connector's focus next to the current key.
+	gamescope::IBackendConnector *pCurrentConnector = GetBackend()->GetCurrentConnector();
+	gamescope::VirtualConnectorKey_t ulCurrentKey = pCurrentConnector ? pCurrentConnector->GetVirtualConnectorKey() : 0;
+	std::string_view svStrategy = gamescope::VirtualConnectorStrategyToString( gamescope::cv_backend_virtual_connector_strategy );
+	focus_log.infof( "Virtual connector strategy: %.*s, current key: 0x%" PRIx64,
+		(int)svStrategy.size(), svStrategy.data(), ulCurrentKey );
+
+	for ( auto &[ ulKey, focus ] : g_VirtualConnectorFocuses )
+	{
+		steamcompmgr_win_t *w = focus.focusWindow;
+		focus_log.infof( "  Connector 0x%" PRIx64 "%s: focus window %s appID=%u", ulKey,
+			ulKey == ulCurrentKey ? " (current)" : "",
+			w ? w->debug_name() : "none", w ? w->appID : 0 );
+	}
+
+	xwayland_ctx_t *root_ctx = wlserver_get_xwayland_server( 0 )->ctx.get();
+	focus_log.infof( "Focused app property: %u", get_prop( root_ctx, root_ctx->root, root_ctx->atoms.gamescopeFocusedAppAtom, 0 ) );
+	focus_log.infof( "Focused window property: 0x%x", get_prop( root_ctx, root_ctx->root, root_ctx->atoms.gamescopeFocusedWindowAtom, 0 ) );
+
+	gamescope_xwayland_server_t *server = NULL;
+	for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
+	{
+		xwayland_ctx_t *ctx = server->ctx.get();
+		Window realFocus = None;
+		int nRevertMode = 0;
+		XGetInputFocus( ctx->dpy, &realFocus, &nRevertMode );
+		steamcompmgr_win_t *realWin = find_win( ctx, realFocus );
+		focus_log.infof( "Server %zu keyboard focus: 0x%lx (%s) revert=%d wanted=0x%lx", i,
+			realFocus, realWin ? realWin->debug_name() : "untracked", nRevertMode, ctx->currentKeyboardFocusWindow );
+		dump_win( "  Focus window", ctx->focus.focusWindow );
+		dump_win( "  Input focus window", ctx->focus.inputFocusWindow );
+		dump_win( "  Override window", ctx->focus.overrideWindow );
+	}
+}
 
 static void
 determine_and_apply_focus( global_focus_t *pFocus )
@@ -4570,7 +4651,9 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	{
 		focusedWindow = (unsigned long)pFocus->focusWindow->id();
 		focusedBaseAppId = pFocus->focusWindow->appID;
-		focusedAppId = pFocus->inputFocusWindow->appID;
+		// A focus window does not guarantee an input focus window.
+		if ( pFocus->inputFocusWindow )
+			focusedAppId = pFocus->inputFocusWindow->appID;
 		focused_display = get_win_display_name(pFocus->focusWindow);
 		sdFocusWindow_pid = pFocus->focusWindow->pid;
 	}
@@ -7673,8 +7756,9 @@ void xwayland_ctx_t::Dispatch()
 			{
 				steamcompmgr_win_t * w = find_win( ctx, ev.xfocus.window );
 
-				// If focus escaped the current desired keyboard focus window, check where it went
-				if ( w && w->xwayland().id == ctx->currentKeyboardFocusWindow )
+				// If focus escaped the current desired keyboard focus window, check where it went.
+				// The desired window may be a preserved subwindow, so also match it directly.
+				if ( w && ( ev.xfocus.window == ctx->currentKeyboardFocusWindow || w->xwayland().id == ctx->currentKeyboardFocusWindow ) )
 				{
 					Window newKeyboardFocus = None;
 					int nRevertMode = 0;
@@ -7685,9 +7769,9 @@ void xwayland_ctx_t::Dispatch()
 
 					if ( kbw )
 					{
-						if ( kbw->xwayland().id == ctx->currentKeyboardFocusWindow )
+						if ( kbw == find_win( ctx, ctx->currentKeyboardFocusWindow ) )
 						{
-							// focus went to a child, this is fine, make note of it in case we need to fix it
+							// focus stayed within the same toplevel, keep track of it
 							ctx->currentKeyboardFocusWindow = newKeyboardFocus;
 						}
 						else
@@ -7695,6 +7779,11 @@ void xwayland_ctx_t::Dispatch()
 							// focus went elsewhere, correct it
 							bSetFocus = true;
 						}
+					}
+					else if ( newKeyboardFocus == None )
+					{
+						// focus dropped to None, take it back
+						bSetFocus = true;
 					}
 				}
 
@@ -7773,7 +7862,9 @@ void xwayland_ctx_t::Dispatch()
 
 	if ( bSetFocus )
 	{
-		XSetInputFocus(ctx->dpy, ctx->currentKeyboardFocusWindow, RevertToNone, CurrentTime);
+		// A subwindow reverts to its parent so it can't strand focus on None.
+		bool bToplevel = find_win( ctx, ctx->currentKeyboardFocusWindow, false ) != nullptr;
+		XSetInputFocus(ctx->dpy, ctx->currentKeyboardFocusWindow, bToplevel ? RevertToNone : RevertToParent, CurrentTime);
 	}
 }
 
@@ -9024,6 +9115,9 @@ steamcompmgr_main(int argc, char **argv)
 				hasRepaint = true;
 			}
 		}
+
+		if ( g_bPendingFocusInfo.exchange( false ) )
+			DumpFocusInfo();
 
 		// XXX(misyl): This is bad! We shouldnt change the upscaler like this at all!!!
 		// We should move this to business logic in paint_window or something!
