@@ -8,15 +8,15 @@ struct wlr_dmabuf_attributes;
 
 namespace gamescope
 {
-	// NVIDIA's display engine requires physically contiguous scanout memory,
-	// which Vulkan external-memory allocation cannot guarantee but GBM can.
-	// Delete this if/when nvidia-drm can scan out Vulkan-allocated buffers.
+	// Allocate every compositor-owned scanout buffer through the DRM driver's
+	// KMS-aware GBM allocator. Vulkan imports these buffers for rendering, but
+	// never decides their memory placement.
 	class CGbmScanoutAllocator
 	{
 	public:
 		~CGbmScanoutAllocator();
 
-		bool Init( int nDrmFd ); // no-op unless nvidia-drm
+		bool Init( int nDrmFd );
 		void Shutdown();
 
 		bool IsAvailable() const { return m_pGbmDevice != nullptr; }

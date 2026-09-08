@@ -8,13 +8,8 @@ namespace gamescope
 	{
 		DrmVendorQuirks quirks{};
 
-		// nvidia-drm's display engine will not scan out memory that did not
-		// come from its own KMS-aware allocator. Client buffers never do, and
-		// neither does anything Vulkan exported for us.
 		if ( svDriverName == "nvidia-drm" )
 		{
-			quirks.bCanDirectScanoutClientBuffers = false;
-			quirks.bRequiresGbmScanoutAllocation = true;
 			quirks.bNeedsModesetLinkDown = true;
 		}
 

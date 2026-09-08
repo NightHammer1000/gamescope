@@ -323,12 +323,11 @@ namespace gamescope
         // Rc manages acquire/release of buffer to/from client while imported.
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) = 0;
 
-        // Some KMS drivers (nvidia-drm) need scanout memory placement that Vulkan
-        // cannot express; such backends allocate scanout buffers for Vulkan to import.
+        // Backends may own scanout memory placement and expose buffers for Vulkan
+        // to import rather than asking Vulkan to allocate exportable images.
         virtual bool UsesBackendAllocatedScanout() const { return false; }
-        // When true, CreateScanoutDmabuf failing is fatal: this driver cannot
-        // scan out Vulkan-allocated memory, so "fall back" means "render
-        // corruption".
+        // When true, CreateScanoutDmabuf failing is fatal: Vulkan-allocated
+        // memory is not considered a safe scanout fallback.
         virtual bool RequiresBackendAllocatedScanout() const { return false; }
         virtual bool CreateScanoutDmabuf( uint32_t /*uWidth*/, uint32_t /*uHeight*/, uint32_t /*uDrmFormat*/,
                                           std::span<const uint64_t> /*ulModifiers*/,

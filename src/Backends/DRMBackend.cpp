@@ -1510,12 +1510,12 @@ bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 
 	drm->vendorQuirks = gamescope::DetectDrmVendorQuirks( drm->fd );
 
-	// Where GBM-allocated scanout is required there is deliberately no fallback:
-	// Vulkan-allocated scanout on such a driver renders corruption rather than
-	// failing, which is far worse than refusing to start.
-	if ( !drm->gbmAllocator.Init( drm->fd ) && drm->vendorQuirks.bRequiresGbmScanoutAllocation )
+	// All composited scanout is GBM-backed. Do not silently restore the Vulkan
+	// allocation path: tests on multiple vendors have shown that a Vulkan image
+	// being exportable does not guarantee that KMS can scan it out reliably.
+	if ( !drm->gbmAllocator.Init( drm->fd ) )
 	{
-		drm_log.errorf( "This driver requires GBM-allocated scanout buffers and the GBM device could not be opened. Refusing to fall back to Vulkan allocation." );
+		drm_log.errorf( "The GBM device could not be opened. Telescope requires GBM-allocated scanout buffers and will not fall back to Vulkan allocation." );
 		return false;
 	}
 
@@ -4006,10 +4006,6 @@ namespace gamescope
 
 			bool bNeedsFullComposite = false;
 			bNeedsFullComposite |= cv_composite_force;
-			// Some display engines will not scan out a buffer the client allocated.
-			// Everywhere else direct scanout stays available: it is the copy this
-			// compositor exists to avoid.
-			bNeedsFullComposite |= !g_DRM.vendorQuirks.bCanDirectScanoutClientBuffers;
 			bNeedsFullComposite |= bWasFirstFrame;
 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;
@@ -4339,7 +4335,7 @@ namespace gamescope
 
 		virtual bool RequiresBackendAllocatedScanout() const override
 		{
-			return g_DRM.vendorQuirks.bRequiresGbmScanoutAllocation;
+			return true;
 		}
 
 		virtual bool CreateScanoutDmabuf( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,

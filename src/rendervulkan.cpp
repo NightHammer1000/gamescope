@@ -3850,11 +3850,9 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 
 		if ( !bBackendAllocated && GetBackend()->RequiresBackendAllocatedScanout() )
 		{
-			// Deliberately fatal. This driver's display engine cannot scan out
-			// Vulkan-allocated memory, so falling back would not fail -- it
-			// would quietly produce a corrupt image, which is the bug we are
-			// here to avoid.
-			vk_log.errorf( "Failed to allocate scanout buffers through GBM, and this driver has no safe fallback. Refusing to start." );
+			// Deliberately fatal. Exportability does not guarantee scanout-safe
+			// memory placement, so falling back may quietly corrupt the image.
+			vk_log.errorf( "Failed to allocate scanout buffers through GBM; Vulkan allocation is not a safe fallback. Refusing to start." );
 			return false;
 		}
 
@@ -5623,7 +5621,7 @@ namespace
 				return nullptr;
 
 			CVulkanTexture::createFlags flags;
-			// Backend-allocated scanout paths (currently NVIDIA DRM) always
+			// Backend-allocated scanout paths always
 			// composite into their own final buffer. Keep frame-generation output
 			// device-local there: exporting it and transferring ownership to the
 			// foreign queue family is both unnecessary and breaks the subsequent
