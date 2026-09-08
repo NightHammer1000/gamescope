@@ -21,6 +21,7 @@ void steamcompmgr_main(int argc, char **argv);
 #include "wlserver.hpp"
 #include "vblankmanager.hpp"
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -40,6 +41,10 @@ static const uint32_t g_zposMuraCorrection = 5;
 
 extern bool g_bHDRItmEnable;
 extern bool g_bForceHDRSupportDebug;
+
+// Request a rebuild of the output images on the next steamcompmgr iteration,
+// eg. after toggling scanout buffer allocation strategy at runtime.
+extern std::atomic<bool> g_bForceOutputImageRemake;
 
 extern EStreamColorspace g_ForcedNV12ColorSpace;
 

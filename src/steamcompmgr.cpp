@@ -160,6 +160,7 @@ static lut3d_t g_tmpLut3d;
 extern int g_nDynamicRefreshHz;
 
 bool g_bForceHDRSupportDebug = false;
+std::atomic<bool> g_bForceOutputImageRemake = { false };
 extern float g_flInternalDisplayBrightnessNits;
 extern float g_flHDRItmSdrNits;
 extern float g_flHDRItmTargetNits;
@@ -1150,7 +1151,7 @@ static bool		drawDebugInfo = false;
 static bool		debugEvents = false;
 extern bool		steamMode;
 
-gamescope::ConVar<bool> cv_composite_force{ "composite_force", false, "Force composition always, never use scanout" };
+gamescope::ConVar<bool> cv_composite_force{ "composite_force", true, "Force composition always, never use direct scanout" };
 static bool		useXRes = true;
 
 namespace gamescope
@@ -9076,12 +9077,20 @@ steamcompmgr_main(int argc, char **argv)
 		// Pick our width/height for this potential frame, regardless of how it might change later
 		// At some point we might even add proper locking so we get real updates atomically instead
 		// of whatever jumble of races the below might cause over a couple of frames
+		// Consume the remake request exactly once, before evaluating the other
+		// conditions: a concurrent request (eg. the drm_gbm_scanout convar
+		// callback on the Wayland thread) must never be cleared unseen, only
+		// exchanged out - a write racing past this point stays set for the
+		// next iteration.
+		const bool bForceOutputImageRemake = g_bForceOutputImageRemake.exchange( false );
+
 		if ( currentOutputWidth != g_nOutputWidth ||
 			 currentOutputHeight != g_nOutputHeight ||
 			 currentOutputRefresh != g_nOutputRefresh ||
 			 currentOutputRotation != g_uOutputRotation ||
 			 currentHDROutput != g_bOutputHDREnabled ||
-			 currentHDRForce != g_bForceHDRSupportDebug )
+			 currentHDRForce != g_bForceHDRSupportDebug ||
+			 bForceOutputImageRemake )
 		{
 			if ( g_nXWaylandCount > 1 )
 			{
