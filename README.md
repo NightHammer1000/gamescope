@@ -2,7 +2,7 @@
 
 *A gamescope fork for a gamemode that works on every vendor, driver workarounds included.*
 
-Telescope started with a bug. High resolution and HDR corrupt on NVIDIA GPUs, because gamescope's scanout path assumes Vulkan-allocated memory is something the display engine can scan out. The Vulkan spec never promised that. It happens to be true on Mesa and it is not true on NVIDIA.
+Telescope started with a bug. High resolution and HDR can corrupt because gamescope's scanout path assumes Vulkan-allocated memory is something the display engine can scan out. The Vulkan spec never promised that, and testing has now exposed failures across NVIDIA, AMD, and Intel configurations.
 
 You can fix it by allocating through GBM, or you can wait for NVIDIA. They have been sitting on this since 2024, so GBM it is.
 
@@ -24,11 +24,11 @@ Early, and not yet run on real hardware. The fork builds clean and its unit test
 
 ## Currently included workarounds
 
-**NVIDIA: scanout buffers come from GBM, and composition is forced.**
+**All GPUs: scanout buffers come from GBM, and composition is forced.**
 
-The display engine will not scan out client-allocated buffers either, so every frame gets composited into a buffer we allocated.
+Every frame is composited into a buffer allocated through the DRM driver's GBM implementation. This avoids relying on either client allocations or Vulkan-exported allocations being suitable for KMS scanout.
 
-This applies to NVIDIA only. AMD and Intel keep Vulkan-allocated scanout, and they keep direct scanout of client buffers, which is the copy this compositor exists to avoid. Where GBM is required there is no fallback, on purpose. Falling back to Vulkan allocation on such a driver does not produce an error, it produces a corrupt image, so Telescope refuses to start instead.
+There is no Vulkan-allocation fallback, on purpose. Recent testing found corruption in some AMD and Intel configurations too: exportable Vulkan memory is not guaranteed to have scanout-safe placement. Telescope refuses to start if GBM allocation is unavailable rather than risk silently producing a corrupt image.
 
 Measured on real hardware: framecount is identical patched and unpatched, so forcing composition costs nothing in steady state.
 

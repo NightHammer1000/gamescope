@@ -1,6 +1,4 @@
 #include "DRMGbmScanout.h"
-#include "DRMVendorQuirks.h"
-
 #include "drm_include.h"
 #include "log.hpp"
 #include "Utils/Algorithm.h"
@@ -23,16 +21,12 @@ namespace gamescope
 
 	bool CGbmScanoutAllocator::Init( int nDrmFd )
 	{
-		// Only drivers that need it pay for it. Everywhere else Vulkan-allocated
-		// scanout works and direct scanout stays available.
-		if ( !DetectDrmVendorQuirks( nDrmFd ).bRequiresGbmScanoutAllocation )
-			return false;
 #if HAVE_GBM
 		m_pGbmDevice = gbm_create_device( nDrmFd );
 		if ( !m_pGbmDevice )
 			gbm_log.errorf_errno( "Failed to create GBM device" );
 #else
-		gbm_log.errorf( "Built without GBM support, but this driver requires GBM-allocated scanout buffers." );
+		gbm_log.errorf( "Built without GBM support; Telescope requires GBM-allocated scanout buffers." );
 #endif
 		return m_pGbmDevice != nullptr;
 	}

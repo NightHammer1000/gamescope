@@ -188,29 +188,23 @@ TEST_CASE("Scanout modifier negotiation does not degrade a healthy driver", "[sc
 	REQUIRE( choice.candidates.back() == DRM_FORMAT_MOD_LINEAR );
 }
 
-TEST_CASE("Only nvidia-drm carries the scanout quirks", "[scanout]") {
+TEST_CASE("Only nvidia-drm carries the link-down modeset quirk", "[scanout]") {
 	const DrmVendorQuirks nvidia = DrmVendorQuirksForDriver( "nvidia-drm" );
-	REQUIRE_FALSE( nvidia.bCanDirectScanoutClientBuffers );
-	REQUIRE( nvidia.bRequiresGbmScanoutAllocation );
 	REQUIRE( nvidia.bNeedsModesetLinkDown );
 
-	// Direct scanout is the copy gamescope exists to avoid, and Vulkan-allocated
-	// scanout works fine on Mesa. Every other driver keeps both.
 	for ( const char *pszDriver : { "amdgpu", "i915", "xe", "nouveau", "msm", "vc4" } )
 	{
 		const DrmVendorQuirks quirks = DrmVendorQuirksForDriver( pszDriver );
 		INFO( "driver: " << pszDriver );
-		REQUIRE( quirks.bCanDirectScanoutClientBuffers );
-		REQUIRE_FALSE( quirks.bRequiresGbmScanoutAllocation );
 		REQUIRE_FALSE( quirks.bNeedsModesetLinkDown );
 	}
 
-	// Unknown drivers get the permissive default, not the NVIDIA workaround.
-	REQUIRE( DrmVendorQuirksForDriver( "some-future-driver" ).bCanDirectScanoutClientBuffers );
-	REQUIRE( DrmVendorQuirksForDriver( "" ).bCanDirectScanoutClientBuffers );
+	// Unknown drivers do not inherit the NVIDIA modeset workaround.
+	REQUIRE_FALSE( DrmVendorQuirksForDriver( "some-future-driver" ).bNeedsModesetLinkDown );
+	REQUIRE_FALSE( DrmVendorQuirksForDriver( "" ).bNeedsModesetLinkDown );
 
 	// Substring paranoia: "nvidia-drm" must match exactly, or an unrelated
-	// driver could silently lose direct scanout.
-	REQUIRE( DrmVendorQuirksForDriver( "nvidia" ).bCanDirectScanoutClientBuffers );
-	REQUIRE( DrmVendorQuirksForDriver( "nvidia-drm-next" ).bCanDirectScanoutClientBuffers );
+	// driver could silently inherit the disruptive modeset workaround.
+	REQUIRE_FALSE( DrmVendorQuirksForDriver( "nvidia" ).bNeedsModesetLinkDown );
+	REQUIRE_FALSE( DrmVendorQuirksForDriver( "nvidia-drm-next" ).bNeedsModesetLinkDown );
 }
