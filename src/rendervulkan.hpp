@@ -240,6 +240,7 @@ private:
 	
 	// If this texture owns the backend Fb (ie. it's an internal texture)
 	gamescope::OwningRc<gamescope::IBackendFb> m_pBackendFb;
+	std::shared_ptr<gamescope::IBackendScanoutBuffer> m_pBackendScanoutBuffer;
 
 	uint8_t *m_pMappedData = nullptr;
 

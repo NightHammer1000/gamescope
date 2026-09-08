@@ -11,6 +11,7 @@ dep_xmu = dependency('xmu')
 dep_xi = dependency('xi')
 
 drm_dep = dependency('libdrm', version: '>= 2.4.113', required: get_option('drm_backend'))
+gbm_dep = dependency('gbm', version: '>= 21.3', required: get_option('drm_backend'))
 eis_dep = dependency('libeis-1.0', required : get_option('input_emulation'))
 
 wayland_server = dependency('wayland-server', version: '>=1.21')
@@ -194,7 +195,7 @@ gamescope_version = configure_file(
     include_directories : [reshade_include, sol2_include],
     dependencies: [
       dep_wayland, dep_x11, dep_xdamage, dep_xcomposite, dep_xrender, dep_xext, dep_xfixes,
-      dep_xxf86vm, dep_xres, glm_dep, drm_dep, wayland_server,
+      dep_xxf86vm, dep_xres, glm_dep, drm_dep, gbm_dep, wayland_server,
       xkbcommon, thread_dep, sdl2_dep, wlroots_dep,
       vulkan_dep, liftoff_dep, dep_xtst, dep_xmu, cap_dep, epoll_dep, pipewire_dep, librt_dep,
       stb_dep, displayinfo_dep, openvr_dep, dep_xcursor, avif_dep, dep_xi,

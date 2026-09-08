@@ -290,6 +290,15 @@ namespace gamescope
         virtual ~IBackendPlane() = default;
     };
 
+    // Owns a backend-allocated DMA-BUF for as long as Vulkan and KMS use it.
+    // Backends which cannot allocate native scanout buffers simply return null.
+    class IBackendScanoutBuffer
+    {
+    public:
+        virtual ~IBackendScanoutBuffer() = default;
+        virtual const wlr_dmabuf_attributes &GetDmabuf() const = 0;
+    };
+
     class CBaseBackendFb : public IBackendFb
     {
     public:
@@ -340,6 +349,13 @@ namespace gamescope
         // shared_ptr owns the structure.
         // Rc manages acquire/release of buffer to/from client while imported.
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) = 0;
+
+        virtual std::shared_ptr<IBackendScanoutBuffer> CreateScanoutBuffer(
+            uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,
+            std::span<const uint64_t> modifiers, bool bLinear )
+        {
+            return nullptr;
+        }
 
         virtual bool UsesModifiers() const = 0;
         virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const = 0;

@@ -2103,6 +2103,36 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	};
 
+	// KMS owns the allocation policy for scanout images.  In particular this
+	// avoids assuming that every buffer exported by a Vulkan driver is safe for
+	// that driver's display engine.  Vulkan imports the GBM allocation instead.
+	if ( flags.bFlippable && !pDMA && depth == 1 )
+	{
+		std::vector<uint64_t> importableModifiers;
+		for ( uint64_t modifier : GetBackend()->GetSupportedModifiers( drmFormat ) )
+		{
+			if ( flags.bLinear && modifier != DRM_FORMAT_MOD_LINEAR )
+				continue;
+
+			VkExternalImageFormatProperties properties = {
+				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+			};
+			VkResult modifierResult = getModifierProps( &imageInfo, modifier, &properties );
+			if ( modifierResult == VK_SUCCESS &&
+			     ( properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT ) )
+				importableModifiers.push_back( modifier );
+		}
+
+		m_pBackendScanoutBuffer = GetBackend()->CreateScanoutBuffer(
+			width, height, drmFormat, importableModifiers, flags.bLinear );
+		if ( m_pBackendScanoutBuffer )
+		{
+			pDMA = const_cast<wlr_dmabuf_attributes *>( &m_pBackendScanoutBuffer->GetDmabuf() );
+			flags.bExportable = false;
+			m_bExternal = true;
+		}
+	}
+
 	assert( imageInfo.format != VK_FORMAT_UNDEFINED );
 
 	std::array<VkFormat, 2> formats = {
@@ -2493,7 +2523,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	if ( flags.bFlippable == true )
 	{
-		m_pBackendFb = GetBackend()->ImportDmabufToBackend( &m_dmabuf );
+		m_pBackendFb = GetBackend()->ImportDmabufToBackend( pDMA ? pDMA : &m_dmabuf );
 	}
 
 	bool bHasAlpha = pDMA ? DRMFormatHasAlpha( pDMA->format ) : true;

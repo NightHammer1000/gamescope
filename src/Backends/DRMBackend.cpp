@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <gbm.h>
 
 #include "backend.h"
 #include "color_helpers.h"
@@ -179,6 +180,26 @@ static int g_page_flip_pipe_fds[2] = { -1, -1 };
 
 namespace gamescope
 {
+	class CGBMScanoutBuffer final : public IBackendScanoutBuffer
+	{
+	public:
+		CGBMScanoutBuffer( gbm_bo *pBo, const wlr_dmabuf_attributes &dmabuf )
+			: m_pBo( pBo ), m_Dmabuf( dmabuf ) {}
+
+		~CGBMScanoutBuffer()
+		{
+			for ( int i = 0; i < m_Dmabuf.n_planes; i++ )
+				close( m_Dmabuf.fd[i] );
+			gbm_bo_destroy( m_pBo );
+		}
+
+		const wlr_dmabuf_attributes &GetDmabuf() const override { return m_Dmabuf; }
+
+	private:
+		gbm_bo *m_pBo;
+		wlr_dmabuf_attributes m_Dmabuf;
+	};
+
 	class CDRMBackend;
 
 	std::tuple<int32_t, int32_t, int32_t> GetKernelVersion()
@@ -3567,6 +3588,8 @@ namespace gamescope
 
 		virtual ~CDRMBackend()
 		{
+			if ( m_pGBMDevice )
+				gbm_device_destroy( m_pGBMDevice );
 			if ( g_DRM.fd != -1 )
 				finish_drm( &g_DRM );
 		}
@@ -3585,7 +3608,16 @@ namespace gamescope
 				return false;
 			}
 
-			return init_drm( &g_DRM, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh );
+			if ( !init_drm( &g_DRM, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh ) )
+				return false;
+
+			m_pGBMDevice = gbm_create_device( g_DRM.fd );
+			if ( !m_pGBMDevice )
+			{
+				drm_log.errorf( "Failed to create GBM device for scanout allocation" );
+				return false;
+			}
+			return true;
 		}
 
 		virtual bool PostInit() override
@@ -3948,6 +3980,64 @@ namespace gamescope
 			return drm_fbid_from_dmabuf( &g_DRM, pDmaBuf );
 		}
 
+		virtual std::shared_ptr<IBackendScanoutBuffer> CreateScanoutBuffer(
+			uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,
+			std::span<const uint64_t> modifiers, bool bLinear ) override
+		{
+			if ( !m_pGBMDevice )
+				return nullptr;
+
+			std::vector<uint64_t> usableModifiers;
+			for ( uint64_t modifier : modifiers )
+			{
+				if ( modifier != DRM_FORMAT_MOD_INVALID )
+					usableModifiers.push_back( modifier );
+			}
+
+			gbm_bo *pBo = nullptr;
+			const uint32_t uFlags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING |
+				( bLinear ? GBM_BO_USE_LINEAR : 0 );
+			if ( !usableModifiers.empty() )
+				pBo = gbm_bo_create_with_modifiers2( m_pGBMDevice, uWidth, uHeight, uDrmFormat,
+					usableModifiers.data(), usableModifiers.size(), uFlags );
+			else if ( !UsesModifiers() || bLinear )
+				pBo = gbm_bo_create( m_pGBMDevice, uWidth, uHeight, uDrmFormat, uFlags );
+
+			if ( !pBo )
+			{
+				drm_log.errorf( "GBM failed to allocate %" PRIu32 "x%" PRIu32 " scanout buffer (format 0x%" PRIX32 ")",
+					uWidth, uHeight, uDrmFormat );
+				return nullptr;
+			}
+
+			wlr_dmabuf_attributes dmabuf = {};
+			dmabuf.width = uWidth;
+			dmabuf.height = uHeight;
+			dmabuf.format = uDrmFormat;
+			dmabuf.modifier = gbm_bo_get_modifier( pBo );
+			dmabuf.n_planes = gbm_bo_get_plane_count( pBo );
+			if ( dmabuf.n_planes < 1 || dmabuf.n_planes > 4 )
+			{
+				gbm_bo_destroy( pBo );
+				return nullptr;
+			}
+
+			for ( int i = 0; i < dmabuf.n_planes; i++ )
+			{
+				dmabuf.fd[i] = gbm_bo_get_fd_for_plane( pBo, i );
+				dmabuf.stride[i] = gbm_bo_get_stride_for_plane( pBo, i );
+				dmabuf.offset[i] = gbm_bo_get_offset( pBo, i );
+				if ( dmabuf.fd[i] < 0 )
+				{
+					for ( int j = 0; j < i; j++ ) close( dmabuf.fd[j] );
+					gbm_bo_destroy( pBo );
+					return nullptr;
+				}
+			}
+
+			return std::make_shared<CGBMScanoutBuffer>( pBo, dmabuf );
+		}
+
 		virtual bool UsesModifiers() const override
 		{
 			return g_DRM.allow_modifiers;
@@ -4063,6 +4153,7 @@ namespace gamescope
 		}
 
 	private:
+		gbm_device *m_pGBMDevice = nullptr;
 		bool m_bWasCompositing = false;
 		bool m_bWasPartialCompositing = false;
 		int m_nLastSingleOverlayZPos = 0;

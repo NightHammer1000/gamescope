@@ -1150,7 +1150,7 @@ static bool		drawDebugInfo = false;
 static bool		debugEvents = false;
 extern bool		steamMode;
 
-gamescope::ConVar<bool> cv_composite_force{ "composite_force", false, "Force composition always, never use scanout" };
+gamescope::ConVar<bool> cv_composite_force{ "composite_force", true, "Force composition always, never use direct client scanout" };
 static bool		useXRes = true;
 
 namespace gamescope
