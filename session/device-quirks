@@ -1,0 +1,20 @@
+#!/bin/bash
+# Machine-specific session setup. Sourced by the session runner before the
+# client config, with SYS_ID already set from the DMI product name.
+#
+# This file is for things that must happen per-device and cannot be expressed
+# as a compositor quirk. Anything about a *driver* belongs in
+# src/Backends/DRMVendorQuirks.cpp instead, and anything about a *panel*
+# belongs in a Lua file under scripts/00-telescope/displays/. Both of those
+# apply to everyone; this only applies to whoever runs the session.
+#
+# Example:
+#
+#   case "$SYS_ID" in
+#     "Galileo")
+#       export SCREEN_WIDTH=1280
+#       export SCREEN_HEIGHT=800
+#       ;;
+#   esac
+#
+# Empty by default.

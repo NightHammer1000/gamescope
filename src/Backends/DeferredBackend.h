@@ -163,6 +163,26 @@ namespace gamescope
             return m_pChild->ImportDmabufToBackend( pDmaBuf );
 		}
 
+		virtual bool RequiresBackendAllocatedScanout() const override
+		{
+            std::shared_lock lock{ m_mutInit };
+            return m_bInittedChild && m_pChild->RequiresBackendAllocatedScanout();
+		}
+
+		virtual bool UsesBackendAllocatedScanout() const override
+		{
+            std::shared_lock lock{ m_mutInit };
+            return m_bInittedChild && m_pChild->UsesBackendAllocatedScanout();
+		}
+
+		virtual bool CreateScanoutDmabuf( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,
+		                                  std::span<const uint64_t> ulModifiers,
+		                                  wlr_dmabuf_attributes *pDmaBuf ) override
+		{
+            std::shared_lock lock{ m_mutInit };
+            return m_bInittedChild && m_pChild->CreateScanoutDmabuf( uWidth, uHeight, uDrmFormat, ulModifiers, pDmaBuf );
+		}
+
 		virtual bool UsesModifiers() const override
 		{
             return true;
@@ -334,20 +354,6 @@ namespace gamescope
                 std::shared_lock lock{ m_mutInit };
                 if ( m_bInittedChild )
                     return m_pChild->NotifyPhysicalInput( eInputType );
-            }
-        }
-
-        virtual bool SupportsVROverlayForwarding() override
-        {
-            // Doesn't need to be 'initted' for this check.
-            return m_pChild->SupportsVROverlayForwarding();
-        }
-        virtual void ForwardFramebuffer( std::shared_ptr<IBackendPlane> &pPlane, IBackendFb *pFramebuffer, const void *pData ) override
-        {
-            {
-                std::shared_lock lock{ m_mutInit };
-                if ( m_bInittedChild )
-                    return m_pChild->ForwardFramebuffer( pPlane, pFramebuffer, pData );
             }
         }
 

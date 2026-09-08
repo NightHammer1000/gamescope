@@ -33,6 +33,15 @@ namespace gamescope
         return std::make_shared<CTimeline>( pSemaphore->GetFd(), std::move( pSemaphore ) );
     }
 
+    /*static*/ std::shared_ptr<CTimeline> CTimeline::CreateVulkanOnly( const TimelineCreateDesc_t &desc )
+    {
+        std::shared_ptr<VulkanTimelineSemaphore_t> pSemaphore = g_device.CreateTimelineSemaphore( desc.ulStartingPoint );
+        if ( !pSemaphore )
+            return nullptr;
+
+        return std::make_shared<CTimeline>( -1, 0, std::move( pSemaphore ) );
+    }
+
     CTimeline::CTimeline( int32_t nSyncobjFd, std::shared_ptr<VulkanTimelineSemaphore_t> pSemaphore )
         : CTimeline( nSyncobjFd, SyncobjFdToHandle( nSyncobjFd ), std::move( pSemaphore ) )
     {
@@ -68,6 +77,55 @@ namespace gamescope
         return m_pVkSemaphore;
     }
 
+    // Materialize a timeline point as a sync_file fd.
+    //
+    // drmSyncobjExportSyncFile only works on binary syncobjs, so transfer the
+    // point into a throwaway binary one and export that. The caller owns the fd.
+    int32_t CTimeline::ExportSyncFile( uint64_t ulPoint ) const
+    {
+        const int32_t nDrmFd = GetDrmRenderFD();
+        uint32_t uBinarySyncobj = 0;
+        if ( drmSyncobjCreate( nDrmFd, 0, &uBinarySyncobj ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjCreate failed" );
+            return -1;
+        }
+
+        int32_t nSyncFile = -1;
+        if ( drmSyncobjTransfer( nDrmFd, uBinarySyncobj, 0,
+                m_uSyncobjHandle, ulPoint, 0 ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjTransfer failed" );
+        }
+        else if ( drmSyncobjExportSyncFile( nDrmFd, uBinarySyncobj, &nSyncFile ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjExportSyncFile failed" );
+            nSyncFile = -1;
+        }
+
+        drmSyncobjDestroy( nDrmFd, uBinarySyncobj );
+
+        return nSyncFile;
+    }
+
+    bool CTimeline::SignalPoint( uint64_t ulPoint ) const
+    {
+        if ( m_uSyncobjHandle )
+        {
+            const uint32_t uHandle = m_uSyncobjHandle;
+            return drmSyncobjTimelineSignal( GetDrmRenderFD(), &uHandle, &ulPoint, 1 ) == 0;
+        }
+
+        return m_pVkSemaphore && m_pVkSemaphore->Signal( ulPoint );
+    }
+
+    bool CTimeline::WaitPoint( uint64_t ulPoint ) const
+    {
+        uint32_t uHandle = m_uSyncobjHandle;
+        return drmSyncobjTimelineWait( GetDrmRenderFD(), &uHandle, &ulPoint, 1,
+            std::numeric_limits<int64_t>::max(), DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, nullptr ) == 0;
+    }
+
     // CTimelinePoint
 
     template <TimelinePointType Type>
@@ -78,9 +136,39 @@ namespace gamescope
     }
 
     template <TimelinePointType Type>
+    int32_t CTimelinePoint<Type>::CreateSyncFile()
+    {
+        if constexpr ( Type != TimelinePointType::Acquire )
+            return -1;
+
+        const int32_t nDrmFd = m_pTimeline->GetDrmRenderFD();
+        uint32_t uBinarySyncobj = 0;
+        if ( drmSyncobjCreate( nDrmFd, 0, &uBinarySyncobj ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjCreate failed" );
+            return -1;
+        }
+
+        int32_t nSyncFile = -1;
+        if ( drmSyncobjTransfer( nDrmFd, uBinarySyncobj, 0,
+                m_pTimeline->GetSyncobjHandle(), m_ulPoint, 0 ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjTransfer failed" );
+        }
+        else if ( drmSyncobjExportSyncFile( nDrmFd, uBinarySyncobj, &nSyncFile ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "drmSyncobjExportSyncFile failed" );
+            nSyncFile = -1;
+        }
+
+        drmSyncobjDestroy( nDrmFd, uBinarySyncobj );
+        return nSyncFile;
+    }
+
+    template <TimelinePointType Type>
     CTimelinePoint<Type>::~CTimelinePoint()
     {
-        if ( ShouldSignalOnDestruction() )
+        if constexpr ( Type == TimelinePointType::Release )
         {
             const uint32_t uHandle = m_pTimeline->GetSyncobjHandle();
 
@@ -157,6 +245,50 @@ namespace gamescope
 
             return { nExplicitSyncEventFd, false };
         }
+    }
+
+    template <TimelinePointType Type>
+    bool CTimelinePoint<Type>::IsMaterialized() const
+    {
+        if constexpr ( Type != TimelinePointType::Acquire )
+            return false;
+
+        uint32_t uHandle = m_pTimeline->GetSyncobjHandle();
+        uint64_t ulPoint = m_ulPoint;
+        return drmSyncobjTimelineWait( m_pTimeline->GetDrmRenderFD(), &uHandle, &ulPoint, 1, 0,
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, nullptr ) == 0;
+    }
+
+    template <TimelinePointType Type>
+    std::pair<int32_t, bool> CTimelinePoint<Type>::CreateAvailabilityEventFd()
+    {
+        if constexpr ( Type != TimelinePointType::Acquire )
+            return k_InvalidEvent;
+
+        if ( IsMaterialized() )
+            return k_AlreadySignalledEvent;
+
+        const int32_t nEventFd = eventfd( 0, EFD_CLOEXEC );
+        if ( nEventFd < 0 )
+        {
+            s_TimelineLog.errorf_errno( "Failed to create availability eventfd" );
+            return k_InvalidEvent;
+        }
+
+        drm_syncobj_eventfd event = {
+            .handle = m_pTimeline->GetSyncobjHandle(),
+            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+            .point = m_ulPoint,
+            .fd = nEventFd,
+        };
+        if ( drmIoctl( m_pTimeline->GetDrmRenderFD(), DRM_IOCTL_SYNCOBJ_EVENTFD, &event ) != 0 )
+        {
+            s_TimelineLog.errorf_errno( "DRM_IOCTL_SYNCOBJ_EVENTFD availability failed" );
+            close( nEventFd );
+            return k_InvalidEvent;
+        }
+
+        return { nEventFd, false };
     }
 
     template class CTimelinePoint<TimelinePointType::Acquire>;

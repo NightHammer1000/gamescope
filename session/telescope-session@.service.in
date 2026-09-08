@@ -1,0 +1,12 @@
+[Unit]
+Description=Telescope gamemode session (%i)
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+
+[Service]
+ExecStart=@sessiondir@/telescope-session %i
+KillMode=mixed
+# Make Steam's srt-logger write to the journal with its own prefixes
+Environment=SRT_LOG_TO_JOURNAL=1

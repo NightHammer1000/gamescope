@@ -7,6 +7,7 @@ layout(constant_id = 3) const int  c_blur_layer_count = 0;
 
 layout(constant_id = 4) const uint c_colorspaceMask = 0;
 layout(constant_id = 5) const uint c_output_eotf = 0;
+layout(constant_id = 6) const bool c_fsr_simple_output = false;
 layout(constant_id = 7) const bool c_itm_enable = false;
 
 const int colorspace_linear = 0;
@@ -44,10 +45,14 @@ uint get_layer_colorspace(uint layerIdx) {
     return bitfieldExtract(c_colorspaceMask, int(layerIdx) * colorspace_max_bits, colorspace_max_bits);
 }
 
-layout(binding = 1, rgba8) writeonly uniform image2D dst;
+#ifndef VKR_TARGET_FORMAT
+#define VKR_TARGET_FORMAT rgba8
+#endif
+
+layout(binding = 1, VKR_TARGET_FORMAT) writeonly uniform image2D dst;
 // alias
-layout(binding = 1, rgba8) writeonly uniform image2D dst_luma;
-layout(binding = 2, rgba8) writeonly uniform image2D dst_chroma;
+layout(binding = 1, VKR_TARGET_FORMAT) writeonly uniform image2D dst_luma;
+layout(binding = 2, VKR_TARGET_FORMAT) writeonly uniform image2D dst_chroma;
 
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 layout(binding = 4) uniform sampler2D s_ycbcr_samplers[VKR_SAMPLER_SLOTS];

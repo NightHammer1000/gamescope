@@ -85,6 +85,8 @@
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "vblankmanager.hpp"
+#include "frame_generation_config.hpp"
+#include "frame_generation_pacing.hpp"
 #include "log.hpp"
 #include "Utils/Defer.h"
 #include "win32_styles.h"
@@ -94,8 +96,8 @@
 #include "Script/Script.h"
 #include "refresh_rate.h"
 #include "commit.h"
-#include "reshade_effect_manager.hpp"
 #include "BufferMemo.h"
+#include "CommitBufferSync.h"
 #include "Utils/Process.h"
 #include "Utils/Algorithm.h"
 
@@ -115,6 +117,7 @@ static const int g_nBaseCursorScale = 36;
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <stb_image_resize.h>
@@ -128,16 +131,9 @@ LogScope g_WaitableLog("waitable");
 
 gamescope::ConVar<bool> cv_overlay_unmultiplied_alpha{ "overlay_unmultiplied_alpha", false };
 
-gamescope::ConVar<bool> cv_vr_show_forwarded_overlays{ "vr_show_forwarded_overlays", false };
-
-std::string *g_pVROverlayKey = nullptr;
 bool g_bWasPartialComposite = false;
 
 bool ShouldDrawCursor();
-
-std::atomic<uint32_t> g_unCurrentVRSceneAppId;
-std::atomic<uint64_t> g_FocusedVROverlayMouse;
-std::atomic<uint64_t> g_FocusedVROverlayKeyboard;
 
 ///
 // Color Mgmt
@@ -157,6 +153,8 @@ gamescope_color_mgmt_luts g_ScreenshotColorMgmtLutsHDR[ EOTF_Count ];
 static lut1d_t g_tmpLut1d;
 static lut3d_t g_tmpLut3d;
 
+extern bool disableInternalPq;
+
 extern int g_nDynamicRefreshHz;
 
 bool g_bForceHDRSupportDebug = false;
@@ -171,12 +169,11 @@ static std::shared_ptr<gamescope::BackendBlob> s_scRGB709To2020Matrix;
 std::string clipboard;
 std::string primarySelection;
 
-std::string g_reshade_effect{};
-extern ReshadeEffectPipeline *g_pLastReshadeEffect;
-uint32_t g_reshade_technique_idx = 0;
 
 bool g_bSteamIsActiveWindow = false;
 bool g_bForceInternal = false;
+bool g_bDPMS = false;
+bool g_bDPMS_set = false;
 
 namespace gamescope
 {
@@ -894,6 +891,7 @@ uint32_t		currentOutputWidth, currentOutputHeight;
 int 			currentOutputRefresh;
 uint32_t		currentOutputRotation = 0;
 bool			currentHDROutput = false;
+bool			currentHDRSupport = false;
 bool			currentHDRForce = false;
 
 std::vector< uint32_t > vecFocuscontrolAppIDs;
@@ -916,8 +914,6 @@ uint32_t		lastPublishedInputCounter;
 
 std::atomic<bool> hasRepaint = false;
 bool			hasRepaintNonBasePlane = false;
-
-bool			g_bUpdateForwardedVROverlays = false;
 
 static gamescope::ConCommand cc_debug_force_repaint( "debug_force_repaint", "Force a repaint",
 []( std::span<std::string_view> args )
@@ -1063,16 +1059,37 @@ window_is_steam( steamcompmgr_win_t *w )
 }
 
 static bool
-window_is_vr_scene_app( steamcompmgr_win_t *w )
+steamcompmgr_window_allows_frame_generation( steamcompmgr_win_t *w )
 {
-	return w && w->appID && w->appID == g_unCurrentVRSceneAppId.load( std::memory_order_relaxed );
+	return w && !window_is_steam( w ) && !w->isSteamStreamingClient;
+}
+
+static bool
+steamcompmgr_window_is_active_frame_generation_overlay( steamcompmgr_win_t *w )
+{
+	const global_focus_t *focus = GetCurrentFocus();
+	if ( !w || !focus || !gamescope::GetFrameGenerationConfig().enabled ||
+		 !steamcompmgr_window_allows_frame_generation( focus->focusWindow ) ||
+		 focus->inputFocusWindow != w || focus->focusWindow == w )
+		return false;
+
+	return
+		( focus->overlayWindow == w && w->opacity ) ||
+		( focus->externalOverlayWindow == w && w->opacity );
+}
+
+bool steamcompmgr_frame_generation_enabled_for_focus()
+{
+	const global_focus_t *focus = GetCurrentFocus();
+	return gamescope::GetFrameGenerationConfig().enabled && focus &&
+		steamcompmgr_window_allows_frame_generation( focus->focusWindow );
 }
 
 bool g_bChangeDynamicRefreshBasedOnGameOpenRatherThanActive = false;
 
 bool steamcompmgr_window_should_limit_fps( steamcompmgr_win_t *w )
 {
-	return w && !window_is_steam( w ) && !window_is_vr_scene_app( w ) && !w->isOverlay && !w->isExternalOverlay;
+	return w && !window_is_steam( w ) && !w->isOverlay && !w->isExternalOverlay;
 }
 
 static bool
@@ -1150,7 +1167,7 @@ static bool		drawDebugInfo = false;
 static bool		debugEvents = false;
 extern bool		steamMode;
 
-gamescope::ConVar<bool> cv_composite_force{ "composite_force", false, "Force composition always, never use scanout" };
+gamescope::ConVar<bool> cv_composite_force{ "composite_force", true, "Force composition always, never use direct client scanout" };
 static bool		useXRes = true;
 
 namespace gamescope
@@ -1396,6 +1413,7 @@ import_commit (
 	steamcompmgr_win_t *w,
 	struct wlr_surface *surf,
 	struct wlr_buffer *buf,
+	std::shared_ptr<gamescope::CCommitBufferSync> bufferSync,
 	bool async,
 	std::shared_ptr<wlserver_vk_swapchain_feedback> swapchain_feedback,
 	std::vector<struct wl_resource*> presentation_feedbacks,
@@ -1408,6 +1426,7 @@ import_commit (
 	commit->win_seq = w->seq;
 	commit->surf = surf;
 	commit->buf = buf;
+	commit->bufferSync = std::move( bufferSync );
 	commit->async = async;
 	commit->fifo = fifo;
 	commit->is_steam = window_is_steam( w );
@@ -1417,21 +1436,26 @@ import_commit (
 		commit->feedback = *swapchain_feedback;
 	commit->present_id = present_id;
 	commit->desired_present_time = desired_present_time;
-	if (window_is_vr_scene_app( w )) {
-		commit->async = true;
-		commit->fifo = false;
-	}
-
-	if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
-	{
-		// Going from OwningRc -> Rc now.
-		commit->vulkanTex = pTexture;
-		return commit;
-	}
-
 	struct wlr_dmabuf_attributes dmabuf = {0};
+	const bool bDmabuf = wlr_buffer_get_dmabuf( buf, &dmabuf );
+
+	// DMA-BUF textures refer to the client's live backing storage, so they can
+	// be reused for every commit of the same wlr_buffer. Data-pointer buffers
+	// are copied into a Vulkan image below; clients can refill and recommit the
+	// same buffer after release, so reusing that snapshot would show stale
+	// contents as the client cycles through its buffer pool.
+	if ( bDmabuf )
+	{
+		if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
+		{
+			// Going from OwningRc -> Rc now.
+			commit->vulkanTex = pTexture;
+			return commit;
+		}
+	}
+
 	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
-	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
+	if ( bDmabuf )
 	{
 		pBackendFb = GetBackend()->ImportDmabufToBackend( &dmabuf );
 	}
@@ -1445,7 +1469,8 @@ import_commit (
 
 	commit->vulkanTex = pOwnedTexture;
 
-	s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
+	if ( bDmabuf )
+		s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
 
 	return commit;
 }
@@ -2059,6 +2084,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 	if (layer->colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB)
 		layer->ctm = s_scRGB709To2020Matrix;
 	layer->tex = commit->vulkanTex;
+	layer->bufferSync = commit->bufferSync;
 
 	layer->filter = base.filter;
 	layer->eAlphaBlendingMode = base.eAlphaBlendingMode;
@@ -2129,6 +2155,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	layer->filter = ( flags & PaintWindowFlag::NoFilter ) ? GamescopeUpscaleFilter::LINEAR : g_upscaleFilter;
 
 	layer->tex = lastCommit->GetTexture( layer->filter, g_upscaleScaler, layer->colorspace );
+	layer->bufferSync = lastCommit->bufferSync;
 
 	if ( flags & PaintWindowFlag::NoScale )
 	{
@@ -2524,35 +2551,6 @@ bool ShouldDrawCursor()
 	return pFocus->GetNestedHints()->ShouldPaintCursor();
 }
 
-static void ForwardVROverlayTargets()
-{
-	gamescope_xwayland_server_t *server = NULL;
-	for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-	{
-		for ( steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next )
-		{
-			if ( w->oulTargetVROverlay && w->bNeedsForwarding )
-			{
-				gamescope::Rc<commit_t> lastCommit;
-				get_window_last_done_commit( w, lastCommit );
-				if ( !lastCommit )
-					continue;
-
-                gamescope::IBackendFb* pFb = lastCommit->vulkanTex->GetBackendFb();
-				if ( !pFb )
-					continue;
-
-				const uint64_t ulOverlayHandle = *w->oulTargetVROverlay;
-				GetBackend()->ForwardFramebuffer( w->pForwarderPlane, pFb, &ulOverlayHandle );
-
-				w->bNeedsForwarding = false;
-			}
-		}
-	}
-
-	gpuvis_trace_printf( "Forward VR Overlays" );
-}
-
 gamescope::ConVar<bool> cv_paint_primary_plane{ "paint_primary_plane", true };
 gamescope::ConVar<bool> cv_paint_override_redirect_plane{ "paint_override_redirect_plane", true };
 gamescope::ConVar<bool> cv_paint_steam_overlay_plane{ "paint_steam_overlay_plane", true };
@@ -2561,7 +2559,7 @@ gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
 gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
 
 static void
-paint_all( global_focus_t *pFocus, bool async )
+paint_all( global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPrepareOnly = false )
 {
 	if ( !pFocus )
 		return;
@@ -2596,13 +2594,58 @@ paint_all( global_focus_t *pFocus, bool async )
 	override = pFocus->overrideWindow;
 	input = pFocus->inputFocusWindow;
 
-	if (++frameCounter == 300)
+	if ( !frameGenerationPrepareOnly && ++frameCounter == 300 )
 	{
 		currentFrameRate = 300 * 1000.0f / (currentTime - lastSampledFrameTime);
 		lastSampledFrameTime = currentTime;
 		frameCounter = 0;
 
 		stats_printf( "fps=%f\n", currentFrameRate );
+		FrameGenerationTelemetry frameGenerationTelemetry = vulkan_frame_generation_get_telemetry();
+		const uint32_t frameGenerationOutputHz = g_nSteamCompMgrTargetFPS > 0
+			? uint32_t( g_nSteamCompMgrTargetFPS )
+			: uint32_t( gamescope::ConvertmHzToHz( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh ) );
+		frameGenerationTelemetry.outputCadenceHz = frameGenerationOutputHz;
+		frameGenerationTelemetry.sourceCadenceHz = frameGenerationOutputHz / 2u;
+		stats_printf( "framegen_of_prepare_pyramid_gpu_ms=%f\n", frameGenerationTelemetry.gpu.preparationAndPyramidMilliseconds );
+		stats_printf( "framegen_of_search_filter_gpu_ms=%f\n", frameGenerationTelemetry.gpu.searchAndFilterMilliseconds );
+		stats_printf( "framegen_fi_vector_gpu_ms=%f\n", frameGenerationTelemetry.gpu.vectorFieldMilliseconds );
+		stats_printf( "framegen_fi_interpolation_gpu_ms=%f\n", frameGenerationTelemetry.gpu.interpolationAndInpaintingMilliseconds );
+		stats_printf( "framegen_generated_fsr_gpu_ms=%f\n", frameGenerationTelemetry.gpu.generatedFsrMilliseconds );
+		stats_printf( "framegen_total_gpu_ms=%f\n", frameGenerationTelemetry.gpu.totalMilliseconds );
+		stats_printf( "framegen_prepare_luma_gpu_ms=%f\n", frameGenerationTelemetry.gpu.prepareLumaMilliseconds );
+		stats_printf( "framegen_luma_pyramid_gpu_ms=%f\n", frameGenerationTelemetry.gpu.luminancePyramidMilliseconds );
+		stats_printf( "framegen_scene_change_gpu_ms=%f\n", frameGenerationTelemetry.gpu.sceneChangeMilliseconds );
+		stats_printf( "framegen_of_search_gpu_ms=%f\n", frameGenerationTelemetry.gpu.opticalFlowSearchMilliseconds );
+		stats_printf( "framegen_of_filter_gpu_ms=%f\n", frameGenerationTelemetry.gpu.opticalFlowFilterMilliseconds );
+		stats_printf( "framegen_of_scale_gpu_ms=%f\n", frameGenerationTelemetry.gpu.opticalFlowScaleMilliseconds );
+		stats_printf( "framegen_gui_mask_gpu_ms=%f\n", frameGenerationTelemetry.gpu.guiMaskMilliseconds );
+		stats_printf( "framegen_midpoint_gpu_ms=%f\n", frameGenerationTelemetry.gpu.midpointMilliseconds );
+		stats_printf( "framegen_inpainting_pyramid_gpu_ms=%f\n", frameGenerationTelemetry.gpu.inpaintingPyramidMilliseconds );
+		stats_printf( "framegen_inpainting_gpu_ms=%f\n", frameGenerationTelemetry.gpu.inpaintingMilliseconds );
+		stats_printf( "framegen_output_composite_gpu_ms=%f\n", frameGenerationTelemetry.gpu.outputCompositeMilliseconds );
+		stats_printf( "framegen_source_frames=%" PRIu64 "\n", frameGenerationTelemetry.sourceFrames );
+		stats_printf( "framegen_source_callbacks=%" PRIu64 "\n", frameGenerationTelemetry.sourceCallbacks );
+		stats_printf( "framegen_source_callbacks_blocked=%" PRIu64 "\n", frameGenerationTelemetry.sourceCallbacksBlocked );
+		stats_printf( "framegen_output_slots=%" PRIu64 "\n", frameGenerationTelemetry.outputSlots );
+		stats_printf( "framegen_output_slots_without_pending=%" PRIu64 "\n", frameGenerationTelemetry.outputSlotsWithoutPending );
+		stats_printf( "framegen_queue_underruns=%" PRIu64 "\n", frameGenerationTelemetry.queueUnderruns );
+		stats_printf( "framegen_repeated_real=%" PRIu64 "\n", frameGenerationTelemetry.repeatedRealFrames );
+		stats_printf( "framegen_generated=%" PRIu64 "\n", frameGenerationTelemetry.generatedFrames );
+		stats_printf( "framegen_presented=%" PRIu64 "\n", frameGenerationTelemetry.presentedGeneratedFrames );
+		stats_printf( "framegen_presented_real=%" PRIu64 "\n", frameGenerationTelemetry.presentedRealFrames );
+		stats_printf( "framegen_deadline_dropped=%" PRIu64 "\n", frameGenerationTelemetry.deadlineDroppedFrames );
+		stats_printf( "framegen_scene_cut_copies=%" PRIu64 "\n", frameGenerationTelemetry.sceneCutCopies );
+		stats_printf( "framegen_source_interval_ms=%f\n", frameGenerationTelemetry.sourceFrameIntervalMilliseconds );
+		stats_printf( "framegen_queue_depth=%u\n", frameGenerationTelemetry.queuedFrames );
+		stats_printf( "framegen_flow_scale_percent=%u\n", frameGenerationTelemetry.flowScalePercent );
+		stats_printf( "framegen_source_cadence_hz=%u\n", frameGenerationTelemetry.sourceCadenceHz );
+		stats_printf( "framegen_output_cadence_hz=%u\n", frameGenerationTelemetry.outputCadenceHz );
+		gpuvis_trace_printf( "framegen total %.3fms of %.3fms fi %.3fms fsr %.3fms",
+			frameGenerationTelemetry.gpu.totalMilliseconds,
+			frameGenerationTelemetry.gpu.preparationAndPyramidMilliseconds + frameGenerationTelemetry.gpu.searchAndFilterMilliseconds,
+			frameGenerationTelemetry.gpu.vectorFieldMilliseconds + frameGenerationTelemetry.gpu.interpolationAndInpaintingMilliseconds,
+			frameGenerationTelemetry.gpu.generatedFsrMilliseconds );
 
 		if ( window_is_steam( w ) )
 		{
@@ -2619,6 +2662,7 @@ paint_all( global_focus_t *pFocus, bool async )
 	frameInfo.outputEncodingEOTF = g_ColorMgmt.pending.outputEncodingEOTF;
 	frameInfo.allowVRR = cv_adaptive_sync;
 	frameInfo.bFadingOut = fadingOut;
+	frameInfo.dpms = dpms;
 
 	// If the window we'd paint as the base layer is the streaming client,
 	// find the video underlay and put it up first in the scenegraph
@@ -2688,6 +2732,10 @@ paint_all( global_focus_t *pFocus, bool async )
 					bool needsScaling = frameInfo.layers.get( 0 ).scale.x < 0.999f && frameInfo.layers.get( 0 ).scale.y < 0.999f;
 					frameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR && needsScaling;
 					frameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS && needsScaling;
+					frameInfo.useSGSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::SGSR && needsScaling;
+					frameInfo.useBCASLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::BCAS && needsScaling;
+					frameInfo.useXBRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::XBR && needsScaling;
+					frameInfo.useAnime4KLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::ANIME4K && needsScaling;
 				}
 				if ( pFocus == GetCurrentFocus() )
 					update_touch_scaling( &frameInfo );
@@ -2864,12 +2912,48 @@ paint_all( global_focus_t *pFocus, bool async )
 
 		frameInfo.useFSRLayer0 = false;
 		frameInfo.useNISLayer0 = false;
+		frameInfo.useSGSRLayer0 = false;
+		frameInfo.useBCASLayer0 = false;
+		frameInfo.useXBRLayer0 = false;
+		frameInfo.useAnime4KLayer0 = false;
 	}
 
+	// Capture FSR activity before frame generation replaces the raw base layer
+	// with its queued midpoint/real scanout buffers. Those buffers have already
+	// had FSR applied and therefore no longer carry useFSRLayer0 themselves.
 	g_bFSRActive = frameInfo.useFSRLayer0;
 	if ( const auto& heldCommit = g_HeldCommits[HELD_COMMIT_BASE]; heldCommit && heldCommit->upscaledTexture ) {
 		g_bFSRActive = ( heldCommit->upscaledTexture->eFilter == GamescopeUpscaleFilter::FSR );
 	}
+
+	// Screenshots of the composition should use the real application layer, not
+	// a queued frame-generation scanout.  Apart from being the expected image to
+	// archive, this keeps screenshot command buffers from retaining framegen's
+	// scanout pool across focus changes (for example when opening Steam).
+	std::optional<FrameInfo_t> frameInfoWithoutFrameGeneration;
+	if ( gamescope::CScreenshotManager::Get().HasPendingScreenshot() )
+		frameInfoWithoutFrameGeneration = frameInfo;
+
+	const gamescope::FrameGenerationConfig frameGeneration = gamescope::GetFrameGenerationConfig();
+	const bool frameGenerationEligible = frameGeneration.enabled &&
+		steamcompmgr_window_allows_frame_generation( w ) &&
+		!fadingOut && frameInfo.layers.count() > 0 &&
+		g_HeldCommits[HELD_COMMIT_BASE] &&
+		g_HeldCommits[HELD_COMMIT_BASE]->commitID == g_uCurrentBasePlaneCommitID;
+	if ( frameGenerationEligible )
+	{
+		vulkan_frame_generation_apply( &frameInfo,
+			g_HeldCommits[HELD_COMMIT_BASE]->vulkanTex,
+			g_uCurrentBasePlaneCommitID, g_uCurrentBasePlaneAppID,
+			frameGenerationPrepareOnly );
+	}
+	else if ( frameGeneration.enabled )
+	{
+		vulkan_frame_generation_reset();
+		gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedFormat );
+	}
+	if ( frameGenerationPrepareOnly )
+		return;
 
 	g_bFirstFrame = false;
 
@@ -2942,11 +3026,17 @@ paint_all( global_focus_t *pFocus, bool async )
 		return;
 	}
 
-	std::optional<gamescope::GamescopeScreenshotInfo> oScreenshotInfo =
-		gamescope::CScreenshotManager::Get().ProcessPendingScreenshot();
+	std::optional<gamescope::GamescopeScreenshotInfo> oScreenshotInfo;
+	if ( frameInfoWithoutFrameGeneration )
+		oScreenshotInfo = gamescope::CScreenshotManager::Get().ProcessPendingScreenshot();
 
 	if ( oScreenshotInfo )
 	{
+		FrameInfo_t screenshotFrameInfo =
+			oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER
+				? frameInfo
+				: *frameInfoWithoutFrameGeneration;
+
 		std::filesystem::path path = std::filesystem::path{ oScreenshotInfo->szScreenshotPath };
 
 		uint32_t drmCaptureFormat = DRM_FORMAT_INVALID;
@@ -2985,8 +3075,8 @@ paint_all( global_focus_t *pFocus, bool async )
 		if ( pScreenshotTexture )
 		{
 			bool bHDRScreenshot = path.extension() == ".avif" &&
-								  frameInfo.layers.count() > 0 &&
-								  ColorspaceIsHDR( frameInfo.layers.get( 0 ).colorspace ) &&
+								  screenshotFrameInfo.layers.count() > 0 &&
+								  ColorspaceIsHDR( screenshotFrameInfo.layers.get( 0 ).colorspace ) &&
 								  oScreenshotInfo->eScreenshotType != GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER;
 
 			if ( drmCaptureFormat == DRM_FORMAT_NV12 || oScreenshotInfo->eScreenshotType != GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
@@ -2995,18 +3085,18 @@ paint_all( global_focus_t *pFocus, bool async )
 				for ( uint32_t nInputEOTF = 0; nInputEOTF < EOTF_Count; nInputEOTF++ )
 				{
 					auto& luts = bHDRScreenshot ? g_ScreenshotColorMgmtLutsHDR : g_ScreenshotColorMgmtLuts;
-					frameInfo.lut3D[nInputEOTF] = luts[nInputEOTF].vk_lut3d;
-					frameInfo.shaperLut[nInputEOTF] = luts[nInputEOTF].vk_lut1d;
+					screenshotFrameInfo.lut3D[nInputEOTF] = luts[nInputEOTF].vk_lut3d;
+					screenshotFrameInfo.shaperLut[nInputEOTF] = luts[nInputEOTF].vk_lut1d;
 				}
 
 				if ( oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_BASE_PLANE_ONLY )
 				{
 					// Remove everything but base planes from the screenshot.
-					for (int i = 0; i < frameInfo.layers.count(); i++)
+					for (int i = 0; i < screenshotFrameInfo.layers.count(); i++)
 					{
-						if (frameInfo.layers.get( i ).zpos >= (int)g_zposExternalOverlay)
+						if (screenshotFrameInfo.layers.get( i ).zpos >= (int)g_zposExternalOverlay)
 						{
-							frameInfo.layers.truncate( i );
+							screenshotFrameInfo.layers.truncate( i );
 							break;
 						}
 					}
@@ -3016,11 +3106,11 @@ paint_all( global_focus_t *pFocus, bool async )
 					if ( is_mura_correction_enabled() )
 					{
 						// Remove the last layer which is for mura...
-						for (int i = 0; i < frameInfo.layers.count(); i++)
+						for (int i = 0; i < screenshotFrameInfo.layers.count(); i++)
 						{
-							if (frameInfo.layers.get( i ).zpos >= (int)g_zposMuraCorrection)
+							if (screenshotFrameInfo.layers.get( i ).zpos >= (int)g_zposMuraCorrection)
 							{
-								frameInfo.layers.truncate( i );
+								screenshotFrameInfo.layers.truncate( i );
 								break;
 							}
 						}
@@ -3028,10 +3118,10 @@ paint_all( global_focus_t *pFocus, bool async )
 				}
 
 				// Re-enable output color management (blending) if it was disabled by mura.
-				frameInfo.applyOutputColorMgmt = true;
+				screenshotFrameInfo.applyOutputColorMgmt = true;
 			}
 
-			frameInfo.outputEncodingEOTF = bHDRScreenshot ? EOTF_PQ : EOTF_Gamma22;
+			screenshotFrameInfo.outputEncodingEOTF = bHDRScreenshot ? EOTF_PQ : EOTF_Gamma22;
 
 			uint32_t uCompositeDebugBackup = g_uCompositeDebug;
 
@@ -3042,10 +3132,10 @@ paint_all( global_focus_t *pFocus, bool async )
 
 			std::optional<uint64_t> oScreenshotSeq;
 			if ( drmCaptureFormat == DRM_FORMAT_NV12 )
-				oScreenshotSeq = vulkan_composite( &frameInfo, pScreenshotTexture, false, pRGBTexture );
+				oScreenshotSeq = vulkan_composite( &screenshotFrameInfo, pScreenshotTexture, false, pRGBTexture );
 			else if ( oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_FULL_COMPOSITION ||
 					  oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
-				oScreenshotSeq = vulkan_composite( &frameInfo, nullptr, false, pScreenshotTexture );
+				oScreenshotSeq = vulkan_composite( &screenshotFrameInfo, nullptr, false, pScreenshotTexture );
 			else if ( bRenderSizeScreenshot )
 			{
 				FrameInfo_t screenshotFrameInfo{};
@@ -3084,7 +3174,7 @@ paint_all( global_focus_t *pFocus, bool async )
 				currentOutputHeight = uBackupHeight;
 			}
 			else
-				oScreenshotSeq = vulkan_screenshot( &frameInfo, pScreenshotTexture, nullptr );
+				oScreenshotSeq = vulkan_screenshot( &screenshotFrameInfo, pScreenshotTexture, nullptr );
 
 			if ( oScreenshotInfo->eScreenshotType != GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
 			{
@@ -3963,12 +4053,6 @@ found:;
 			continue;
 		}
 
-		// Skip overlay targets
-		if ( w->oulTargetVROverlay && !cv_vr_show_forwarded_overlays )
-		{
-			continue;
-		}
-
 		// Skip streaming client video window
 		if ( w->isSteamStreamingClientVideo )
 		{
@@ -4117,40 +4201,6 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 			{
 				inputFocus = mouse_focus.overrideWindow ? mouse_focus.overrideWindow : mouse_focus.focusWindow;
 				ctx->focus.overrideWindowMouse = mouse_focus.overrideWindow;
-			}
-		}
-
-		uint64_t ulFocusedKeyboardOverlayVR = g_FocusedVROverlayKeyboard;
-		uint64_t ulFocusedMouseOverlayVR = g_FocusedVROverlayMouse;
-
-		if ( ulFocusedKeyboardOverlayVR || ulFocusedMouseOverlayVR )
-		{
-			for ( steamcompmgr_win_t *queryWindow = ctx->list; queryWindow; queryWindow = queryWindow->xwayland().next )
-			{
-				if ( queryWindow->oulTargetVROverlay && *queryWindow->oulTargetVROverlay == ulFocusedKeyboardOverlayVR )
-				{
-					focus_log.debugf( "[XWL] Overriding keyboard focus window with VR forwarder overlay! Overlay: 0x%lx XWindow: 0x%x Title: %s", ulFocusedKeyboardOverlayVR, queryWindow->id(), queryWindow->debug_name() );
-
-					keyboardFocusWin = queryWindow;
-					ctx->focus.focusWindow = queryWindow;
-
-					// No support for overrides with this VR path!
-					ctx->focus.overrideWindow = nullptr;
-					ctx->focus.overrideWindowMouse = nullptr;
-				}
-
-				if ( queryWindow->oulTargetVROverlay && *queryWindow->oulTargetVROverlay == ulFocusedMouseOverlayVR )
-				{
-					// We don't want to do any mouse input for target VR overlays right now.
-					// SteamWebHelper is handling this.
-
-					if ( !inputFocus )
-						inputFocus = queryWindow;
-
-					// No support for overrides with this VR path!
-					ctx->focus.overrideWindow = nullptr;
-					ctx->focus.overrideWindowMouse = nullptr;
-				}
 			}
 		}
 	}
@@ -4563,43 +4613,6 @@ determine_and_apply_focus( global_focus_t *pFocus )
 		pFocus->keyboardFocusWindow = pFocus->overrideWindow ? pFocus->overrideWindow : pFocus->focusWindow;
 	}
 
-	if ( !gamescope::VirtualConnectorIsSingleOutput() )
-	{
-		uint64_t ulFocusedKeyboardOverlayVR = g_FocusedVROverlayKeyboard;
-		uint64_t ulFocusedMouseOverlayVR = g_FocusedVROverlayMouse;
-
-		focus_log.debugf( "Current focus VR overlays: keyboard 0x%lx | mouse 0x%lx", ulFocusedKeyboardOverlayVR, ulFocusedMouseOverlayVR );
-
-		if ( ulFocusedKeyboardOverlayVR || ulFocusedMouseOverlayVR )
-		{
-			for ( steamcompmgr_win_t *queryWindow = root_ctx->list; queryWindow; queryWindow = queryWindow->xwayland().next )
-			{
-				if ( queryWindow->oulTargetVROverlay && *queryWindow->oulTargetVROverlay == ulFocusedKeyboardOverlayVR )
-				{
-					focus_log.debugf( "[WL GLOBAL] Overriding keyboard focus window with VR forwarder overlay! Overlay: 0x%lx XWindow: 0x%x Title: %s", ulFocusedKeyboardOverlayVR, queryWindow->id(), queryWindow->debug_name() );
-					pFocus->keyboardFocusWindow = queryWindow;
-
-					pFocus->overrideWindow = nullptr;
-					pFocus->overrideUnderlayWindow = nullptr;
-					pFocus->decorationWindows.clear();
-				}
-
-				if ( queryWindow->oulTargetVROverlay && *queryWindow->oulTargetVROverlay == ulFocusedMouseOverlayVR )
-				{
-					// We don't want to do any mouse input for target VR overlays right now.
-					// SteamWebHelper is handling this.
-
-					//pFocus->inputFocusWindow = queryWindow;
-
-					pFocus->overrideWindow = nullptr;
-					pFocus->overrideUnderlayWindow = nullptr;
-					pFocus->decorationWindows.clear();
-				}
-			}
-		}
-	}
-
-	// After the VR forwarder has had its say, since it clears both.
 	if ( pFocus->decorationWindows != previousLocalFocus.decorationWindows ||
 		 pFocus->overrideUnderlayWindow != previousLocalFocus.overrideUnderlayWindow )
 		hasRepaintNonBasePlane = true;
@@ -5074,7 +5087,7 @@ handle_desktop_window(steamcompmgr_win_t *w)
 	if ( w->type != steamcompmgr_win_type_t::XWAYLAND )
 		return;
 
-	if ( w->xwayland().a.override_redirect || ( w->oulTargetVROverlay && !cv_vr_show_forwarded_overlays ) )
+	if ( w->xwayland().a.override_redirect )
 		return;
 
 	if ( win_maybe_a_dropdown( w ) || win_is_useless( w ) )
@@ -5162,14 +5175,6 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
 	// Fixes mangoapp usage when nested, and not in SteamOS.
 	if ( w->isExternalOverlay )
 		w->appID = 0;
-
-	w->oulTargetVROverlay = get_u64_prop(ctx, w->xwayland().id, ctx->atoms.steamGamescopeVROverlayTarget);
-	if ( w->oulTargetVROverlay )
-	{
-		g_bUpdateForwardedVROverlays = true;
-		w->bNeedsForwarding = true;
-	}
-	w->pForwarderPlane = nullptr;
 
 	get_size_hints(ctx, w);
 
@@ -5759,8 +5764,7 @@ damage_win(xwayland_ctx_t *ctx, XDamageNotifyEvent *de)
 
 	bool bCareAboutWindow = true;
 
-	if ( win_is_useless( w ) || w->IsAnyOverlay() ||
-	    ( w->oulTargetVROverlay && !cv_vr_show_forwarded_overlays ) || w->isSysTrayIcon ||
+	if ( win_is_useless( w ) || w->IsAnyOverlay() || w->isSysTrayIcon ||
 		w->xwayland().a.map_state != IsViewable )
 	{
 		bCareAboutWindow = false;
@@ -5987,17 +5991,6 @@ void gamescope_set_selection(std::string contents, GamescopeSelection eSelection
 	}
 }
 
-void gamescope_set_reshade_effect(std::string effect_path)
-{
-	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server(0);
-	set_string_prop(server->ctx.get(), server->ctx->atoms.gamescopeReshadeEffect, effect_path);
-}
-
-void gamescope_clear_reshade_effect() {
-	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server(0);
-	clear_prop(server->ctx.get(), server->ctx->atoms.gamescopeReshadeEffect);
-}
-
 static void
 handle_selection_request(xwayland_ctx_t *ctx, XSelectionRequestEvent *ev)
 {
@@ -6173,18 +6166,76 @@ steamcompmgr_flush_frame_done( steamcompmgr_win_t *w )
 
 static std::optional<uint64_t> s_oLowestFPSLimitScheduleVRR;
 
-static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vblank_idx, steamcompmgr_win_t *w = nullptr, uint64_t now = 0 )
+static bool steamcompmgr_can_latch_frame_generation_between_vblanks()
+{
+	return steamcompmgr_frame_generation_enabled_for_focus();
+}
+
+static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vblank_idx,
+	steamcompmgr_win_t *w = nullptr, uint64_t now = 0, bool frameCallback = false )
 {
 	bool bSendCallback = true;
 
 	int nRefreshHz = gamescope::ConvertmHzToHz( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
-	int nTargetFPS = g_nSteamCompMgrTargetFPS;
+	int nTargetFPS = g_nSteamCompMgrTargetFPS
+		? std::min( g_nSteamCompMgrTargetFPS, nRefreshHz ) : nRefreshHz;
+	const global_focus_t *currentFocus = GetCurrentFocus();
+	const bool frameGenerationActive = gamescope::GetFrameGenerationConfig().enabled &&
+		steamcompmgr_window_allows_frame_generation( w ) &&
+		currentFocus && w == currentFocus->focusWindow;
+	const bool frameGenerationOverlayActive =
+		steamcompmgr_window_is_active_frame_generation_overlay( w );
+	const bool shouldLimit = frameGenerationActive ||
+		frameGenerationOverlayActive ||
+		( g_nSteamCompMgrTargetFPS && bShouldLimitFPS );
+
+	if ( frameGenerationActive && w )
+	{
+		const bool blocked = frameCallback
+			? !vulkan_frame_generation_can_request_source_frame()
+			: !vulkan_frame_generation_can_accept_source_frame();
+		if ( blocked )
+		{
+			if ( frameCallback )
+				vulkan_frame_generation_note_source_callback( true );
+			return false;
+		}
+		// Source callbacks own the 60 Hz cadence. Once the midpoint drains and
+		// only its following real frame remains, latch the next source immediately
+		// so generation gets the complete interval before its output slot.
+		if ( !frameCallback )
+			return true;
+		const uint64_t schedule = w->last_commit_first_latch_time +
+			g_SteamCompMgrLimitedAppRefreshCycle;
+		static constexpr uint64_t kFrameGenerationScheduleFudge = 200'000;
+		if ( now + kFrameGenerationScheduleFudge < schedule )
+		{
+			if ( frameCallback )
+			{
+				if ( !s_oLowestFPSLimitScheduleVRR )
+					s_oLowestFPSLimitScheduleVRR = schedule;
+				else
+					s_oLowestFPSLimitScheduleVRR = std::min(
+						*s_oLowestFPSLimitScheduleVRR, schedule );
+			}
+			return false;
+		}
+		if ( frameCallback )
+			vulkan_frame_generation_note_source_callback( false );
+		return true;
+	}
+	if ( frameGenerationOverlayActive )
+	{
+		return gamescope::FrameGenerationSourceSlotDue(
+			vblank_idx, uint64_t( nTargetFPS ), uint64_t( nRefreshHz ) );
+	}
 
 	if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
 	{
-		bool bCloseEnough = std::abs( g_nSteamCompMgrTargetFPS - nRefreshHz ) < 2;
+		bool bCloseEnough = !frameGenerationActive &&
+			std::abs( g_nSteamCompMgrTargetFPS - nRefreshHz ) < 2;
 
-		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && w && !bCloseEnough )
+		if ( shouldLimit && w && !bCloseEnough )
 		{
 			uint64_t schedule = w->last_commit_first_latch_time + g_SteamCompMgrLimitedAppRefreshCycle;
 
@@ -6202,27 +6253,31 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 	}
 	else
 	{
-		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
+		if ( shouldLimit && ( frameGenerationActive || nRefreshHz > nTargetFPS ) )
 		{
-			int nVblankDivisor = nRefreshHz / nTargetFPS;
-
-			if ( vblank_idx % nVblankDivisor != 0 )
-				bSendCallback = false;
+			if ( frameGenerationActive )
+			{
+				bSendCallback = gamescope::FrameGenerationSourceSlotDue(
+					vblank_idx, uint64_t( nTargetFPS ), uint64_t( nRefreshHz ) );
+			}
+			else
+			{
+				int nVblankDivisor = nRefreshHz / nTargetFPS;
+				if ( vblank_idx % nVblankDivisor != 0 )
+					bSendCallback = false;
+			}
 		}
 	}
 
 	return bSendCallback;
 }
 
-static bool steamcompmgr_should_vblank_window( steamcompmgr_win_t *w, uint64_t vblank_idx, uint64_t now )
-{
-	return steamcompmgr_should_vblank_window( steamcompmgr_window_should_limit_fps( w ), vblank_idx, w, now );
-}
 
 static void
 steamcompmgr_latch_frame_done( steamcompmgr_win_t *w, uint64_t vblank_idx, uint64_t now )
 {
-	if ( steamcompmgr_should_vblank_window( w, vblank_idx, now ) )
+	if ( steamcompmgr_should_vblank_window(
+			steamcompmgr_window_should_limit_fps( w ), vblank_idx, w, now, true ) )
 	{
 		w->unlockedForFrameCallback = true;
 	}
@@ -6327,19 +6382,6 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		{
 			w->isSteamStreamingClientVideo = get_prop(ctx, w->xwayland().id, ctx->atoms.steamStreamingClientVideoAtom, 0);
 			MakeFocusDirty();
-		}
-	}
-	if (ev->atom == ctx->atoms.steamGamescopeVROverlayTarget)
-	{
-		steamcompmgr_win_t * w = find_win(ctx, ev->window);
-		if (w)
-		{
-			w->oulTargetVROverlay = get_u64_prop(ctx, w->xwayland().id, ctx->atoms.steamGamescopeVROverlayTarget);
-			w->pForwarderPlane = nullptr;
-			MakeFocusDirty();
-			hasRepaint = true;
-			g_bUpdateForwardedVROverlays = true;
-			w->bNeedsForwarding = true;
 		}
 	}
 	if (ev->atom == ctx->atoms.gamescopeCtrlAppIDAtom )
@@ -6570,14 +6612,43 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
 			g_wantedUpscaleFilter = GamescopeUpscaleFilter::NIS;
 			break;
+		// Telescope extension values; Steam's UI only sends 0-4.
+		case 5:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::SGSR;
+			break;
+		case 6:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::BCAS;
+			break;
+		case 7:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::XBR;
+			break;
+		case 8:
+			g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+			g_wantedUpscaleFilter = GamescopeUpscaleFilter::ANIME4K;
+			break;
 		}
 		hasRepaint = true;
 	}
 	if ( ev->atom == ctx->atoms.gamescopeFSRSharpness || ev->atom == ctx->atoms.gamescopeSharpness )
 	{
 		g_upscaleFilterSharpness = (int)clamp( get_prop( ctx, ctx->root, ev->atom, 2 ), 0u, 20u );
-		if ( g_upscaleFilter == GamescopeUpscaleFilter::FSR || g_upscaleFilter == GamescopeUpscaleFilter::NIS )
+		if ( g_upscaleFilter == GamescopeUpscaleFilter::FSR || g_upscaleFilter == GamescopeUpscaleFilter::NIS || g_upscaleFilter == GamescopeUpscaleFilter::BCAS )
 			hasRepaint = true;
+	}
+	if ( ev->atom == ctx->atoms.gamescopeFrameGenerationEnabled )
+	{
+		gamescope::SetFrameGenerationEnabled(
+			get_prop( ctx, ctx->root, ctx->atoms.gamescopeFrameGenerationEnabled, 0 ) );
+		hasRepaint = true;
+	}
+	if ( ev->atom == ctx->atoms.gamescopeFrameGenerationFlowScale )
+	{
+		gamescope::SetFrameGenerationFlowScale(
+			get_prop( ctx, ctx->root, ctx->atoms.gamescopeFrameGenerationFlowScale, 75 ) );
+		hasRepaint = true;
 	}
 	if ( ev->atom == ctx->atoms.gamescopeXWaylandModeControl )
 	{
@@ -7037,15 +7108,9 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 			MakeFocusDirty();
 		}
 	}
-	if (ev->atom == ctx->atoms.gamescopeReshadeTechniqueIdx)
+	if (ev->atom == ctx->atoms.gamescopeDPMS)
 	{
-		uint32_t technique_idx = get_prop(ctx, ctx->root, ctx->atoms.gamescopeReshadeTechniqueIdx, 0);
-		g_reshade_technique_idx = technique_idx;
-	}
-	if (ev->atom == ctx->atoms.gamescopeReshadeEffect)
-	{
-		std::string path = get_string_prop( ctx, ctx->root, ctx->atoms.gamescopeReshadeEffect );
-		g_reshade_effect = path;
+		g_bDPMS = !!get_prop(ctx, ctx->root, ctx->atoms.gamescopeDPMS, 0);
 	}
 	if (ev->atom == ctx->atoms.gamescopeDisplayDynamicRefreshBasedOnGamePresence)
 	{
@@ -7084,6 +7149,7 @@ static void
 steamcompmgr_exit(void)
 {
 	g_ImageWaiter.Shutdown();
+	vulkan_frame_generation_reset();
 
 	// Clean up any commits.
 	{
@@ -7236,13 +7302,6 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 
 			// Window just got a new available commit, determine if that's worth a repaint
 
-			// If this is a forwarded vr plane, repaint
-			if ( w->oulTargetVROverlay )
-			{
-				g_bUpdateForwardedVROverlays = true;
-				w->bNeedsForwarding = true;
-			}
-
 			for ( auto &iter : g_VirtualConnectorFocuses )
 			{
 				global_focus_t *pFocus = &iter.second;
@@ -7339,24 +7398,26 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 	// very fast loop yes
 	for ( auto& entry : ctx->doneCommits.listCommitsDone )
 	{
-		bool entry_vblank = vblank;
-
-		if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
+		steamcompmgr_win_t *entry_window = nullptr;
+		for ( steamcompmgr_win_t *w = ctx->list; w; w = w->xwayland().next )
 		{
-			for ( steamcompmgr_win_t *w = ctx->list; w; w = w->xwayland().next )
+			if ( w->seq == entry.winSeq )
 			{
-				if (w->seq != entry.winSeq)
-					continue;
-
-				entry_vblank = entry_vblank && steamcompmgr_should_vblank_window( true, vblank_idx, w, now );
+				entry_window = w;
+				break;
 			}
 		}
-		else
-		{
-			entry_vblank = entry_vblank && steamcompmgr_should_vblank_window( true, vblank_idx );
-		}
+		const bool frameGenerationOverlay =
+			steamcompmgr_window_is_active_frame_generation_overlay( entry_window );
+		const bool fifoPaced = entry.fifo || frameGenerationOverlay;
+		const bool entry_vblank =
+			( vblank || ( !frameGenerationOverlay &&
+			  steamcompmgr_can_latch_frame_generation_between_vblanks() ) ) &&
+			( entry_window
+			? steamcompmgr_should_vblank_window( true, vblank_idx, entry_window, now )
+			: steamcompmgr_should_vblank_window( true, vblank_idx ) );
 
-		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
+		if ( fifoPaced && ( !entry_vblank || fifo_win_seqs.count( entry.winSeq ) > 0 ) )
 		{
 			commits_before_their_time.push_back( entry );
 			continue;
@@ -7380,7 +7441,7 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 				continue;
 			if (handle_done_commit(w, ctx, entry.commitID, entry.earliestPresentTime, entry.earliestLatchTime))
 			{
-				if (entry.fifo)
+				if ( fifoPaced )
 					fifo_win_seqs.insert(entry.winSeq);
 				break;
 			}
@@ -7408,12 +7469,29 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 
 	uint64_t now = get_time_in_nanos();
 
-	vblank = vblank && steamcompmgr_should_vblank_window( true, vblank_idx );
-
 	// very fast loop yes
 	for ( auto& entry : g_steamcompmgr_xdg_done_commits.listCommitsDone )
 	{
-		if (entry.fifo && (!vblank || fifo_win_seqs.count(entry.winSeq) > 0))
+		steamcompmgr_win_t *entry_window = nullptr;
+		for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
+		{
+			if ( xdg_win->seq == entry.winSeq )
+			{
+				entry_window = xdg_win.get();
+				break;
+			}
+		}
+		const bool frameGenerationOverlay =
+			steamcompmgr_window_is_active_frame_generation_overlay( entry_window );
+		const bool fifoPaced = entry.fifo || frameGenerationOverlay;
+		const bool entry_vblank =
+			( vblank || ( !frameGenerationOverlay &&
+			  steamcompmgr_can_latch_frame_generation_between_vblanks() ) ) &&
+			( entry_window
+				? steamcompmgr_should_vblank_window( true, vblank_idx, entry_window, now )
+				: steamcompmgr_should_vblank_window( true, vblank_idx ) );
+
+		if ( fifoPaced && ( !entry_vblank || fifo_win_seqs.count( entry.winSeq ) > 0 ) )
 		{
 			commits_before_their_time.push_back( entry );
 			continue;
@@ -7437,7 +7515,7 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 				continue;
 			if (handle_done_commit(xdg_win.get(), nullptr, entry.commitID, entry.earliestPresentTime, entry.earliestLatchTime))
 			{
-				if (entry.fifo)
+				if ( fifoPaced )
 					fifo_win_seqs.insert(entry.winSeq);
 				break;
 			}
@@ -7455,12 +7533,19 @@ void handle_presented_for_window( steamcompmgr_win_t* w )
 
 	uint64_t next_refresh_time = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
 
-	uint64_t refresh_cycle = g_nSteamCompMgrTargetFPS && steamcompmgr_window_should_limit_fps( w )
+	const bool frameGenerationOverlay =
+		steamcompmgr_window_is_active_frame_generation_overlay( w );
+	uint64_t refresh_cycle = frameGenerationOverlay ||
+		( g_nSteamCompMgrTargetFPS && steamcompmgr_window_should_limit_fps( w ) )
 		? g_SteamCompMgrLimitedAppRefreshCycle
 		: g_SteamCompMgrAppRefreshCycle;
 
 	commit_t *lastCommit = get_window_last_done_commit_peek(w);
-	if (lastCommit)
+	const global_focus_t *currentFocus = GetCurrentFocus();
+	const bool generatedSlotForWindow = currentFocus &&
+		w == currentFocus->focusWindow &&
+		vulkan_frame_generation_last_presented_generated();
+	if ( lastCommit && !generatedSlotForWindow )
 	{
 		if ( !cv_mangoapp_use_output_timing )
 		{
@@ -7475,6 +7560,8 @@ void handle_presented_for_window( steamcompmgr_win_t* w )
 				w->last_commit_present_time = lastCommit->present_time;
 			}
 		}
+
+		w->bHasHDRColorspace = ColorspaceIsHDR(lastCommit->colorspace());
 
 		if (!lastCommit->presentation_feedbacks.empty() || lastCommit->present_id)
 		{
@@ -7680,10 +7767,14 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		return;
 	}
 
+	std::shared_ptr<gamescope::CCommitBufferSync> bufferSync = std::make_shared<gamescope::CCommitBufferSync>(
+		buf, std::move( reslistentry.pAcquirePoint ), std::move( reslistentry.pReleasePoint ), w->pid );
+
 	gamescope::Rc<commit_t> newCommit = import_commit(
 		w,
 		reslistentry.surf,
 		buf,
+		bufferSync,
 		reslistentry.async,
 		std::move(reslistentry.feedback),
 		std::move(reslistentry.presentation_feedbacks),
@@ -7708,7 +7799,18 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 								( pCurrentFocus->focusWindow && pCurrentFocus->focusWindow->isSteamStreamingClient && w->isSteamStreamingClientVideo ) )
 								&& !bMangoappSocketDisable;
 
-	bool bValidPreemptiveScale = reslistentry.pAcquirePoint && pCurrentFocus && w == pCurrentFocus->focusWindow && cv_upscale_preemptive;
+	// Frame generation must submit the midpoint before the real frame's FSR
+	// work. Preemptive scaling reverses that GPU order and consumes most of
+	// the midpoint's output slot, so let the queued real slot run its single
+	// FSR chain after generated-frame synthesis instead.
+	const std::shared_ptr<gamescope::CAcquireTimelinePoint> &pAcquirePoint = bufferSync->GetAcquirePoint();
+	gamescope::CCommitBufferSync::AcquireStatus acquireStatus = bufferSync->PrepareAcquire();
+	bool bValidPreemptiveScale =
+		acquireStatus != gamescope::CCommitBufferSync::AcquireStatus::Pending &&
+		acquireStatus != gamescope::CCommitBufferSync::AcquireStatus::Failed &&
+		pAcquirePoint && pCurrentFocus &&
+		w == pCurrentFocus->focusWindow && cv_upscale_preemptive &&
+		!steamcompmgr_frame_generation_enabled_for_focus();
 	bool bPreemptiveUpscale = bValidPreemptiveScale && newCommit->ShouldPreemptivelyUpscale();
 
 	bool bKnownReady = false;
@@ -7732,6 +7834,10 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		paint_window_commit( newCommit, w, w, &upscaledFrameInfo, nullptr );
 		upscaledFrameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR;
 		upscaledFrameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS;
+		upscaledFrameInfo.useSGSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::SGSR;
+		upscaledFrameInfo.useBCASLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::BCAS;
+		upscaledFrameInfo.useXBRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::XBR;
+		upscaledFrameInfo.useAnime4KLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::ANIME4K;
 		globalScaleRatio = flOldGlobalScale;
 		zoomScaleRatio = flOldZoomScale;
 		overscanScaleRatio = flOldOverscanScale;
@@ -7743,7 +7849,8 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 
 			std::unique_ptr<CVulkanCmdBuffer> pCommandBuffer = g_device.commandBuffer();
 			
-			pCommandBuffer->AddDependency( reslistentry.pAcquirePoint->GetTimeline()->ToVkSemaphore(), reslistentry.pAcquirePoint->GetPoint() );
+			if ( !bufferSync->UsesSyncFileInterop() || bufferSync->IsAcquireFallback() )
+				pCommandBuffer->AddDependency( pAcquirePoint->GetTimeline()->ToVkSemaphore(), pAcquirePoint->GetPoint() );
 			pCommandBuffer->AddSignal( pTempImage->pReleaseTimeline->ToVkSemaphore(), ulNextReleasePoint );
 
 			static std::optional<uint64_t> s_ulLastPreemptiveUpscaleSeqNo;
@@ -7791,18 +7898,30 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 			ClearUpscaleImages();
 		}
 
-		if ( reslistentry.pAcquirePoint )
+		if ( acquireStatus == gamescope::CCommitBufferSync::AcquireStatus::Ready )
 		{
-			eventFd = reslistentry.pAcquirePoint->CreateEventFd();
+			bKnownReady = true;
 		}
-	}
-
-	if ( gamescope::IBackendFb *pBackendFb = newCommit->vulkanTex->GetBackendFb() )
-	{
-		if ( reslistentry.pReleasePoint )
-			pBackendFb->SetReleasePoint( reslistentry.pReleasePoint );
-		else
-			pBackendFb->SetBuffer( buf );
+		else if ( acquireStatus == gamescope::CCommitBufferSync::AcquireStatus::Pending )
+		{
+			eventFd = bufferSync->CreateAcquireAvailabilityEvent();
+			if ( eventFd == gamescope::CAcquireTimelinePoint::k_InvalidEvent )
+			{
+				bufferSync->UseAcquireFallback();
+				eventFd = bufferSync->DuplicateBaselineWaitFd();
+			}
+			bKnownReady = eventFd.second;
+		}
+		else if ( acquireStatus == gamescope::CCommitBufferSync::AcquireStatus::Failed )
+		{
+			bufferSync->UseAcquireFallback();
+			eventFd = bufferSync->DuplicateBaselineWaitFd();
+			bKnownReady = eventFd.second;
+		}
+		else if ( pAcquirePoint )
+		{
+			eventFd = pAcquirePoint->CreateEventFd();
+		}
 	}
 
 	if ( eventFd != gamescope::CAcquireTimelinePoint::k_InvalidEvent )
@@ -7810,12 +7929,19 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		fence = eventFd.first;
 		bKnownReady = eventFd.second;
 	}
-	else
+	else if ( !bKnownReady )
 	{
 		struct wlr_dmabuf_attributes dmabuf = {0};
 		if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
 		{
 			fence = dup( dmabuf.fd[0] );
+		}
+		else if ( !g_device.supportsClientDmabufs() )
+		{
+			// The data-pointer fallback waits for its upload before returning
+			// and is not exported on drivers where client DMA-BUF imports are
+			// disabled, so there is no external fence to wait for.
+			bKnownReady = true;
 		}
 		else
 		{
@@ -7827,7 +7953,11 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 	{
 		newCommit->SetFence( fence, mango_nudge, doneCommits );
 		if ( bKnownReady )
+		{
+			if ( bufferSync->IsAcquireFallback() )
+				bufferSync->MarkAcquireFallbackReady();
 			newCommit->Signal();
+		}
 		else
 			g_ImageWaiter.AddWaitable( newCommit.get() );
 	}
@@ -8215,9 +8345,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.netSystemTrayOpcodeAtom = XInternAtom(ctx->dpy, "_NET_SYSTEM_TRAY_OPCODE", false);
 	ctx->atoms.steamStreamingClientAtom = XInternAtom(ctx->dpy, "STEAM_STREAMING_CLIENT", false);
 	ctx->atoms.steamStreamingClientVideoAtom = XInternAtom(ctx->dpy, "STEAM_STREAMING_CLIENT_VIDEO", false);
-	ctx->atoms.steamGamescopeVROverlayTarget = XInternAtom(ctx->dpy, "STEAM_GAMESCOPE_VROVERLAY_TARGET", false);
 	ctx->atoms.gamescopePid = XInternAtom(ctx->dpy, "GAMESCOPE_PID", false);
-	ctx->atoms.gamescopeVROverlayForwarding = XInternAtom(ctx->dpy, "GAMESCOPE_VROVERLAY_FORWARDING", false);
 	ctx->atoms.gamescopeFocusableAppsAtom = XInternAtom(ctx->dpy, "GAMESCOPE_FOCUSABLE_APPS", false);
 	ctx->atoms.gamescopeFocusableWindowsAtom = XInternAtom(ctx->dpy, "GAMESCOPE_FOCUSABLE_WINDOWS", false);
 	ctx->atoms.gamescopeFocusedAppAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_APP", false );
@@ -8249,6 +8377,9 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeLowLatency = XInternAtom( ctx->dpy, "GAMESCOPE_LOW_LATENCY", false );
 
 	ctx->atoms.gamescopeFSRFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_FSR_FEEDBACK", false );
+	ctx->atoms.gamescopeFrameGenerationEnabled = XInternAtom( ctx->dpy, "GAMESCOPE_FRAME_GENERATION_ENABLED", false );
+	ctx->atoms.gamescopeFrameGenerationFlowScale = XInternAtom( ctx->dpy, "GAMESCOPE_FRAME_GENERATION_FLOW_SCALE", false );
+	ctx->atoms.gamescopeFrameGenerationFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_FRAME_GENERATION_FEEDBACK", false );
 
 	ctx->atoms.gamescopeBlurMode = XInternAtom( ctx->dpy, "GAMESCOPE_BLUR_MODE", false );
 	ctx->atoms.gamescopeBlurRadius = XInternAtom( ctx->dpy, "GAMESCOPE_BLUR_RADIUS", false );
@@ -8319,13 +8450,9 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeCreateXWaylandServerFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_CREATE_XWAYLAND_SERVER_FEEDBACK", false );
 	ctx->atoms.gamescopeDestroyXWaylandServer = XInternAtom( ctx->dpy, "GAMESCOPE_DESTROY_XWAYLAND_SERVER", false );
 
-	ctx->atoms.gamescopeReshadeEffect = XInternAtom( ctx->dpy, "GAMESCOPE_RESHADE_EFFECT", false );
-	ctx->atoms.gamescopeReshadeTechniqueIdx = XInternAtom( ctx->dpy, "GAMESCOPE_RESHADE_TECHNIQUE_IDX", false );
 
 	ctx->atoms.gamescopeDisplayRefreshRateFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK", false );
 	ctx->atoms.gamescopeDisplayDynamicRefreshBasedOnGamePresence = XInternAtom( ctx->dpy, "GAMESCOPE_DISPLAY_DYNAMIC_REFRESH_BASED_ON_GAME_PRESENCE", false );
-
-	ctx->atoms.gamescopeMainSteamVROverlay = XInternAtom( ctx->dpy, "GAMESCOPE_MAIN_STEAMVR_OVERLAY", false );
 	ctx->atoms.steamosTouchPointerEmulation = XInternAtom( ctx->dpy, "_STEAMOS_TOUCH_POINTER_EMULATION", false );
 
 	ctx->atoms.wineHwndStyle = XInternAtom( ctx->dpy, "_WINE_HWND_STYLE", false );
@@ -8337,6 +8464,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 
 	ctx->atoms.wm_protocols = XInternAtom(ctx->dpy, "WM_PROTOCOLS", false);
 	ctx->atoms.wm_delete_window = XInternAtom(ctx->dpy, "WM_DELETE_WINDOW", false);
+	ctx->atoms.gamescopeDPMS = XInternAtom(ctx->dpy, "GAMESCOPE_DPMS", false);
 
 	ctx->root_width = DisplayWidth(ctx->dpy, ctx->scr);
 	ctx->root_height = DisplayHeight(ctx->dpy, ctx->scr);
@@ -8349,9 +8477,6 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 
 	uint32_t unPid = getpid();
 	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopePid, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&unPid, 1 );
-
-	uint32_t unVROverlayForwardingSupported = GetBackend()->SupportsVROverlayForwarding() ? 2 : 0;
-	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopeVROverlayForwarding, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&unVROverlayForwardingSupported, 1 );
 
 	XGrabServer(ctx->dpy);
 
@@ -8622,7 +8747,7 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
 
 		unsetenv( "ENABLE_VKBASALT" );
 		// Enable Gamescope WSI by default for nested.
-		setenv( "ENABLE_GAMESCOPE_WSI", "1", 0 );
+		setenv( "ENABLE_TELESCOPE_WSI", "1", 0 );
 
 		// Unset this to avoid it leaking to Proton apps, etc.
 		unsetenv( "SDL_VIDEODRIVER" );
@@ -8665,6 +8790,40 @@ static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []
 {
 	g_FPSLimitVRRTimer.DisarmTimer();
 }};
+
+static bool s_bFrameGenerationOutputTimerDue = false;
+static uint64_t s_uFrameGenerationOutputDeadline = 0;
+static uint64_t s_uFrameGenerationOutputInterval = 0;
+static gamescope::CTimerFunction g_FrameGenerationOutputTimer{ []
+{
+	s_bFrameGenerationOutputTimerDue = true;
+	g_FrameGenerationOutputTimer.DisarmTimer();
+}};
+
+static void reset_frame_generation_output_timer()
+{
+	g_FrameGenerationOutputTimer.DisarmTimer();
+	s_bFrameGenerationOutputTimerDue = false;
+	s_uFrameGenerationOutputDeadline = 0;
+	s_uFrameGenerationOutputInterval = 0;
+}
+
+static void schedule_frame_generation_output_timer( uint64_t now, uint64_t interval )
+{
+	if ( interval == 0 )
+	{
+		reset_frame_generation_output_timer();
+		return;
+	}
+
+	if ( s_uFrameGenerationOutputInterval != interval )
+		s_uFrameGenerationOutputDeadline = 0;
+	s_uFrameGenerationOutputInterval = interval;
+	s_uFrameGenerationOutputDeadline = gamescope::FrameGenerationNextOutputDeadline(
+		s_uFrameGenerationOutputDeadline, now, interval );
+	s_bFrameGenerationOutputTimerDue = false;
+	g_FrameGenerationOutputTimer.ArmTimer( s_uFrameGenerationOutputDeadline );
+}
 
 void
 steamcompmgr_main(int argc, char **argv)
@@ -8728,6 +8887,8 @@ steamcompmgr_main(int argc, char **argv)
 					g_bForceHDR10OutputDebug = true;
 				} else if (strcmp(opt_name, "hdr-itm-enabled") == 0 || strcmp(opt_name, "hdr-itm-enable") == 0) {
 					g_bHDRItmEnable = true;
+				} else if (strcmp(opt_name, "hdr-pq-internal-enable") == 0) {
+					disableInternalPq = false;
 				} else if (strcmp(opt_name, "sdr-gamut-wideness") == 0) {
 					g_ColorMgmt.pending.sdrGamutWideness = atof(optarg);
 				} else if (strcmp(opt_name, "hdr-sdr-content-nits") == 0) {
@@ -8738,10 +8899,6 @@ steamcompmgr_main(int argc, char **argv)
 					g_flHDRItmTargetNits = atof(optarg);
 				} else if (strcmp(opt_name, "framerate-limit") == 0) {
 					g_nSteamCompMgrTargetFPS = atoi(optarg);
-				} else if (strcmp(opt_name, "reshade-effect") == 0) {
-					g_reshade_effect = optarg;
-				} else if (strcmp(opt_name, "reshade-technique-idx") == 0) {
-					g_reshade_technique_idx = atoi(optarg);
 				} else if (strcmp(opt_name, "mura-map") == 0) {
 					set_mura_overlay(optarg);
 				}
@@ -8812,6 +8969,7 @@ steamcompmgr_main(int argc, char **argv)
 
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
 	g_SteamCompMgrWaiter.AddWaitable( &g_FPSLimitVRRTimer );
+	g_SteamCompMgrWaiter.AddWaitable( &g_FrameGenerationOutputTimer );
 	GetVBlankTimer().ArmNextVBlank( true );
 
 	{
@@ -8831,11 +8989,6 @@ steamcompmgr_main(int argc, char **argv)
 
 	if ( !GetBackend()->PostInit() )
 		return;
-
-	if ( g_pVROverlayKey )
-	{
-		set_string_prop( root_ctx, root_ctx->atoms.gamescopeMainSteamVROverlay, *g_pVROverlayKey );
-	}
 
 	update_edid_prop();
 
@@ -8877,6 +9030,28 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		g_SteamCompMgrWaiter.PollEvents();
+
+		static uint64_t s_lastFrameGenerationConfigSerial = 0;
+		const uint64_t frameGenerationConfigSerial =
+			gamescope::GetFrameGenerationConfigSerial();
+		if ( frameGenerationConfigSerial != s_lastFrameGenerationConfigSerial )
+		{
+			s_lastFrameGenerationConfigSerial = frameGenerationConfigSerial;
+			vulkan_frame_generation_reset();
+			reset_frame_generation_output_timer();
+			hasRepaint = true;
+		}
+
+		static uint64_t s_lastFrameGenerationStateSerial = 0;
+		const uint64_t frameGenerationStateSerial = gamescope::GetFrameGenerationStateSerial();
+		if ( frameGenerationStateSerial != s_lastFrameGenerationStateSerial )
+		{
+			s_lastFrameGenerationStateSerial = frameGenerationStateSerial;
+			const uint32_t status = static_cast<uint32_t>( gamescope::GetFrameGenerationStatus() );
+			XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeFrameGenerationFeedback,
+				XA_CARDINAL, 32, PropModeReplace, reinterpret_cast<const unsigned char *>( &status ), 1 );
+			XFlush( root_ctx->dpy );
+		}
 
 		bool vblank = false;
 		if ( std::optional<gamescope::VBlankTime> pendingVBlank = GetVBlankTimer().ProcessVBlank() )
@@ -9071,7 +9246,54 @@ steamcompmgr_main(int argc, char **argv)
 
 		g_uCompositeDebug = cv_composite_debug;
 
-		g_bOutputHDREnabled = (g_bSupportsHDR_CachedValue || g_bForceHDR10OutputDebug) && cv_hdr_enabled;
+		// Advertise our HDR support state to X11 apps
+		bool hdr_supported = (g_bSupportsHDR_CachedValue || g_bForceHDR10OutputDebug) && cv_hdr_enabled;
+		if ( currentHDRSupport != hdr_supported ||
+			 currentHDRForce != g_bForceHDRSupportDebug ) {
+			gamescope_xwayland_server_t *server = NULL;
+			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+			{
+				uint32_t hdr_value = ( hdr_supported || g_bForceHDRSupportDebug ) ? 1 : 0;
+				XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
+					(unsigned char *)&hdr_value, 1 );
+
+				server->ctx->cursor->setDirty();
+
+				if (server->ctx.get() == root_ctx)
+				{
+					flush_root = true;
+				}
+				else
+				{
+					XFlush(server->ctx->dpy);
+				}
+			}
+
+			currentHDRSupport = hdr_supported;
+			currentHDRForce = g_bForceHDRSupportDebug;
+		}
+
+		// Check if any running app has requested an hdr colorspace
+		// and only if it has, enable hdr output
+		bool hdr_requested = false;
+		{
+			gamescope_xwayland_server_t *server = NULL;
+			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+			{
+				for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
+				{
+					if (w->bHasHDRColorspace)
+						hdr_requested = true;
+				}
+			}
+
+			for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
+			{
+				if (xdg_win->bHasHDRColorspace)
+					hdr_requested = true;
+			}
+		}
+		g_bOutputHDREnabled = hdr_supported && hdr_requested;
 
 		// Pick our width/height for this potential frame, regardless of how it might change later
 		// At some point we might even add proper locking so we get real updates atomically instead
@@ -9080,8 +9302,7 @@ steamcompmgr_main(int argc, char **argv)
 			 currentOutputHeight != g_nOutputHeight ||
 			 currentOutputRefresh != g_nOutputRefresh ||
 			 currentOutputRotation != g_uOutputRotation ||
-			 currentHDROutput != g_bOutputHDREnabled ||
-			 currentHDRForce != g_bForceHDRSupportDebug )
+			 currentHDROutput != g_bOutputHDREnabled )
 		{
 			if ( g_nXWaylandCount > 1 )
 			{
@@ -9105,34 +9326,11 @@ steamcompmgr_main(int argc, char **argv)
 				vulkan_remake_output_images();
 			}
 
-
-			{
-				gamescope_xwayland_server_t *server = NULL;
-				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-				{
-					uint32_t hdr_value = ( g_bOutputHDREnabled || g_bForceHDRSupportDebug ) ? 1 : 0;
-					XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
-						(unsigned char *)&hdr_value, 1 );
-
-					server->ctx->cursor->setDirty();
-
-					if (server->ctx.get() == root_ctx)
-					{
-						flush_root = true;
-					}
-					else
-					{
-						XFlush(server->ctx->dpy);
-					}
-				}
-			}
-
 			currentOutputWidth = g_nOutputWidth;
 			currentOutputHeight = g_nOutputHeight;
 			currentOutputRefresh = g_nOutputRefresh;
 			currentOutputRotation = g_uOutputRotation;
 			currentHDROutput = g_bOutputHDREnabled;
-			currentHDRForce = g_bForceHDRSupportDebug;
 
 #if HAVE_PIPEWIRE
 			nudge_pipewire();
@@ -9214,6 +9412,15 @@ steamcompmgr_main(int argc, char **argv)
 
 					g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle * nVblankDivisor;
 				}
+			}
+			if ( steamcompmgr_frame_generation_enabled_for_focus() )
+			{
+				const int nRealRefreshHz = gamescope::ConvertmHzToHz( nRealRefreshmHz );
+				const int nTotalFPS = g_nSteamCompMgrTargetFPS
+					? std::min( g_nSteamCompMgrTargetFPS, nRealRefreshHz )
+					: nRealRefreshHz;
+				g_SteamCompMgrLimitedAppRefreshCycle =
+					gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTotalFPS ) ) * 2u;
 			}
 		}
 
@@ -9392,6 +9599,8 @@ steamcompmgr_main(int argc, char **argv)
 			// for composition to finish before submitting.
 			// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
 			const bool bSurfaceWantsAsync = (g_HeldCommits[HELD_COMMIT_BASE] != nullptr && g_HeldCommits[HELD_COMMIT_BASE]->async);
+			const bool bFrameGeneration = gamescope::GetFrameGenerationConfig().enabled &&
+				steamcompmgr_window_allows_frame_generation( pPaintFocus->focusWindow );
 			const bool bTearing = cv_tearing_enabled && GetBackend()->SupportsTearing() && bSurfaceWantsAsync;
 
 			enum class FlipType
@@ -9420,6 +9629,57 @@ steamcompmgr_main(int argc, char **argv)
 			}
 			else
 				eFlipType = FlipType::Normal;
+
+			const uint64_t frameGenerationRefreshHz = gamescope::ConvertmHzToHz(
+				g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
+			const uint64_t frameGenerationOutputFPS = g_nSteamCompMgrTargetFPS > 0
+				? std::min<uint64_t>( g_nSteamCompMgrTargetFPS, frameGenerationRefreshHz )
+				: frameGenerationRefreshHz;
+			const uint64_t frameGenerationOutputInterval = frameGenerationOutputFPS > 0
+				? gamescope::mHzToRefreshCycle(
+					gamescope::ConvertHztomHz( uint32_t( frameGenerationOutputFPS ) ) )
+				: 0;
+			const bool frameGenerationFreeRunning = bFrameGeneration &&
+				( bVRR || eFlipType == FlipType::Async );
+			// A queued frame belongs to the frame-generating focus.  Do not let it
+			// suppress painting after focus has moved to an ineligible window (most
+			// notably Steam while transitioning to Settings or Media).  That paint
+			// will reset the stale frame-generation queue in paint_all().
+			bool frameGenerationPending = bFrameGeneration &&
+				vulkan_frame_generation_has_pending_frame();
+			const uint64_t frameGenerationNow = get_time_in_nanos();
+
+			if ( frameGenerationFreeRunning )
+			{
+				if ( frameGenerationPending &&
+					( s_uFrameGenerationOutputDeadline == 0 ||
+					  s_uFrameGenerationOutputInterval != frameGenerationOutputInterval ) )
+				{
+					schedule_frame_generation_output_timer(
+						frameGenerationNow, frameGenerationOutputInterval );
+				}
+			}
+			else if ( s_uFrameGenerationOutputDeadline != 0 )
+			{
+				reset_frame_generation_output_timer();
+			}
+
+			const bool frameGenerationTimerOutputDue = frameGenerationFreeRunning &&
+				frameGenerationPending && s_bFrameGenerationOutputTimerDue;
+			const bool frameGenerationVblankOutputDue = bFrameGeneration &&
+				!frameGenerationFreeRunning && vblank &&
+				gamescope::FrameGenerationOutputSlotDue(
+					vblank_idx, frameGenerationOutputFPS, frameGenerationRefreshHz );
+			if ( frameGenerationVblankOutputDue )
+				vulkan_frame_generation_note_output_slot( frameGenerationPending );
+
+			if ( frameGenerationTimerOutputDue &&
+				vulkan_frame_generation_drop_stale_generated_frame(
+					frameGenerationNow, s_uFrameGenerationOutputDeadline,
+					frameGenerationOutputInterval ) )
+			{
+				frameGenerationPending = vulkan_frame_generation_has_pending_frame();
+			}
 
 			bool bShouldPaint = false;
 
@@ -9483,21 +9743,52 @@ steamcompmgr_main(int argc, char **argv)
 				bShouldPaint = false;
 			}
 
+			if ( frameGenerationPending )
+			{
+				if ( frameGenerationFreeRunning )
+					bShouldPaint = frameGenerationTimerOutputDue;
+				else if ( vblank )
+					bShouldPaint = frameGenerationVblankOutputDue;
+				else
+					bShouldPaint = false;
+
+				if ( bVRR && GetBackend()->GetCurrentConnector() &&
+					 GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0 )
+				{
+					bShouldPaint = false;
+				}
+			}
+
+			const bool frameGenerationPrepareOnly = bFrameGeneration && hasRepaint &&
+				( frameGenerationFreeRunning
+					? frameGenerationPending && !frameGenerationTimerOutputDue
+					: !vblank );
+			if ( frameGenerationPrepareOnly )
+				bShouldPaint = true;
+
+			if ( g_bDPMS != g_bDPMS_set && vblank )
+				bShouldPaint = true;
+
 			if ( bShouldPaint )
 			{
-				paint_all( pPaintFocus, eFlipType == FlipType::Async );
+				paint_all( pPaintFocus, eFlipType == FlipType::Async, g_bDPMS,
+					frameGenerationPrepareOnly );
 
-				bPainted = true;
+				if ( !frameGenerationPrepareOnly )
+				{
+					g_bDPMS_set = g_bDPMS;
+					bPainted = true;
+
+					if ( frameGenerationFreeRunning )
+					{
+						if ( vulkan_frame_generation_has_pending_frame() )
+							schedule_frame_generation_output_timer(
+								frameGenerationNow, frameGenerationOutputInterval );
+						else
+							reset_frame_generation_output_timer();
+					}
+				}
 			}
-		}
-
-		if ( vblank && g_bUpdateForwardedVROverlays )
-		{
-			ForwardVROverlayTargets();
-
-			g_bUpdateForwardedVROverlays = false;
-
-			bPainted = true;
 		}
 
 		if ( bPainted )

@@ -29,7 +29,7 @@
     it.
   </description>
 
-  <interface name="gamescope_control" version="6">
+  <interface name="gamescope_control" version="7">
     <request name="destroy" type="destructor"></request>
 
     <enum name="feature">
@@ -44,6 +44,7 @@
       <entry name="mura_correction" value="5"/>
       <entry name="look" value="6"/>
       <entry name="perf_query" value="7"/>
+      <entry name="frame_generation" value="8"/>
     </enum>
 
     <event name="feature_support">
@@ -142,6 +143,14 @@
       <arg name="frametime_ns_lo" type="uint" summary="Time delta between the two most recent frames"></arg>
       <arg name="frametime_ns_hi" type="uint" summary="frametime_ns high bits"></arg>
     </event>
+
+    <request name="set_frame_generation" since="7">
+      <description summary="Enable compositor frame generation">
+        Frame generation inserts one midpoint between consecutive application
+        frames, producing fixed non-speculative x2 output.
+      </description>
+      <arg name="enabled" type="uint" summary="0 disables and 1 enables frame generation"/>
+    </request>
 
   </interface>
 </protocol>

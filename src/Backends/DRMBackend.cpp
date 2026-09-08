@@ -23,12 +23,15 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <chrono>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "backend.h"
+#include "CommitBufferSync.h"
 #include "color_helpers.h"
 #include "Utils/Defer.h"
 #include "drm_include.h"
@@ -53,6 +56,9 @@
 #include "libdisplay-info/cta.h"
 #include "wlr_end.hpp"
 
+#include "DRMGbmScanout.h"
+#include "DRMVendorQuirks.h"
+
 #include "gamescope-control-protocol.h"
 
 extern int g_nPreferredOutputWidth;
@@ -73,6 +79,17 @@ gamescope::ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_e
 gamescope::ConVar<bool> cv_drm_debug_disable_in_fence_fd( "drm_debug_disable_in_fence_fd", false, "Force disable IN_FENCE_FD being set to avoid over-synchronization on the DRM backend." );
 
 gamescope::ConVar<bool> cv_drm_allow_dynamic_modes_for_external_display( "drm_allow_dynamic_modes_for_external_display", false, "Allow dynamic mode/refresh rate switching for external displays." );
+
+gamescope::ConVar<int> cv_drm_modeset_link_down( "drm_modeset_link_down", -1,
+	"Take the link fully down as its own commit before bringing it back up with the new mode, "
+	"instead of disabling and refilling in one atomic request. "
+	"-1 = auto (on where the driver is known to need it), 0 = never, 1 = always.\n"
+	"Worth forcing on for sinks with unreliable HDMI 2.1 link training: some AV receivers only "
+	"negotiate VRR correctly after the link has actually dropped, regardless of GPU vendor." );
+
+gamescope::ConVar<int> cv_drm_modeset_link_down_settle_ms( "drm_modeset_link_down_settle_ms", 1000,
+	"How long to wait after the link-down commit before bringing the link back up. "
+	"Only used when drm_modeset_link_down applies." );
 
 int HackyDRMPresent( const FrameInfo_t *pFrameInfo, bool bAsync );
 
@@ -109,6 +126,8 @@ struct drm_t {
 	uint64_t cursor_width, cursor_height;
 	bool allow_modifiers;
 	struct wlr_drm_format_set formats;
+	gamescope::CGbmScanoutAllocator gbmAllocator;
+	gamescope::DrmVendorQuirks vendorQuirks;
 
 	std::vector< std::unique_ptr< gamescope::CDRMPlane > > planes;
 	std::vector< std::unique_ptr< gamescope::CDRMCRTC > > crtcs;
@@ -140,15 +159,19 @@ struct drm_t {
 	// FBs in the atomic request, but not yet submitted to KMS
 	// Accessed only on req thread
 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_FbIdsInRequest;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_BufferUsesInRequest;
+	std::vector<int> m_InFenceFdsInRequest;
 
 	// FBs currently queued to go on screen.
 	// May be accessed by page flip handler thread and req thread, thus mutex.
 	std::mutex m_QueuedFbIdsMutex;
 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_QueuedFbIds;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_QueuedBufferUses;
 	// FBs currently on screen.
 	// Accessed only on page flip handler thread.
 	std::mutex m_mutVisibleFbIds;
 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_VisibleFbIds;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_VisibleBufferUses;
 
 	std::atomic < uint32_t > uPendingFlipCount = { 0 };
 
@@ -168,6 +191,13 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode );
 using namespace std::literals;
 
 struct drm_t g_DRM = {};
+
+static void drm_close_in_fences( struct drm_t *drm )
+{
+	for ( int nFd : drm->m_InFenceFdsInRequest )
+		close( nFd );
+	drm->m_InFenceFdsInRequest.clear();
+}
 
 // Flip handler thread control. Keep the thread object global so we
 // can join it during shutdown instead of detaching and risking the
@@ -219,6 +249,11 @@ namespace gamescope
 			nRefresh /= mode->vscan;
 
 		return nRefresh;
+	}
+
+	static int32_t GetVblankNs(const drmModeModeInfo *mode)
+	{
+		return (mode->vsync_start - mode->vdisplay) * 1'000'000'000ll / mode->vrefresh / mode->vtotal;
 	}
 
 	template <typename T>
@@ -387,6 +422,7 @@ namespace gamescope
 			std::optional<CDRMAtomicProperty> vrr_capable;
 			std::optional<CDRMAtomicProperty> EDID;
 			std::optional<CDRMAtomicProperty> Broadcast_RGB;
+			std::optional<CDRMAtomicProperty> max_bpc;
 			std::optional<CDRMAtomicProperty> DUMMY_END;
 		};
 		      ConnectorProperties &GetProperties()       { return m_Props; }
@@ -558,12 +594,12 @@ extern bool g_bDebugLayers;
 struct DRMPresentCtx
 {
 	uint64_t ulPendingFlipCount = 0;
+	uint64_t frameGenerationOutputId = 0;
 };
 
 extern gamescope::ConVar<bool> cv_composite_force;
 extern bool g_bColorSliderInUse;
 extern bool fadingOut;
-extern std::string g_reshade_effect;
 
 #ifndef DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP
 #define DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP 0x15
@@ -571,6 +607,7 @@ extern std::string g_reshade_effect;
 
 bool drm_update_color_mgmt(struct drm_t *drm);
 bool drm_supports_color_mgmt(struct drm_t *drm);
+bool drm_supports_blend_tf(struct drm_t *drm);
 bool drm_set_connector( struct drm_t *drm, gamescope::CDRMConnector *conn );
 
 struct drm_color_ctm2 {
@@ -721,12 +758,11 @@ static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uin
 /* Pick a primary plane that can be connected to the chosen CRTC. */
 static gamescope::CDRMPlane *find_primary_plane(struct drm_t *drm)
 {
-	if ( !drm->pCRTC )
-		return nullptr;
-
 	for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
 	{
-		if ( pPlane->GetModePlane()->possible_crtcs & drm->pCRTC->GetCRTCMask() )
+		// Use a plane that can be used with the current CRTC. If no CRTC is
+		// chosen yet, pick any primary plane.
+		if ( !drm->pCRTC || (pPlane->GetModePlane()->possible_crtcs & drm->pCRTC->GetCRTCMask()) )
 		{
 			if ( pPlane->GetProperties().type->GetCurrentValue() == DRM_PLANE_TYPE_PRIMARY )
 				return pPlane.get();
@@ -753,7 +789,7 @@ static bool have_overlay_planes(struct drm_t *drm)
 	return false;
 }
 
-extern void mangoapp_output_update( uint64_t vblanktime );
+extern void mangoapp_output_update( uint64_t vblanktime, uint64_t frameGenerationOutputId );
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, unsigned int crtc_id, void *data)
 {
 	DRMPresentCtx *pCtx = reinterpret_cast<DRMPresentCtx *>( data );
@@ -785,12 +821,14 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 		// Swap and clear from queue -> visible to avoid allocations.
 		g_DRM.m_VisibleFbIds.swap( g_DRM.m_QueuedFbIds );
 		g_DRM.m_QueuedFbIds.clear();
+		g_DRM.m_VisibleBufferUses.swap( g_DRM.m_QueuedBufferUses );
+		g_DRM.m_QueuedBufferUses.clear();
 	}
 
 	g_DRM.uPendingFlipCount--;
 	g_DRM.uPendingFlipCount.notify_all();
 
-	mangoapp_output_update( vblanktime );
+	mangoapp_output_update( vblanktime, pCtx->frameGenerationOutputId );
 
 	// Nudge so that steamcompmgr releases commits.
 	nudge_steamcompmgr();
@@ -1019,15 +1057,42 @@ static std::unordered_map<std::string, int> parse_connector_priorities(const cha
 	return priorities;
 }
 
-static int get_connector_priority(struct drm_t *drm, const char *name)
+static int get_connector_priority(const std::unordered_map<std::string, int> &priorities, const char *name)
 {
-	if (drm->connector_priorities.count(name) > 0) {
-		return drm->connector_priorities[name];
+	if ( auto iter = priorities.find( name ); iter != priorities.end() ) {
+		return iter->second;
 	}
-	if (drm->connector_priorities.count("*") > 0) {
-		return drm->connector_priorities["*"];
+	if ( auto iter = priorities.find( "*" ); iter != priorities.end() ) {
+		return iter->second;
 	}
-	return drm->connector_priorities.size();
+	return priorities.size();
+}
+
+static int get_best_connector_priority_for_fd( int fd, const void *userdata )
+{
+	const auto &priorities = *static_cast<const std::unordered_map<std::string, int> *>( userdata );
+	drmModeRes *resources = drmModeGetResources( fd );
+	if ( !resources )
+		return INT_MAX;
+
+	int best_priority = INT_MAX;
+	for ( int i = 0; i < resources->count_connectors; i++ )
+	{
+		drmModeConnector *connector = drmModeGetConnector( fd, resources->connectors[i] );
+		if ( !connector )
+			continue;
+
+		if ( connector->connection == DRM_MODE_CONNECTED )
+		{
+			char name[64];
+			snprintf( name, sizeof( name ), "%s-%u", drmModeGetConnectorTypeName( connector->connector_type ), connector->connector_type_id );
+			best_priority = std::min( best_priority, get_connector_priority( priorities, name ) );
+		}
+		drmModeFreeConnector( connector );
+	}
+
+	drmModeFreeResources( resources );
+	return best_priority;
 }
 
 static bool get_saved_mode(const char *description, saved_mode &mode_info)
@@ -1082,7 +1147,7 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 		if ( g_bForceInternal && pConnector->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL )
 			continue;
 
-		int nPriority = get_connector_priority( drm, pConnector->GetName() );
+		int nPriority = get_connector_priority( drm->connector_priorities, pConnector->GetName() );
 		if ( nPriority < nBestPriority )
 		{
 			best = pConnector;
@@ -1245,7 +1310,7 @@ gamescope_liftoff_log_handler(enum liftoff_log_priority liftoff_priority, const 
 	liftoff_log_scope.vlogf(priority, fmt, args);
 }
 
-bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 {
 	load_pnps();
 
@@ -1255,33 +1320,26 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 	drm->preferred_height = height;
 	drm->preferred_refresh = refresh;
 
+	drm->fd = fd;
 	drm->device_name = nullptr;
-	dev_t dev_id = 0;
-	if (vulkan_primary_dev_id(&dev_id)) {
-		drmDevice *drm_dev = nullptr;
-		if (drmGetDeviceFromDevId(dev_id, 0, &drm_dev) != 0) {
-			drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)dev_id);
-			return false;
-		}
-		assert(drm_dev->available_nodes & (1 << DRM_NODE_PRIMARY));
-		drm->device_name = strdup(drm_dev->nodes[DRM_NODE_PRIMARY]);
-		drm_log.infof("opening DRM node '%s'", drm->device_name);
-	}
-	else
+
+	struct stat fd_stat = {};
+	if ( fstat( drm->fd, &fd_stat ) == 0 )
 	{
-		drm_log.infof("warning: picking an arbitrary DRM device");
+		drmDevice *drm_dev = nullptr;
+		if ( drmGetDeviceFromDevId( fd_stat.st_rdev, 0, &drm_dev ) == 0 )
+		{
+			if ( drm_dev->available_nodes & (1 << DRM_NODE_PRIMARY) )
+				drm->device_name = strdup( drm_dev->nodes[DRM_NODE_PRIMARY] );
+			drmFreeDevice( &drm_dev );
+		}
 	}
 
-	drm->fd = wlsession_open_kms( drm->device_name );
-	if ( drm->fd < 0 )
-	{
-		drm_log.errorf("Could not open KMS device");
-		return false;
-	}
+	drm_log.infof( "opening DRM node '%s'", drm->device_name ? drm->device_name : "unknown" );
 
 	if ( !drmIsKMS( drm->fd ) )
 	{
-		drm_log.errorf( "'%s' is not a KMS device", drm->device_name );
+		drm_log.errorf( "'%s' is not a KMS device", drm->device_name ? drm->device_name : "unknown" );
 		wlsession_close_kms();
 		return -1;
 	}
@@ -1450,6 +1508,17 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 
 	drm->needs_modeset = true;
 
+	drm->vendorQuirks = gamescope::DetectDrmVendorQuirks( drm->fd );
+
+	// All composited scanout is GBM-backed. Do not silently restore the Vulkan
+	// allocation path: tests on multiple vendors have shown that a Vulkan image
+	// being exportable does not guarantee that KMS can scan it out reliably.
+	if ( !drm->gbmAllocator.Init( drm->fd ) )
+	{
+		drm_log.errorf( "The GBM device could not be opened. Telescope requires GBM-allocated scanout buffers and will not fall back to Vulkan allocation." );
+		return false;
+	}
+
 	return true;
 }
 
@@ -1502,6 +1571,9 @@ void finish_drm(struct drm_t *drm)
 
 		if ( pConnector->GetProperties().content_type )
 			pConnector->GetProperties().content_type->SetPendingValue( req, 0, true );
+
+		if ( pConnector->GetProperties().max_bpc )
+			pConnector->GetProperties().max_bpc->SetPendingValue( req, pConnector->GetProperties().max_bpc->GetInitialValue(), true );
 	}
 
 	for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
@@ -1593,13 +1665,17 @@ void finish_drm(struct drm_t *drm)
 	wlr_drm_format_set_finish( &drm->formats );
 	wlr_drm_format_set_finish( &drm->primary_formats );
 	drm->m_FbIdsInRequest.clear();
+	drm->m_BufferUsesInRequest.clear();
+	drm_close_in_fences( drm );
 	{
 		std::unique_lock lock( drm->m_QueuedFbIdsMutex );
 		drm->m_QueuedFbIds.clear();
+		drm->m_QueuedBufferUses.clear();
 	}
 	{
 		std::unique_lock lock( drm->m_mutVisibleFbIds );
 		drm->m_VisibleFbIds.clear();
+		drm->m_VisibleBufferUses.clear();
 	}
 	drm->sdr_static_metadata = nullptr;
 	drm->current = drm_t::drm_state_t{};
@@ -1608,6 +1684,7 @@ void finish_drm(struct drm_t *drm)
 	drm->crtcs.clear();
 	drm->connectors.clear();
 
+	drm->gbmAllocator.Shutdown();
 
 	// Signal the page-flip handler thread to exit and join it so it won't be
 	// using the DRM fd while we clean it up. Closing the pipe write end
@@ -2181,6 +2258,15 @@ namespace gamescope
 			if (bGoodRefreshA != bGoodRefreshB)
 				return bGoodRefreshA;
 
+			// Some tvs may report 60hz as their preferred output even
+			// if they support 120hz. Prefer 120hz modes if available.
+			// Still honor preferred mode, above 120hz things might get
+			// funny, such as 360hz. Leave those for manual override.
+			bGoodRefreshA = a.vrefresh >= 120;
+			bGoodRefreshB = b.vrefresh >= 120;
+			if (bGoodRefreshA != bGoodRefreshB)
+				return bGoodRefreshA;
+
 			bool bPreferredA = a.type & DRM_MODE_TYPE_PREFERRED;
 			bool bPreferredB = b.type & DRM_MODE_TYPE_PREFERRED;
 			if (bPreferredA != bPreferredB)
@@ -2232,6 +2318,7 @@ namespace gamescope
 			m_Props.vrr_capable              = CDRMAtomicProperty::Instantiate( "vrr_capable",            this, *rawProperties );
 			m_Props.EDID                     = CDRMAtomicProperty::Instantiate( "EDID",                   this, *rawProperties );
 			m_Props.Broadcast_RGB            = CDRMAtomicProperty::Instantiate( "Broadcast RGB",          this, *rawProperties );
+			m_Props.max_bpc                  = CDRMAtomicProperty::Instantiate( "max bpc",                this, *rawProperties );
 		}
 
 		ParseEDID();
@@ -2371,7 +2458,9 @@ namespace gamescope
 				sol::optional<sol::table> otDynamicRefreshRates = tTable["dynamic_refresh_rates"];
 				sol::optional<sol::function> ofnDynamicModegen = tTable["dynamic_modegen"];
 
-				if ( otDynamicRefreshRates && ofnDynamicModegen )
+				if ( otDynamicRefreshRates && !ofnDynamicModegen )
+					m_Mutable.ValidDynamicRefreshRates = TableToVector<uint32_t>( *otDynamicRefreshRates );
+				else if ( otDynamicRefreshRates && ofnDynamicModegen )
 				{
 					m_Mutable.ValidDynamicRefreshRates = TableToVector<uint32_t>( *otDynamicRefreshRates );
 
@@ -2455,8 +2544,10 @@ namespace gamescope
 			}
 			else
 			{
+				if ( g_customRefreshRates.size() > 0 && GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL )
+					m_Mutable.ValidDynamicRefreshRates = g_customRefreshRates;
 				// Unknown display, see if there are any other refresh rates in the EDID we can get.
-				if ( GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL || cv_drm_allow_dynamic_modes_for_external_display )
+				else if ( GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL  || cv_drm_allow_dynamic_modes_for_external_display )
 				{
 					const drmModeModeInfo *pPreferredMode = find_mode( m_pConnector.get(), 0, 0, 0 );
 
@@ -2550,7 +2641,13 @@ namespace gamescope
 				 pHDRStaticMetadata && pHDRStaticMetadata->eotfs && pHDRStaticMetadata->eotfs->pq )
 			{
 				m_Mutable.HDR.bExposeHDRSupport = true;
-				m_Mutable.HDR.eOutputEncodingEOTF = EOTF_PQ;
+				if (disableInternalPq && GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL)
+					// Current handheld internal displays have issues
+					// with PQ, e.g., Ayaneo 3, Steam Deck etc.
+					// Use Gamma 2.2 as the safest option for now.
+					m_Mutable.HDR.eOutputEncodingEOTF = EOTF_Gamma22;
+				else
+					m_Mutable.HDR.eOutputEncodingEOTF = EOTF_PQ;
 				m_Mutable.HDR.uMaxContentLightLevel =
 					pHDRStaticMetadata->desired_content_max_luminance
 					? nits_to_u16( pHDRStaticMetadata->desired_content_max_luminance )
@@ -2576,25 +2673,10 @@ namespace gamescope
 			hdr_output_metadata defaultHDRMetadata{};
 			hdr_metadata_infoframe *pInfoframe = &defaultHDRMetadata.hdmi_metadata_type1;
 
-			// To be filled in by the app based on the scene, default to desired_content_max_luminance
-			//
-			// Using display's max_fall for the default metadata max_cll to avoid displays
-			// overcompensating with tonemapping for SDR content.
-			uint16_t uDefaultInfoframeLuminances = m_Mutable.HDR.uMaxFrameAverageLuminance;
-
-			pInfoframe->display_primaries[0].x = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.r.x );
-			pInfoframe->display_primaries[0].y = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.r.y );
-			pInfoframe->display_primaries[1].x = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.g.x );
-			pInfoframe->display_primaries[1].y = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.g.y );
-			pInfoframe->display_primaries[2].x = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.b.x );
-			pInfoframe->display_primaries[2].y = color_xy_to_u16( m_Mutable.DisplayColorimetry.primaries.b.y );
-			pInfoframe->white_point.x = color_xy_to_u16( m_Mutable.DisplayColorimetry.white.x );
-			pInfoframe->white_point.y = color_xy_to_u16( m_Mutable.DisplayColorimetry.white.y );
-			pInfoframe->max_display_mastering_luminance = uDefaultInfoframeLuminances;
-			pInfoframe->min_display_mastering_luminance = m_Mutable.HDR.uMinContentLightLevel;
-			pInfoframe->max_cll = uDefaultInfoframeLuminances;
-			pInfoframe->max_fall = uDefaultInfoframeLuminances;
+			// The mastering display and content light levels describe the source, not
+			// this connector. Leave them zero (unknown) until the app supplies them.
 			pInfoframe->eotf = HDMI_EOTF_ST2084;
+			pInfoframe->metadata_type = 0;
 
 			m_Mutable.HDR.pDefaultMetadataBlob = GetBackend()->CreateBackendBlob( defaultHDRMetadata );
 		}
@@ -2649,12 +2731,31 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				return -EINVAL;
 			}
 
-			const int nFence = cv_drm_debug_disable_in_fence_fd ? -1 : g_nAlwaysSignalledSyncFile;
+			int nFence = cv_drm_debug_disable_in_fence_fd ? -1 : g_nAlwaysSignalledSyncFile;
+			if ( !cv_drm_debug_disable_in_fence_fd && pLayer->bufferSync &&
+				pLayer->bufferSync->UsesSyncFileInterop() && !pLayer->bufferSync->IsAcquireFallback() )
+			{
+				nFence = pLayer->bufferSync->DuplicateAcquireSyncFile();
+				if ( nFence < 0 )
+				{
+					pLayer->bufferSync->RecordFailure( "KMS acquire duplication" );
+					return -EINVAL;
+				}
+				drm->m_InFenceFdsInRequest.push_back( nFence );
+			}
+			else if ( !cv_drm_debug_disable_in_fence_fd && pLayer->acquirePoint )
+			{
+				nFence = pLayer->acquirePoint->CreateSyncFile();
+				if ( nFence >= 0 )
+					drm->m_InFenceFdsInRequest.push_back( nFence );
+			}
 
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "FB_ID", pDrmFb->GetFbId());
 			liftoff_layer_set_property( drm->lo_layers[ i ], "IN_FENCE_FD", nFence );
 			drm->m_FbIdsInRequest.emplace_back( pDrmFb );
+			if ( pLayer->bufferSync )
+				drm->m_BufferUsesInRequest.emplace_back( pLayer->bufferSync );
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "zpos", entry.layerState[i].zpos );
 			liftoff_layer_set_property( drm->lo_layers[ i ], "alpha", frameInfo->layers.get( i ).opacity * 0xffff);
@@ -2773,13 +2874,16 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				}
 			}
 
-			if ( drm_supports_color_mgmt( drm ) )
+			if ( drm_supports_blend_tf( drm ) )
 			{
 				if (!cv_drm_debug_disable_blend_tf && !bSinglePlane)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", drm->pending.output_tf );
 				else
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
+			}
 
+			if ( drm_supports_color_mgmt( drm ) )
+			{
 				if (!cv_drm_debug_disable_ctm && frameInfo->layers.get( i ).ctm != nullptr)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", frameInfo->layers.get( i ).ctm->GetBlobValue() );
 				else
@@ -2801,9 +2905,11 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_LUT", 0 );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_TF", 0 );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_LUT3D", 0 );
-				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", 0 );
 			}
+
+			if ( drm_supports_blend_tf( drm ) )
+				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 		}
 	}
 
@@ -2946,6 +3052,88 @@ static void drm_unlink_foreign_planes( struct drm_t *drm )
 	drmModeAtomicFree( req );
 }
 
+/* Takes the link fully down as its own blocking commit, waits for it to settle,
+ * and leaves the caller to bring it back up.
+ *
+ * The point is that the link-up must be a *separate* request. Zeroing CRTC_ID /
+ * ACTIVE / MODE_ID and refilling them in one atomic request leaves it to the
+ * driver to decide whether the link ever really dropped, and nvidia-drm appears
+ * to decide that it did not -- so it never retrains, and we get corruption.
+ *
+ * Returns true if the link is now down and the caller should NOT emit its own
+ * disable pass. On failure the properties are rolled back and we fall through to
+ * the single-request path, which is no worse than not trying.
+ */
+static bool drm_modeset_link_down( struct drm_t *drm )
+{
+	auto ForEachProperty = [ & ]( auto &&func )
+	{
+		for ( auto &iter : drm->connectors )
+			for ( std::optional<gamescope::CDRMAtomicProperty> &oProp : iter.second.GetProperties() )
+				if ( oProp ) func( *oProp );
+		for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
+			for ( std::optional<gamescope::CDRMAtomicProperty> &oProp : pCRTC->GetProperties() )
+				if ( oProp ) func( *oProp );
+		for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
+			for ( std::optional<gamescope::CDRMAtomicProperty> &oProp : pPlane->GetProperties() )
+				if ( oProp ) func( *oProp );
+	};
+
+	// Nothing is lit, so there is no link to drop. Skip the settle rather than
+	// stalling for a second on the way to the first modeset.
+	bool bAnythingActive = false;
+	for ( auto &iter : drm->connectors )
+		bAnythingActive |= iter.second.GetProperties().CRTC_ID->GetCurrentValue() != 0;
+	for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
+		bAnythingActive |= pCRTC->GetProperties().ACTIVE->GetCurrentValue() != 0;
+
+	if ( !bAnythingActive )
+		return false;
+
+	drmModeAtomicReq *pRequest = drmModeAtomicAlloc();
+	if ( !pRequest )
+		return false;
+
+	defer( drmModeAtomicFree( pRequest ) );
+
+	for ( auto &iter : drm->connectors )
+		iter.second.GetProperties().CRTC_ID->SetPendingValue( pRequest, 0, true );
+
+	for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
+	{
+		pCRTC->GetProperties().ACTIVE->SetPendingValue( pRequest, 0, true );
+		pCRTC->GetProperties().MODE_ID->SetPendingValue( pRequest, 0, true );
+	}
+
+	for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
+	{
+		pPlane->GetProperties().FB_ID->SetPendingValue( pRequest, 0, true );
+		pPlane->GetProperties().CRTC_ID->SetPendingValue( pRequest, 0, true );
+	}
+
+	// Blocking on purpose: the whole point is that this lands before the link
+	// comes back up.
+	int ret = drmModeAtomicCommit( drm->fd, pRequest, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr );
+	if ( ret != 0 )
+	{
+		// -EACCES just means we are VT-switched away; our caller handles that.
+		if ( ret != -EACCES )
+			drm_log.errorf_errno( "drm_modeset_link_down: commit failed, falling back to a single-request modeset" );
+
+		ForEachProperty( []( gamescope::CDRMAtomicProperty &prop ){ prop.Rollback(); } );
+		return false;
+	}
+
+	ForEachProperty( []( gamescope::CDRMAtomicProperty &prop ){ prop.OnCommit(); } );
+
+	const int nSettleMs = std::max( 0, cv_drm_modeset_link_down_settle_ms.Get() );
+	drm_log.debugf( "drm_modeset_link_down: link down, settling for %dms", nSettleMs );
+	if ( nSettleMs > 0 )
+		std::this_thread::sleep_for( std::chrono::milliseconds( nSettleMs ) );
+
+	return true;
+}
+
 /* Prepares an atomic commit for the provided scene-graph. Returns 0 on success,
  * negative errno on failure or if the scene-graph can't be presented directly. */
 int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
@@ -2965,9 +3153,14 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			drm->needs_modeset = true;
 	}
 
+	if (drm->pCRTC && drm->pCRTC->GetProperties().ACTIVE->GetCurrentValue() != !frameInfo->dpms)
+		drm->needs_modeset = true;
+
 	drm_colorspace uColorimetry = DRM_MODE_COLORIMETRY_DEFAULT;
 
 	const bool bWantsHDR10 = g_bOutputHDREnabled && frameInfo->outputEncodingEOTF == EOTF_PQ;
+	// Request only the color depth needed by the active output encoding.
+	const uint64_t uMaxBpc = bWantsHDR10 ? 10u : 8u;
 	gamescope::BackendBlob *pHDRMetadata = nullptr;
 	if ( drm->pConnector && drm->pConnector->SupportsHDR10() )
 	{
@@ -2990,7 +3183,13 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			drm->needs_modeset = true;
 	}
 
+	if ( drm->pConnector && drm->pConnector->GetProperties().max_bpc &&
+		 uMaxBpc != drm->pConnector->GetProperties().max_bpc->GetCurrentValue() )
+		drm->needs_modeset = true;
+
 	drm->m_FbIdsInRequest.clear();
+	drm->m_BufferUsesInRequest.clear();
+	drm_close_in_fences( drm );
 
 	bool needs_modeset = drm->needs_modeset.exchange(false);
 
@@ -3032,6 +3231,9 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			needs_modeset = true;
 	}
 
+	if ( frameInfo->dpms )
+		bSleep = true;
+
 	if ( !bSleep )
 	{
 		if ( drm->pCRTC != nullptr )
@@ -3049,7 +3251,28 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 		drm_unlink_foreign_planes( drm );
 
+		// Some drivers mishandle disabling and refilling in a single request, and
+		// need the link to come down as its own commit first.
+		//
+		// If that worked, the disable pass below must NOT run: re-adding the
+		// zeroes to this request would rebuild exactly the disable-then-refill
+		// pattern we just went out of our way to avoid.
+		// -1 follows the driver quirk; 0 and 1 are the user overriding us. The
+		// override has to be able to turn this ON, not just off -- it is also a
+		// workaround for sinks that will not retrain properly, which is a
+		// property of the display, not the GPU.
+		const int nLinkDownMode = cv_drm_modeset_link_down;
+		const bool bWantLinkDown =
+			nLinkDownMode > 0 ||
+			( nLinkDownMode < 0 && drm->vendorQuirks.bNeedsModesetLinkDown );
+
+		const bool bLinkTakenDown = bWantLinkDown && drm_modeset_link_down( drm );
+
 		// Disable all connectors and CRTCs
+		// (Body deliberately left at its original indentation -- reindenting it
+		//  would conflict against every upstream change to these loops.)
+		if ( !bLinkTakenDown )
+		{
 
 		for ( auto &iter : drm->connectors )
 		{
@@ -3101,6 +3324,8 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 				pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( drm->req, 0, bForceInRequest );
 		}
 
+		} // !bLinkTakenDown
+
 		if ( drm->pConnector && !bSleep )
 		{
 			// Always set our CRTC_ID for the modeset, especially
@@ -3113,7 +3338,13 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 		if ( drm->pCRTC && !bSleep )
 		{
-			drm->pCRTC->GetProperties().ACTIVE->SetPendingValue( drm->req, 1u, true );
+			if ( frameInfo->dpms ) {
+				// We can't disable a CRTC if it's already disabled
+				if (drm->pCRTC->GetProperties().ACTIVE->GetCurrentValue() != 0)
+					drm->pCRTC->GetProperties().ACTIVE->SetPendingValue(drm->req, 0, true);
+			}
+			else
+				drm->pCRTC->GetProperties().ACTIVE->SetPendingValue( drm->req, 1u, true );
 			drm->pCRTC->GetProperties().MODE_ID->SetPendingValue( drm->req, drm->pending.mode_id ? drm->pending.mode_id->GetBlobValue() : 0lu, true );
 
 			// Clear color properties inherited from a previous DRM master (i.e. KDE's
@@ -3139,6 +3370,9 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 		if ( drm->pConnector->GetProperties().content_type )
 			drm->pConnector->GetProperties().content_type->SetPendingValue( drm->req, DRM_MODE_CONTENT_TYPE_GAME, bForceInRequest );
+
+		if ( drm->pConnector->GetProperties().max_bpc )
+			drm->pConnector->GetProperties().max_bpc->SetPendingValue( drm->req, uMaxBpc, bForceInRequest );
 
 		GamescopeBroadcastRGBMode_t eBroadcastRGB = drm->pConnector->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL
 			? s_ExternalBroadcastRGBMode
@@ -3177,6 +3411,8 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 		drm->req = nullptr;
 
 		drm->m_FbIdsInRequest.clear();
+		drm->m_BufferUsesInRequest.clear();
+		drm_close_in_fences( drm );
 
 		if ( needs_modeset )
 			drm->needs_modeset = true;
@@ -3373,6 +3609,9 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 	g_nOutputRefresh = gamescope::GetModeRefresh( mode );
 	g_nDynamicRefreshHz = 0;
 
+	g_nsVsync = gamescope::GetVblankNs( mode );
+	drm_log.infof("Vblank ns: %lu", g_nsVsync);
+
 	update_drm_effective_orientations(drm, mode);
 
 	// 90/270 transpose the output (g_bRotated); 180 flips in place.
@@ -3535,6 +3774,12 @@ std::pair<uint32_t, uint32_t> drm_get_connector_identifier(struct drm_t *drm)
 	return std::make_pair(drm->pConnector->GetModeConnector()->connector_type, drm->pConnector->GetModeConnector()->connector_type_id);
 }
 
+// Per-plane colour conversion: degamma, shaper LUT, 3D LUT and CTM.
+//
+// Deliberately does NOT include BLEND_TF. That is a separate capability, and
+// hardware exists that has everything here but not that; gating the whole
+// pipeline on it costs those cards degamma, shaper, 3D LUT and CTM for no
+// reason. Ask drm_supports_blend_tf() for that one.
 bool drm_supports_color_mgmt(struct drm_t *drm)
 {
 	if ( g_bForceDisableColorMgmt )
@@ -3543,7 +3788,23 @@ bool drm_supports_color_mgmt(struct drm_t *drm)
 	if ( !drm->pPrimaryPlane )
 		return false;
 
-	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_CTM.has_value() && drm->pPrimaryPlane->GetProperties().AMD_PLANE_BLEND_TF.has_value();
+	const auto &props = drm->pPrimaryPlane->GetProperties();
+	return props.AMD_PLANE_CTM.has_value()
+		&& props.AMD_PLANE_DEGAMMA_TF.has_value()
+		&& props.AMD_PLANE_SHAPER_LUT.has_value()
+		&& props.AMD_PLANE_LUT3D.has_value();
+}
+
+// The blend-space transfer function, asked for on its own.
+bool drm_supports_blend_tf(struct drm_t *drm)
+{
+	if ( g_bForceDisableColorMgmt )
+		return false;
+
+	if ( !drm->pPrimaryPlane )
+		return false;
+
+	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_BLEND_TF.has_value();
 }
 
 std::span<const uint32_t> drm_get_valid_refresh_rates( struct drm_t *drm )
@@ -3573,19 +3834,48 @@ namespace gamescope
 
 		virtual bool Init() override
 		{
-			if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
-			{
-				fprintf( stderr, "Failed to initialize Vulkan\n" );
-				return false;
-			}
-
 			if ( !wlsession_init() )
 			{
 				fprintf( stderr, "Failed to initialize Wayland session\n" );
 				return false;
 			}
 
-			return init_drm( &g_DRM, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh );
+			const auto connector_priorities = parse_connector_priorities( g_sOutputName );
+			int kms_fd = wlsession_open_kms( nullptr, get_best_connector_priority_for_fd, &connector_priorities );
+			if ( kms_fd < 0 )
+			{
+				fprintf( stderr, "Failed to select KMS device\n" );
+				return false;
+			}
+
+			struct stat fd_stat = {};
+			if ( fstat( kms_fd, &fd_stat ) != 0 )
+			{
+				drm_log.errorf_errno( "Failed to identify selected KMS device" );
+				return false;
+			}
+
+			drmDevice *drm_device = nullptr;
+			if ( drmGetDeviceFromDevId( fd_stat.st_rdev, 0, &drm_device ) != 0 ||
+			     drm_device->bustype != DRM_BUS_PCI || !drm_device->deviceinfo.pci )
+			{
+				drm_log.errorf( "Selected KMS device has no PCI identity" );
+				if ( drm_device )
+					drmFreeDevice( &drm_device );
+				return false;
+			}
+
+			g_preferVendorID = drm_device->deviceinfo.pci->vendor_id;
+			g_preferDeviceID = drm_device->deviceinfo.pci->device_id;
+			drmFreeDevice( &drm_device );
+
+			if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
+			{
+				fprintf( stderr, "Failed to initialize Vulkan\n" );
+				return false;
+			}
+
+			return init_drm( &g_DRM, kms_fd, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh );
 		}
 
 		virtual bool PostInit() override
@@ -3629,9 +3919,15 @@ namespace gamescope
 
 			bool bWantsPartialComposite = pFrameInfo->layers.count() >= 3 && !kDisablePartialComposition;
 
-			static bool s_bWasFirstFrame = true;
-			bool bWasFirstFrame = s_bWasFirstFrame;
-			s_bWasFirstFrame = false;
+			// Held until a commit actually lands, so a first frame after resume
+			// that fails to commit still composites on the next attempt rather
+			// than being consumed by one that never reached the screen.
+			const bool bWasFirstFrame = m_bNeedsFirstFrameComposite.exchange( false );
+			bool bFirstFrameCommitted = false;
+			defer(
+				if ( bWasFirstFrame && !bFirstFrameCommitted )
+					m_bNeedsFirstFrameComposite = true;
+			);
 
 			bool bDrewCursor = false;
 			for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
@@ -3640,6 +3936,67 @@ namespace gamescope
 				{
 					bDrewCursor = true;
 					break;
+				}
+			}
+
+			FrameInfo_t fsrScanoutFrameInfo;
+			const FrameInfo_t::Layer_t &fsrBaseLayer = pFrameInfo->layers.get( 0 );
+			const bool bCanPreprocessFsrBase =
+				pFrameInfo->useFSRLayer0 &&
+				pFrameInfo->layers.count() > 1 &&
+				!cv_composite_force &&
+				!bWasFirstFrame &&
+				!pFrameInfo->useNISLayer0 &&
+				!pFrameInfo->useSGSRLayer0 &&
+				!pFrameInfo->useBCASLayer0 &&
+				!pFrameInfo->useXBRLayer0 &&
+				!pFrameInfo->useAnime4KLayer0 &&
+				!pFrameInfo->blurLayer0 &&
+				!pFrameInfo->bFadingOut &&
+				!g_bColorSliderInUse &&
+				!g_bHDRItmEnable &&
+				!g_bOutputHDREnabled &&
+				g_uCompositeDebug == 0 &&
+				( cv_drm_cursor_plane || !bDrewCursor ) &&
+				pFrameInfo->outputEncodingEOTF == EOTF_Gamma22 &&
+				( !pFrameInfo->applyOutputColorMgmt || SupportsColorManagement() ) &&
+				close_enough( fsrBaseLayer.opacity, 1.0f ) &&
+				( fsrBaseLayer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR ||
+				  fsrBaseLayer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB );
+
+			if ( bCanPreprocessFsrBase )
+			{
+				// Run FSR on the base plane only. Keep it in the source SDR space so
+				// KMS can apply the same per-plane color management as direct scanout.
+				FrameInfo_t fsrBaseFrameInfo = {};
+				fsrBaseFrameInfo.useFSRLayer0 = true;
+				fsrBaseFrameInfo.applyOutputColorMgmt = true;
+				fsrBaseFrameInfo.outputEncodingEOTF = EOTF_Gamma22;
+				*fsrBaseFrameInfo.layers.push() = fsrBaseLayer;
+				fsrBaseFrameInfo.layers.get( 0 ).ctm = nullptr;
+
+				std::optional<uint64_t> oFsrResult = vulkan_composite( &fsrBaseFrameInfo, nullptr, false );
+				if ( oFsrResult )
+				{
+					vulkan_wait( *oFsrResult, true );
+
+					fsrScanoutFrameInfo = *pFrameInfo;
+					fsrScanoutFrameInfo.useFSRLayer0 = false;
+
+					FrameInfo_t::Layer_t &scanoutBaseLayer = fsrScanoutFrameInfo.layers.get( 0 );
+					scanoutBaseLayer.tex = vulkan_get_last_output_image( false, false );
+					scanoutBaseLayer.offset = { 0.0f, 0.0f };
+					scanoutBaseLayer.scale = { 1.0f, 1.0f };
+					scanoutBaseLayer.opacity = 1.0f;
+					scanoutBaseLayer.blackBorder = false;
+					scanoutBaseLayer.filter = GamescopeUpscaleFilter::NEAREST;
+					scanoutBaseLayer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+					scanoutBaseLayer.eAlphaBlendingMode = ALPHA_BLENDING_MODE_NONE;
+
+					// From here, normal plane assignment can scan out the FSR result and
+					// keep compatible overlays and the cursor on hardware planes. If it
+					// fails, the compositor reuses this base without executing FSR again.
+					pFrameInfo = &fsrScanoutFrameInfo;
 				}
 			}
 
@@ -3652,12 +4009,26 @@ namespace gamescope
 			bNeedsFullComposite |= bWasFirstFrame;
 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;
+			bNeedsFullComposite |= pFrameInfo->useSGSRLayer0;
+			bNeedsFullComposite |= pFrameInfo->useBCASLayer0;
+			bNeedsFullComposite |= pFrameInfo->useXBRLayer0;
+			bNeedsFullComposite |= pFrameInfo->useAnime4KLayer0;
 			bNeedsFullComposite |= pFrameInfo->blurLayer0;
 			bNeedsFullComposite |= bNeedsCompositeFromFilter;
 			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
-			bNeedsFullComposite |= !g_reshade_effect.empty();
+
+			if ( !SupportsColorManagement() ) {
+				// Fuzzy match default values to see if we need to composite
+				bNeedsFullComposite |= g_ColorMgmt.pending.nightmode.amount != 0.0f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.x > 0 &&
+					abs(g_ColorMgmt.pending.outputVirtualWhite.x - 0.3127f) > 0.001f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.y > 0 &&
+					abs(g_ColorMgmt.pending.outputVirtualWhite.y - 0.3290f) > 0.001f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.sdrGamutWideness >= 0 &&
+					abs(g_ColorMgmt.pending.sdrGamutWideness - 0.5f) > 0.02f;
+			}
 
 			if ( g_bOutputHDREnabled )
 			{
@@ -3700,7 +4071,9 @@ namespace gamescope
 				if ( pFrameInfo->layers.count() == 2 )
 					m_nLastSingleOverlayZPos = pFrameInfo->layers.get( 1 ).zpos;
 
-				return Commit( pFrameInfo );
+				int ret = Commit( pFrameInfo );
+				bFirstFrameCommitted = ret == 0;
+				return ret;
 			}
 
 			// Composition Path
@@ -3785,6 +4158,7 @@ namespace gamescope
 
 			FrameInfo_t presentCompFrameInfo = {};
 			presentCompFrameInfo.allowVRR = pFrameInfo->allowVRR;
+			presentCompFrameInfo.dpms = pFrameInfo->dpms;
 			presentCompFrameInfo.outputEncodingEOTF = pFrameInfo->outputEncodingEOTF;
 
 			if ( bNeedsFullComposite )
@@ -3903,15 +4277,21 @@ namespace gamescope
 				}
 			}
 
-			return Commit( &compositeFrameInfo );
+			ret = Commit( &compositeFrameInfo );
+			bFirstFrameCommitted = ret == 0;
+			return ret;
 		}
 
 		virtual void DirtyState( bool bForce, bool bForceModeset ) override
 		{
+			const bool bPaused = !wlsession_active();
+			const bool bWasPaused = g_DRM.paused.exchange( bPaused );
+			if ( bWasPaused && !bPaused )
+				m_bNeedsFirstFrameComposite = true;
+
 			if ( bForceModeset )
 				g_DRM.needs_modeset = true;
 			g_DRM.out_of_date = std::max<int>( g_DRM.out_of_date, bForce ? 2 : 1 );
-			g_DRM.paused = !wlsession_active();
 		}
 
 		virtual bool PollState() override
@@ -3946,6 +4326,23 @@ namespace gamescope
 		virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) override
 		{
 			return drm_fbid_from_dmabuf( &g_DRM, pDmaBuf );
+		}
+
+		virtual bool UsesBackendAllocatedScanout() const override
+		{
+			return g_DRM.gbmAllocator.IsAvailable();
+		}
+
+		virtual bool RequiresBackendAllocatedScanout() const override
+		{
+			return true;
+		}
+
+		virtual bool CreateScanoutDmabuf( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,
+		                                  std::span<const uint64_t> ulModifiers,
+		                                  wlr_dmabuf_attributes *pDmaBuf ) override
+		{
+			return g_DRM.gbmAllocator.CreateScanoutDmabuf( uWidth, uHeight, uDrmFormat, ulModifiers, pDmaBuf );
 		}
 
 		virtual bool UsesModifiers() const override
@@ -4063,6 +4460,7 @@ namespace gamescope
 		}
 
 	private:
+		std::atomic<bool> m_bNeedsFirstFrameComposite = true;
 		bool m_bWasCompositing = false;
 		bool m_bWasPartialCompositing = false;
 		int m_nLastSingleOverlayZPos = 0;
@@ -4072,7 +4470,11 @@ namespace gamescope
 
 		bool SupportsColorManagement() const
 		{
-			return drm_supports_color_mgmt( &g_DRM );
+			// Stricter than drm_supports_color_mgmt() on purpose. This only
+			// decides whether the planes can handle HDR without compositing,
+			// and blending several layers in the wrong space is exactly what
+			// BLEND_TF is for. Without it, keep forcing the composite.
+			return drm_supports_color_mgmt( &g_DRM ) && drm_supports_blend_tf( &g_DRM );
 		}
 
 		int Commit( const FrameInfo_t *pFrameInfo )
@@ -4097,6 +4499,7 @@ namespace gamescope
 				// Swap over request FDs -> Queue
 				std::unique_lock lock( drm->m_QueuedFbIdsMutex );
 				drm->m_QueuedFbIds.swap( drm->m_FbIdsInRequest );
+				drm->m_QueuedBufferUses.swap( drm->m_BufferUsesInRequest );
 			}
 
 			GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents++;
@@ -4104,11 +4507,14 @@ namespace gamescope
 			uint32_t uCurrentPresentCtx = m_uNextPresentCtx;
 			m_uNextPresentCtx = ( m_uNextPresentCtx + 1 ) % 3;
 			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents;
+			m_PresentCtxs[uCurrentPresentCtx].frameGenerationOutputId =
+				pFrameInfo->frameGenerationOutputId;
 
 			drm_log.debugf("flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents);
 			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents );
 
 			ret = drmModeAtomicCommit(drm->fd, drm->req, drm->flags, &m_PresentCtxs[uCurrentPresentCtx] );
+			drm_close_in_fences( drm );
 			if ( ret != 0 )
 			{
 				drm_log.errorf_errno( "flip error" );
@@ -4128,9 +4534,11 @@ namespace gamescope
 				{
 					std::unique_lock lock( drm->m_QueuedFbIdsMutex );
 					drm->m_QueuedFbIds.swap( drm->m_FbIdsInRequest );
+					drm->m_QueuedBufferUses.swap( drm->m_BufferUsesInRequest );
 				}
 				// Clear our refs.
 				drm->m_FbIdsInRequest.clear();
+				drm->m_BufferUsesInRequest.clear();
 
 				GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents--;
 
@@ -4142,6 +4550,7 @@ namespace gamescope
 				// Our request went through!
 				// Clear what we swapped with (what was previously queued)
 				drm->m_FbIdsInRequest.clear();
+				drm->m_BufferUsesInRequest.clear();
 
 				drm->current = drm->pending;
 

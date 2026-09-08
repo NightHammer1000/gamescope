@@ -1,0 +1,129 @@
+// This file is part of the FidelityFX SDK integration in Gamescope.
+//
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
+// Copyright (C) 2026 Gamescope contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_OPTICAL_FLOW_MOTION_VECTOR_FIELD_X 0
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_OPTICAL_FLOW_MOTION_VECTOR_FIELD_Y 1
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_OPTICAL_FLOW_SCENE_CHANGE_DETECTION 4
+#define FFX_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION                  7
+
+layout(set = 0, binding = 2) uniform utexture2D r_previous_luma;
+layout(set = 0, binding = 3) uniform utexture2D r_current_luma;
+layout(set = 0, binding = 5) uniform texture2D r_previous_gui_mask;
+layout(set = 0, binding = 6, r8) uniform writeonly image2D rw_current_gui_mask;
+
+#include "frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h"
+#include "frameinterpolation/ffx_frameinterpolation_common.h"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+float lumaDifference(float a, float b)
+{
+    return clamp(abs(a - b) / max(max(abs(a), abs(b)), 0.04), 0.0, 1.0);
+}
+
+float loadPreviousLuma(ivec2 pixel)
+{
+    const ivec2 maximum = textureSize(r_previous_luma, 0) - 1;
+    return float(texelFetch(r_previous_luma, clamp(pixel, ivec2(0), maximum), 0).r) / 255.0;
+}
+
+float loadCurrentLuma(ivec2 pixel)
+{
+    const ivec2 maximum = textureSize(r_current_luma, 0) - 1;
+    return float(texelFetch(r_current_luma, clamp(pixel, ivec2(0), maximum), 0).r) / 255.0;
+}
+
+float samplePreviousLuma(vec2 uv)
+{
+    return loadPreviousLuma(ivec2(uv * vec2(textureSize(r_previous_luma, 0))));
+}
+
+float sampleCurrentLuma(vec2 uv)
+{
+    return loadCurrentLuma(ivec2(uv * vec2(textureSize(r_current_luma, 0))));
+}
+
+float guiCandidate(ivec2 pixel, vec2 motionPixels,
+    float previousWarped, float currentWarped)
+{
+    const ivec2 size = textureSize(r_current_luma, 0);
+    if (any(lessThanEqual(pixel, ivec2(2))) ||
+        any(greaterThanEqual(pixel, size - 3)))
+        return 0.0;
+
+    const float previousScreen = loadPreviousLuma(pixel);
+    const float currentScreen = loadCurrentLuma(pixel);
+    const float screenResidual = lumaDifference(previousScreen, currentScreen);
+    const float screenStability = 1.0 - smoothstep(0.008, 0.035, screenResidual);
+
+    float localContrast = 0.0;
+    localContrast = max(localContrast, lumaDifference(currentScreen, loadCurrentLuma(pixel + ivec2( 2,  0))));
+    localContrast = max(localContrast, lumaDifference(currentScreen, loadCurrentLuma(pixel + ivec2(-2,  0))));
+    localContrast = max(localContrast, lumaDifference(currentScreen, loadCurrentLuma(pixel + ivec2( 0,  2))));
+    localContrast = max(localContrast, lumaDifference(currentScreen, loadCurrentLuma(pixel + ivec2( 0, -2))));
+
+    const float edgeConfidence = smoothstep(0.035, 0.16, localContrast);
+    const float sceneMotion = smoothstep(0.35, 1.75, length(motionPixels));
+    const float warpedInstability = smoothstep(0.08, 0.28,
+        lumaDifference(previousWarped, currentWarped));
+    return screenStability * edgeConfidence * sceneMotion * warpedInstability;
+}
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 maskSize = imageSize(rw_current_gui_mask);
+    if (any(greaterThanEqual(pixel, maskSize)))
+        return;
+
+    if (HasSceneChanged() || Reset())
+    {
+        imageStore(rw_current_gui_mask, pixel, vec4(0.0));
+        return;
+    }
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(maskSize);
+    VectorFieldEntry field;
+    SampleOpticalFlowMotionVectorField(uv, field);
+
+    const vec2 previousUv = clamp(uv + field.fMotionVector, vec2(0.0), vec2(1.0));
+    const vec2 currentUv = clamp(uv - field.fMotionVector, vec2(0.0), vec2(1.0));
+    const float previousWarped = samplePreviousLuma(previousUv);
+    const float currentWarped = sampleCurrentLuma(currentUv);
+
+    float candidate = guiCandidate(pixel,
+        field.fMotionVector * vec2(DisplaySize()), previousWarped, currentWarped);
+    if (isnan(candidate) || isinf(candidate))
+        candidate = 0.0;
+    candidate = smoothstep(0.55, 0.90, clamp(candidate, 0.0, 1.0));
+
+    const float previousHistory = texelFetch(r_previous_gui_mask, pixel, 0).r;
+    const float attackedHistory = mix(previousHistory, candidate, 0.65);
+    const float currentHistory = max(attackedHistory, previousHistory * 0.88);
+    imageStore(rw_current_gui_mask, pixel, vec4(currentHistory, 0.0, 0.0, 0.0));
+}

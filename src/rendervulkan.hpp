@@ -17,10 +17,16 @@
 
 #include "gamescope_shared.h"
 #include "backend.h"
+#include "Timeline.h"
 
 #include "shaders/descriptor_set_constants.h"
 
 class CVulkanCmdBuffer;
+
+namespace gamescope
+{
+	class CCommitBufferSync;
+}
 
 // 1: Fade Plane (Fade outs between switching focus)
 // 2: Video Underlay (The actual video)
@@ -211,6 +217,7 @@ private:
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
 	bool m_bOutputImage = false;
+	bool m_bOwnsImage = false;
 
 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;
 
@@ -282,6 +289,10 @@ struct FrameInfo_t
 {
 	bool useFSRLayer0;
 	bool useNISLayer0;
+	bool useSGSRLayer0;
+	bool useBCASLayer0;
+	bool useXBRLayer0;
+	bool useAnime4KLayer0;
 	bool bFadingOut;
 	BlurMode blurLayer0;
 	int blurRadius;
@@ -290,8 +301,12 @@ struct FrameInfo_t
 	gamescope::Rc<CVulkanTexture> lut3D[EOTF_Count];
 
 	bool allowVRR;
+	bool frameGenerationActive = false;
+	uint64_t frameGenerationOutputId = 0;
 	bool applyOutputColorMgmt; // drm only
 	EOTF outputEncodingEOTF;
+
+	bool dpms = false;
 
 	struct Layer_t
 	{
@@ -312,6 +327,8 @@ struct FrameInfo_t
 
 		std::shared_ptr<gamescope::BackendBlob> ctm;
 		std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
+		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
+		std::shared_ptr<gamescope::CCommitBufferSync> bufferSync;
 
 		GamescopeAppTextureColorspace colorspace;
 
@@ -450,14 +467,72 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr );
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride = nullptr );
+
+void vulkan_frame_generation_apply( FrameInfo_t *frameInfo,
+	gamescope::Rc<CVulkanTexture> rawSource, uint64_t sourceId, uint32_t appId,
+	bool prepareOnly = false );
+bool vulkan_frame_generation_has_pending_frame();
+bool vulkan_frame_generation_is_draining();
+bool vulkan_frame_generation_can_request_source_frame();
+bool vulkan_frame_generation_can_accept_source_frame();
+bool vulkan_frame_generation_drop_stale_generated_frame(
+	uint64_t now, uint64_t deadline, uint64_t interval );
+bool vulkan_frame_generation_last_presented_generated();
+void vulkan_frame_generation_reset();
+
+struct FrameGenerationGpuTimings
+{
+	double prepareLumaMilliseconds = 0.0;
+	double luminancePyramidMilliseconds = 0.0;
+	double sceneChangeMilliseconds = 0.0;
+	double opticalFlowSearchMilliseconds = 0.0;
+	double opticalFlowFilterMilliseconds = 0.0;
+	double opticalFlowScaleMilliseconds = 0.0;
+	double guiMaskMilliseconds = 0.0;
+	double midpointMilliseconds = 0.0;
+	double inpaintingPyramidMilliseconds = 0.0;
+	double inpaintingMilliseconds = 0.0;
+	double outputCompositeMilliseconds = 0.0;
+	double preparationAndPyramidMilliseconds = 0.0;
+	double searchAndFilterMilliseconds = 0.0;
+	double vectorFieldMilliseconds = 0.0;
+	double interpolationAndInpaintingMilliseconds = 0.0;
+	double generatedFsrMilliseconds = 0.0;
+	double totalMilliseconds = 0.0;
+};
+
+struct FrameGenerationTelemetry
+{
+	FrameGenerationGpuTimings gpu;
+	uint64_t sourceFrames = 0;
+	uint64_t sourceCallbacks = 0;
+	uint64_t sourceCallbacksBlocked = 0;
+	uint64_t outputSlots = 0;
+	uint64_t outputSlotsWithoutPending = 0;
+	uint64_t queueUnderruns = 0;
+	uint64_t repeatedRealFrames = 0;
+	uint64_t generatedFrames = 0;
+	uint64_t presentedGeneratedFrames = 0;
+	uint64_t presentedRealFrames = 0;
+	uint64_t deadlineDroppedFrames = 0;
+	uint64_t sceneCutCopies = 0;
+	double sourceFrameIntervalMilliseconds = 0.0;
+	uint32_t queuedFrames = 0;
+	uint32_t flowScalePercent = 75;
+	uint32_t sourceCadenceHz = 0;
+	uint32_t outputCadenceHz = 0;
+};
+FrameGenerationTelemetry vulkan_frame_generation_get_telemetry();
+void vulkan_frame_generation_note_source_callback( bool blocked );
+void vulkan_frame_generation_note_output_slot( bool hasPendingFrame );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 uint32_t vulkan_get_rgb10_capture_format( void );
 
-void vulkan_present_to_window( void );
+void vulkan_present_to_window( uint64_t frameGenerationOutputId );
 
 void vulkan_garbage_collect( void );
 bool vulkan_remake_swapchain( void );
@@ -590,17 +665,37 @@ struct VulkanOutput_t
 	// NIS
 	gamescope::OwningRc<CVulkanTexture> nisScalerImage;
 	gamescope::OwningRc<CVulkanTexture> nisUsmImage;
+
+	// Anime4K CNN feature ping-pong buffers, at source resolution.
+	std::array<gamescope::OwningRc<CVulkanTexture>, 2> anime4kFeatures;
 };
 
 
 enum ShaderType {
 	SHADER_TYPE_BLIT = 0,
+	SHADER_TYPE_BLIT_RGB10A2,
 	SHADER_TYPE_BLUR,
 	SHADER_TYPE_BLUR_COND,
 	SHADER_TYPE_BLUR_FIRST_PASS,
 	SHADER_TYPE_EASU,
+	SHADER_TYPE_EASU_RGBA16F,
 	SHADER_TYPE_RCAS,
+	SHADER_TYPE_RCAS_FP16,
+	SHADER_TYPE_RCAS_RGBA16F,
+	SHADER_TYPE_RCAS_RGB10A2,
 	SHADER_TYPE_NIS,
+	SHADER_TYPE_SGSR,
+	SHADER_TYPE_XBR,
+	SHADER_TYPE_BICUBIC,
+	SHADER_TYPE_BICUBIC_RGBA16F,
+	SHADER_TYPE_CAS,
+	SHADER_TYPE_CAS_RGBA16F,
+	SHADER_TYPE_CAS_RGB10A2,
+	SHADER_TYPE_ANIME4K_CONV0,
+	SHADER_TYPE_ANIME4K_CONV1,
+	SHADER_TYPE_ANIME4K_CONV2,
+	SHADER_TYPE_ANIME4K_CONV3,
+	SHADER_TYPE_ANIME4K_D2S,
 	SHADER_TYPE_RGB_TO_NV12,
 
 	SHADER_TYPE_COUNT
@@ -651,6 +746,7 @@ struct PipelineInfo_t
 	uint32_t colorspaceMask;
 	uint32_t outputEOTF;
 	bool itmEnable;
+	bool fsrSimpleOutput;
 
 	bool operator==(const PipelineInfo_t& o) const {
 		return
@@ -661,7 +757,8 @@ struct PipelineInfo_t
 		compositeDebug == o.compositeDebug &&
 		colorspaceMask == o.colorspaceMask &&
 		outputEOTF == o.outputEOTF &&
-		itmEnable == o.itmEnable;
+		itmEnable == o.itmEnable &&
+		fsrSimpleOutput == o.fsrSimpleOutput;
 	}
 };
 
@@ -685,6 +782,7 @@ namespace std
 			hash = hash_combine(hash, k.colorspaceMask);
 			hash = hash_combine(hash, k.outputEOTF);
 			hash = hash_combine(hash, k.itmEnable);
+			hash = hash_combine(hash, k.fsrSimpleOutput);
 			return hash;
 		}
 	};
@@ -732,6 +830,8 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdEndRendering) \
 	VK_FUNC(CmdPipelineBarrier) \
 	VK_FUNC(CmdPushConstants) \
+	VK_FUNC(CmdResetQueryPool) \
+	VK_FUNC(CmdWriteTimestamp) \
 	VK_FUNC(CreateBuffer) \
 	VK_FUNC(CreateCommandPool) \
 	VK_FUNC(CreateComputePipelines) \
@@ -742,6 +842,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CreateImage) \
 	VK_FUNC(CreateImageView) \
 	VK_FUNC(CreatePipelineLayout) \
+	VK_FUNC(CreateQueryPool) \
 	VK_FUNC(CreateSampler) \
 	VK_FUNC(CreateSamplerYcbcrConversion) \
 	VK_FUNC(CreateSemaphore) \
@@ -757,7 +858,9 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(DestroyPipeline) \
 	VK_FUNC(DestroySemaphore) \
 	VK_FUNC(DestroyPipelineLayout) \
+	VK_FUNC(DestroyQueryPool) \
 	VK_FUNC(DestroySampler) \
+	VK_FUNC(DestroyShaderModule) \
 	VK_FUNC(DestroySwapchainKHR) \
 	VK_FUNC(EndCommandBuffer) \
 	VK_FUNC(FreeCommandBuffers) \
@@ -769,6 +872,8 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(GetImageMemoryRequirements) \
 	VK_FUNC(GetImageSubresourceLayout) \
 	VK_FUNC(GetMemoryFdKHR) \
+	VK_FUNC(GetQueryPoolResults) \
+	VK_FUNC(GetMemoryFdPropertiesKHR) \
 	VK_FUNC(GetSemaphoreCounterValue) \
 	VK_FUNC(GetSwapchainImagesKHR) \
 	VK_FUNC(MapMemory) \
@@ -776,7 +881,9 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(QueueSubmit) \
 	VK_FUNC(QueueWaitIdle) \
 	VK_FUNC(ResetCommandBuffer) \
+	VK_FUNC(ResetDescriptorPool) \
 	VK_FUNC(ResetFences) \
+	VK_FUNC(SignalSemaphore) \
 	VK_FUNC(UnmapMemory) \
 	VK_FUNC(UpdateDescriptorSets) \
 	VK_FUNC(WaitForFences) \
@@ -799,6 +906,25 @@ struct VulkanTimelineSemaphore_t
 	VkSemaphore pVkSemaphore = VK_NULL_HANDLE;
 
 	int GetFd() const;
+	bool Signal( uint64_t ulPoint ) const;
+};
+
+struct VulkanBinarySemaphore_t
+{
+	~VulkanBinarySemaphore_t();
+
+	CVulkanDevice *pDevice = nullptr;
+	VkSemaphore pVkSemaphore = VK_NULL_HANDLE;
+};
+
+struct VulkanTimelineSyncFile_t
+{
+	~VulkanTimelineSyncFile_t();
+
+	std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore;
+	int nSyncFileFd = -1;
+
+	int DuplicateSyncFile() const;
 };
 
 struct VulkanTimelinePoint_t
@@ -813,23 +939,26 @@ public:
 	bool BInit(VkInstance instance, VkSurfaceKHR surface);
 
 	VkSampler sampler(SamplerState key);
-	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false);
+	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false, bool fsr_simple_output = false);
 	int32_t findMemoryType( VkMemoryPropertyFlags properties, uint32_t requiredTypeBits );
 	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
 	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
 	void wait(uint64_t sequence, bool reset = true);
+	bool isComplete(uint64_t sequence);
 	void waitIdle(bool reset = true);
 	void garbageCollect();
-	inline VkDescriptorSet descriptorSet()
-	{
-		VkDescriptorSet ret = m_descriptorSets[m_currentDescriptorSet];
-		m_currentDescriptorSet = (m_currentDescriptorSet + 1) % m_descriptorSets.size();
-		return ret;
-	}
+	VkDescriptorSet descriptorSet();
+	void recycleDescriptorSets( std::vector<VkDescriptorSet>& descriptorSets );
 
 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
+	std::shared_ptr<VulkanTimelineSyncFile_t> CreateTimelineSyncFile(
+		const std::shared_ptr<VulkanTimelineSemaphore_t> &pTimeline, uint64_t ulPoint );
+	// Consumes nSyncFile regardless of success.
+	std::shared_ptr<VulkanBinarySemaphore_t> ImportSyncFile( int32_t nSyncFile );
+	int ExportSubmissionTimelineFd() const;
+	std::shared_ptr<gamescope::CTimeline> GetSubmissionTimeline();
 
 	static const uint32_t upload_buffer_size = 1920 * 1080 * 4;
 
@@ -846,16 +975,21 @@ public:
 	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
 	inline int drmRenderFd() {return m_drmRendererFd;}
 	inline bool supportsModifiers() {return m_bSupportsModifiers;}
+	inline bool supportsClientDmabufs() {return m_bSupportsClientDmabufs;}
 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
+	inline bool supportsIntegerDotProduct() { return m_bSupportsIntegerDotProduct; }
+	inline bool supportsStorageImageReadWithoutFormat() { return m_bSupportsStorageImageReadWithoutFormat; }
+	inline bool supportsStorageImageWriteWithoutFormat() { return m_bSupportsStorageImageWriteWithoutFormat; }
+	inline uint32_t vendorID() {return m_uVendorID;}
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
-	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size)
+	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
 	{
 		assert(size <= upload_buffer_size);
 
-		m_uploadBufferOffset = align(m_uploadBufferOffset, 16);
+		m_uploadBufferOffset = align(m_uploadBufferOffset, alignment);
 		if (m_uploadBufferOffset + size > upload_buffer_size)
 		{
 			fprintf(stderr, "Exceeded uploadBufferData\n");
@@ -888,7 +1022,7 @@ protected:
 	bool createPools();
 	bool createShaders();
 	bool createScratchResources();
-	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable);
+	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output);
 	void compileAllPipelines(std::stop_token st);
 
 	VkDevice m_device = nullptr;
@@ -911,8 +1045,13 @@ protected:
 	dev_t m_drmPrimaryDevId = 0;
 
 	bool m_bSupportsFp16 = false;
+	bool m_bSupportsIntegerDotProduct = false;
+	bool m_bSupportsStorageImageReadWithoutFormat = false;
+	bool m_bSupportsStorageImageWriteWithoutFormat = false;
+	uint32_t m_uVendorID = 0;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
+	bool m_bSupportsClientDmabufs = true;
 	bool m_bInitialized = false;
 
 
@@ -925,11 +1064,10 @@ protected:
 
 	static constexpr uint32_t k_uMaxConcurrentSubmits = 8;
 
-	// currently just one set, no need to double buffer because we
-	// vkQueueWaitIdle after each submit.
-	// should be moved to the output if we are going to support multiple outputs
+	// Descriptor sets are checked out by command buffers and returned only after
+	// the submission using them has completed.
 	std::array<VkDescriptorSet, k_uMaxConcurrentSubmits * 3> m_descriptorSets;
-	uint32_t m_currentDescriptorSet = 0;
+	std::vector<VkDescriptorSet> m_freeDescriptorSets;
 
 	VkBuffer m_uploadBuffer;
 	VkDeviceMemory m_uploadBufferMemory;
@@ -937,6 +1075,7 @@ protected:
 	uint32_t m_uploadBufferOffset = 0;
 
 	VkSemaphore m_scratchTimelineSemaphore;
+	std::shared_ptr<gamescope::CTimeline> m_pSubmissionTimeline;
 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
@@ -1004,9 +1143,13 @@ public:
 	uint32_t queueFamily() { return m_queueFamily; }
 
 	void AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
+	void AddBinaryDependency( std::shared_ptr<VulkanBinarySemaphore_t> pSemaphore );
+	bool AddBufferUse( std::shared_ptr<gamescope::CCommitBufferSync> pBufferSync );
+	void NotifyBufferUsesSubmitted( const std::shared_ptr<gamescope::CTimeline> &pTimeline, uint64_t ulPoint );
 	void AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 
 	const std::vector<VulkanTimelinePoint_t> &GetExternalDependencies() const { return m_ExternalDependencies; }
+	const std::vector<std::shared_ptr<VulkanBinarySemaphore_t>> &GetExternalBinaryDependencies() const { return m_ExternalBinaryDependencies; }
 	const std::vector<VulkanTimelinePoint_t> &GetExternalSignals() const { return m_ExternalSignals; }
 
 private:
@@ -1030,7 +1173,10 @@ private:
 	std::array<CVulkanTexture *, VKR_LUT3D_COUNT> m_lut3D;
 
 	std::vector<VulkanTimelinePoint_t> m_ExternalDependencies;
+	std::vector<std::shared_ptr<VulkanBinarySemaphore_t>> m_ExternalBinaryDependencies;
+	std::vector<std::shared_ptr<gamescope::CCommitBufferSync>> m_BufferUses;
 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
+	std::vector<VkDescriptorSet> m_descriptorSets;
 
 	uint32_t m_renderBufferOffset = 0;
 };

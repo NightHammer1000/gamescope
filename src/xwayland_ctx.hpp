@@ -142,9 +142,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom netSystemTrayOpcodeAtom;
 		Atom steamStreamingClientAtom;
 		Atom steamStreamingClientVideoAtom;
-		Atom steamGamescopeVROverlayTarget;
 		Atom gamescopePid;
-		Atom gamescopeVROverlayForwarding;
 		Atom gamescopeFocusableAppsAtom;
 		Atom gamescopeFocusableWindowsAtom;
 		Atom gamescopeFocusedWindowAtom;
@@ -174,6 +172,9 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom gamescopeLowLatency;
 
 		Atom gamescopeFSRFeedback;
+		Atom gamescopeFrameGenerationEnabled;
+		Atom gamescopeFrameGenerationFlowScale;
+		Atom gamescopeFrameGenerationFeedback;
 
 		Atom gamescopeBlurMode;
 		Atom gamescopeBlurRadius;
@@ -244,13 +245,10 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom gamescopeCreateXWaylandServerFeedback;
 		Atom gamescopeDestroyXWaylandServer;
 
-		Atom gamescopeReshadeEffect;
-		Atom gamescopeReshadeTechniqueIdx;
 
 		Atom gamescopeDisplayRefreshRateFeedback;
 		Atom gamescopeDisplayDynamicRefreshBasedOnGamePresence;
 
-		Atom gamescopeMainSteamVROverlay;
 		Atom steamosTouchPointerEmulation;
 
 		Atom wineHwndStyle;
@@ -262,6 +260,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 
 		Atom wm_protocols;
 		Atom wm_delete_window;
+		Atom gamescopeDPMS;
 	} atoms;
 
 	bool HasQueuedEvents();

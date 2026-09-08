@@ -1,0 +1,247 @@
+#!/bin/bash
+# The session proper. Started by the telescope-session@<client>.service unit.
+#
+# Modelled closely on ChimeraOS gamescope-session-plus (MIT, © 2020-2023
+# Joaquín Ignacio Aramendía). Adapted for Telescope: our binary, our WSI layer
+# gate, our config paths.
+#
+# GAMESCOPE_* environment variables are kept as-is on purpose. Steam and the
+# WSI layer read those names; they are a protocol, not branding.
+
+set -x
+
+declare -r CLIENT=$1
+declare -r CLIENT_CONFIG_DIR_USR=@sessiondir@/sessions.d
+declare -r CLIENT_CONFIG_DIR_ETC=/etc/telescope-session/sessions.d
+declare -r CLIENT_CONFIG_DIR_LOCAL="${XDG_CONFIG_HOME:-$HOME/.config}/telescope-session/sessions.d"
+
+short_session_recover() { :; }
+post_telescope_start() { :; }
+post_client_shutdown() { :; }
+
+get_telescope_binary() {
+	if [ -n "$TELESCOPE_BIN" ]; then echo "$TELESCOPE_BIN"; else echo "@bindir@/telescope"; fi
+}
+
+# Feature-detect rather than assume: this script outlives any one build.
+telescope_has_option() {
+	$(get_telescope_binary) --help 2>&1 | grep -e "$1" > /dev/null
+}
+
+export mesa_glthread=true
+
+# Our layer, not gamescope's. Both can be installed; each compositor only
+# enables its own.
+export ENABLE_TELESCOPE_WSI=1
+
+export QT_QPA_PLATFORM=xcb
+export SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0
+
+MANGOHUD_CONFIGFILE=$(mktemp /tmp/mangohud.XXXXXXXX); export MANGOHUD_CONFIGFILE
+RADV_FORCE_VRS_CONFIG_FILE=$(mktemp /tmp/radv_vrs.XXXXXXXX); export RADV_FORCE_VRS_CONFIG_FILE
+
+export GAMESCOPE_MODE_SAVE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/telescope/modes.cfg"
+export GAMESCOPE_PATCHED_EDID_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/telescope/edid.bin"
+mkdir -p "$(dirname "$GAMESCOPE_MODE_SAVE_FILE")" && touch "$GAMESCOPE_MODE_SAVE_FILE"
+mkdir -p "$(dirname "$GAMESCOPE_PATCHED_EDID_FILE")" && touch "$GAMESCOPE_PATCHED_EDID_FILE"
+
+# No way to set a colour space for an NV12 buffer in Wayland yet.
+export GAMESCOPE_NV12_COLORSPACE=k_EStreamColorspace_BT601
+export VKD3D_SWAPCHAIN_LATENCY_FRAMES=3
+export WINEDLLOVERRIDES=dxgi=n
+export vk_xwayland_wait_ready=false
+GAMESCOPE_LIMITER_FILE=$(mktemp /tmp/telescope-limiter.XXXXXXXX); export GAMESCOPE_LIMITER_FILE
+
+# Don't let mangoapp draw before Steam has initialised.
+mkdir -p "$(dirname "$MANGOHUD_CONFIGFILE")"
+echo "no_display" > "$MANGOHUD_CONFIGFILE"
+mkdir -p "$(dirname "$RADV_FORCE_VRS_CONFIG_FILE")"
+echo "1x1" > "$RADV_FORCE_VRS_CONFIG_FILE"
+
+ulimit -n 524288
+
+# shellcheck source=/dev/null
+# Machine-specific setup, keyed on SYS_ID. Sourced, so it can define the
+# short_session_recover / post_telescope_start / post_client_shutdown hooks
+# as well as export variables.
+SYS_ID="$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null)"
+export SYS_ID
+# shellcheck source=/dev/null
+[ -f @sessiondir@/device-quirks ] && . @sessiondir@/device-quirks
+
+set -a
+for i in ${CLIENT_CONFIG_DIR_USR}/${CLIENT} ${CLIENT_CONFIG_DIR_ETC}/${CLIENT} ${CLIENT_CONFIG_DIR_LOCAL}/${CLIENT}; do
+	# shellcheck source=/dev/null
+	[[ -f "${i}" ]] && . "${i}"
+done
+for i in /etc/environment.d/*.conf "${HOME}"/.config/environment.d/*.conf; do
+	# shellcheck source=/dev/null
+	[[ -f "${i}" ]] && . "${i}"
+done
+set +a
+
+# Startup handshake and stats sockets.
+tmpdir="$([[ -n ${XDG_RUNTIME_DIR+x} ]] && mktemp -p "$XDG_RUNTIME_DIR" -d -t telescope.XXXXXXX)"
+socket="${tmpdir:+$tmpdir/startup.socket}"
+stats="${tmpdir:+$tmpdir/stats.pipe}"
+if [[ -z $tmpdir || -z ${XDG_RUNTIME_DIR+x} ]]; then
+	echo >&2 "!! No runtime directory for the session sockets (is \$XDG_RUNTIME_DIR set?)"
+	exit 1
+fi
+
+export GAMESCOPE_STATS="$stats"
+mkfifo -- "$stats"
+mkfifo -- "$socket"
+
+sessionlink="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/}telescope-stats"
+lockfile="$sessionlink".lck
+exec 9>"$lockfile"
+if flock -n 9 && rm -f "$sessionlink" && ln -sf "$tmpdir" "$sessionlink"; then
+	echo >&2 "Claimed global telescope stats session at \"$sessionlink\""
+else
+	echo >&2 "!! Failed to claim global telescope stats session"
+fi
+
+if [ -z "$TELESCOPECMD" ]; then
+	: "${OUTPUT_CONNECTOR:=*,eDP-1}"
+	: "${XWAYLAND_COUNT:=2}"
+	: "${TOUCH_MODE:=4}"
+	: "${HIDE_CURSOR_DELAY_MS:=3000}"
+
+	CURSOR=""
+	[ -f "$CURSOR_FILE" ] && CURSOR="--cursor ${CURSOR_FILE}"
+
+	RESOLUTION=""
+	[ -n "$SCREEN_WIDTH" ] && [ -n "$SCREEN_HEIGHT" ] && RESOLUTION="-W $SCREEN_WIDTH -H $SCREEN_HEIGHT"
+
+	INTERNAL_RESOLUTION=""
+	[ -n "$INTERNAL_WIDTH" ] && [ -n "$INTERNAL_HEIGHT" ] && INTERNAL_RESOLUTION="-w $INTERNAL_WIDTH -h $INTERNAL_HEIGHT"
+
+	DRM_MODE_OPTION=""
+	[ -n "$DRM_MODE" ] && DRM_MODE_OPTION="--generate-drm-mode $DRM_MODE"
+
+	ORIENTATION_OPTION=""
+	[ -n "$ORIENTATION" ] && ORIENTATION_OPTION="--force-orientation $ORIENTATION"
+
+	ADAPTIVE_SYNC_OPTION=""
+	[ -n "$ADAPTIVE_SYNC" ] && ADAPTIVE_SYNC_OPTION="--adaptive-sync"
+
+	MAX_SCALE_OPTION=""
+	[ -n "$MAX_SCALE" ] && telescope_has_option "--max-scale" && MAX_SCALE_OPTION="--max-scale $MAX_SCALE"
+
+	FADE_OUT_OPTION=""
+	[ -n "$FADE_OUT_DURATION_MS" ] && telescope_has_option "--fade-out-duration" && \
+		FADE_OUT_OPTION="--fade-out-duration $FADE_OUT_DURATION_MS"
+
+	HDR_OPTIONS=""
+	if [ "$ENABLE_TELESCOPE_HDR" == "1" ] && telescope_has_option "--hdr-enabled"; then
+		HDR_OPTIONS="--hdr-enabled"
+		telescope_has_option "--hdr-itm-enable" && HDR_OPTIONS="$HDR_OPTIONS --hdr-itm-enable"
+		export ENABLE_HDR_WSI=1
+		export DXVK_HDR=1
+	fi
+	if [ -n "$TELESCOPE_HDR_NITS" ] && telescope_has_option "--hdr-itm-sdr-nits"; then
+		HDR_OPTIONS="$HDR_OPTIONS --hdr-itm-sdr-nits $TELESCOPE_HDR_NITS --hdr-sdr-content-nits $TELESCOPE_HDR_NITS"
+	fi
+
+	# No backend option here on purpose. Telescope only has drm and headless,
+	# and picking between them is not the session's business.
+	TELESCOPECMD="$(get_telescope_binary) \
+		$CURSOR \
+		$RESOLUTION \
+		$INTERNAL_RESOLUTION \
+		$ORIENTATION_OPTION \
+		$DRM_MODE_OPTION \
+		$ADAPTIVE_SYNC_OPTION \
+		$MAX_SCALE_OPTION \
+		$FADE_OUT_OPTION \
+		$HDR_OPTIONS \
+		--prefer-output $OUTPUT_CONNECTOR \
+		--xwayland-count $XWAYLAND_COUNT \
+		--default-touch-mode $TOUCH_MODE \
+		--hide-cursor-delay $HIDE_CURSOR_DELAY_MS \
+		--steam"
+fi
+
+TELESCOPECMD+=" -R $socket -T $stats"
+[ -n "$VULKAN_ADAPTER" ] && TELESCOPECMD+=" --prefer-vk-device $VULKAN_ADAPTER"
+
+# If the session keeps dying quickly, stop trying and let the client's recovery
+# hook drop us somewhere usable rather than looping on a black screen.
+short_session_tracker_file="/tmp/telescope-short-session-tracker"
+short_session_duration=60
+short_session_count_before_reset=5
+SECONDS=0
+touch "$short_session_tracker_file"
+short_session_count=$(wc < "$short_session_tracker_file" -l)
+
+if [[ "$short_session_count" -ge "$short_session_count_before_reset" ]]; then
+	echo >&2 "telescope-session: ${CLIENT} or telescope keeps failing, attempting recovery"
+	short_session_recover
+	rm -f "$short_session_tracker_file"
+	exit 1
+fi
+
+$TELESCOPECMD &
+telescope_pid="$!"
+
+# Telescope writes the X and Wayland display names here once it is up. The
+# client cannot start before that.
+if read -r -t 30 response_x_display response_wl_display <> "$socket"; then
+	export DISPLAY="$response_x_display"
+	export GAMESCOPE_WAYLAND_DISPLAY="$response_wl_display"
+else
+	echo "telescope failed to come up" >> "$short_session_tracker_file"
+	kill -9 "$telescope_pid"
+	wait -n "$telescope_pid"
+	exit 1
+fi
+
+post_telescope_start
+
+command -v ibus-daemon >/dev/null && \
+	ibus-daemon -d -r --panel=disable --emoji-extension=disable
+
+if command -v mangoapp >/dev/null; then
+	(while true; do mangoapp; done) &
+fi
+
+$CLIENTCMD
+
+if [[ "$SECONDS" -lt "$short_session_duration" ]]; then
+	echo "${CLIENT} failed" >> "$short_session_tracker_file"
+else
+	rm -f "$short_session_tracker_file"
+fi
+
+post_client_shutdown
+
+kill "$telescope_pid"
+
+sleep 5 &
+sleep_pid="$!"
+
+if [[ -n "$REBOOT_SENTINEL" && -e "$REBOOT_SENTINEL" ]]; then
+	rm -f "$REBOOT_SENTINEL" "$short_session_tracker_file"
+	reboot
+fi
+if [[ -n "$SHUTDOWN_SENTINEL" && -e "$SHUTDOWN_SENTINEL" ]]; then
+	rm -f "$SHUTDOWN_SENTINEL" "$short_session_tracker_file"
+	poweroff
+fi
+
+ret=0
+wait -n $telescope_pid $sleep_pid || ret=$?
+if [[ $ret = 127 ]]; then
+	echo >&2 "telescope-session: interrupted while tearing down, force-killing what is left"
+fi
+
+for job in $(jobs -p); do
+	if [[ $ret != 127 && $job = "$telescope_pid" ]]; then
+		echo >&2 "telescope-session: telescope timed out while exiting, killing"
+	elif [[ $ret != 127 && $job != "$sleep_pid" ]]; then
+		echo >&2 "telescope-session: unexpected background pid $job at teardown:"
+		ps -p "$job" >&2
+	fi
+	kill -9 "$job"
+done

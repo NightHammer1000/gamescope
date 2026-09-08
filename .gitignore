@@ -1,0 +1,15 @@
+# Meson build directories
+/build*/
+
+# Subprojects fetched by meson wraps (glm, stb, and their transitive deps).
+# Submodules listed in .gitmodules are tracked and must not be ignored.
+/subprojects/glm/
+/subprojects/stb/
+/subprojects/v4l-utils/
+/subprojects/v4l-utils.wrap
+/subprojects/packagecache/
+
+# Working notes, local only. Not part of the published fork.
+/CLAUDE.md
+/UPSTREAM.md
+/HARDWARE-CHECKLIST.md

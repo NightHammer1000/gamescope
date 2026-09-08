@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <xf86drm.h>
+#include <xf86drmMode.h>
 #include <sys/eventfd.h>
 
 #include <linux/input-event-codes.h>
@@ -19,7 +20,6 @@
 #include "WaylandServer/WaylandResource.h"
 #include "WaylandServer/WaylandProtocol.h"
 #include "WaylandServer/LinuxDrmSyncobj.h"
-#include "WaylandServer/Reshade.h"
 #include "WaylandServer/GamescopeActionBinding.h"
 
 #include "wlr_begin.hpp"
@@ -63,6 +63,7 @@
 #include "log.hpp"
 #include "ime.hpp"
 #include "xwayland_ctx.hpp"
+#include "frame_generation_config.hpp"
 #include "refresh_rate.h"
 #include "InputEmulation.h"
 #include "commit.h"
@@ -76,6 +77,7 @@
 #include "gpuvis_trace_utils.h"
 
 #include <algorithm>
+#include <climits>
 #include <list>
 #include <set>
 
@@ -111,6 +113,7 @@ wlserver_wl_surface_info *get_wl_surface_info(struct wlr_surface *wlr_surf);
 static void wlserver_update_cursor_constraint();
 static void handle_pointer_constraint(struct wl_listener *listener, void *data);
 static void wlserver_constrain_cursor( struct wlr_pointer_constraint_v1 *pNewConstraint );
+static void apply_touchscreen_orientation(GamescopePanelOrientation orientation, double *x, double *y );
 struct wlr_surface *wlserver_surface_to_main_surface( struct wlr_surface *pSurface );
 bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press );
 
@@ -362,6 +365,25 @@ static void wlserver_handle_pointer_motion(struct wl_listener *listener, void *d
 	wlserver_mousemotion(event->unaccel_dx, event->unaccel_dy, event->time_msec);
 }
 
+static void wlserver_handle_pointer_motion_absolute(struct wl_listener *listener, void *data)
+{
+	struct wlr_pointer_motion_absolute_event *event = (struct wlr_pointer_motion_absolute_event *) data;
+
+	double x = event->x;
+	double y = event->y;
+	if ( gamescope::IBackendConnector *connector = GetBackend()->GetCurrentConnector() )
+		apply_touchscreen_orientation( connector->GetCurrentOrientation(), &x, &y );
+
+	x *= g_nOutputWidth;
+	y *= g_nOutputHeight;
+	x += focusedWindowOffsetX;
+	y += focusedWindowOffsetY;
+	x *= focusedWindowScaleX;
+	y *= focusedWindowScaleY;
+
+	wlserver_mousewarp( x, y, event->time_msec, false );
+}
+
 void wlserver_open_steam_menu( bool qam )
 {
 	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server( 0 );
@@ -536,6 +558,8 @@ static void wlserver_new_input(struct wl_listener *listener, void *data)
 
 			pointer->motion.notify = wlserver_handle_pointer_motion;
 			wl_signal_add( &pointer->wlr->events.motion, &pointer->motion );
+			pointer->motion_absolute.notify = wlserver_handle_pointer_motion_absolute;
+			wl_signal_add( &pointer->wlr->events.motion_absolute, &pointer->motion_absolute );
 			pointer->button.notify = wlserver_handle_pointer_button;
 			wl_signal_add( &pointer->wlr->events.button, &pointer->button );
 			pointer->axis.notify = wlserver_handle_pointer_axis;
@@ -1006,11 +1030,6 @@ static void gamescope_swapchain_set_hdr_metadata( struct wl_client *client, stru
 			return;
 		}
 
-		// Check validity of this metadata,
-		// if it's garbage, just toss it...
-		if (!max_cll || !max_fall || (!white_point_x && !white_point_y))
-			return;
-
 		hdr_output_metadata metadata = {};
 		metadata.metadata_type = 0;
 
@@ -1307,6 +1326,13 @@ static void gamescope_control_request_app_performance_stats( struct wl_client *c
 	wlserver.app_perf_requests[ app_id ].push_back( resource );
 }
 
+static void gamescope_control_set_frame_generation( struct wl_client *client, struct wl_resource *resource, uint32_t enabled )
+{
+	assert( wlserver_is_lock_held() );
+	gamescope::SetFrameGenerationEnabled( enabled );
+	hasRepaint = true;
+}
+
 void wlserver_app_presented( uint32_t app_id, uint64_t frametime_ns )
 {
 	assert( wlserver_is_lock_held() );
@@ -1336,6 +1362,7 @@ static const struct gamescope_control_interface gamescope_control_impl = {
 	.set_look = gamescope_control_set_look,
 	.unset_look = gamescope_control_unset_look,
 	.request_app_performance_stats = gamescope_control_request_app_performance_stats,
+	.set_frame_generation = gamescope_control_set_frame_generation,
 };
 
 static uint32_t get_conn_display_info_flags()
@@ -1399,13 +1426,13 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 	});
 
 	// Send feature support
-	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_RESHADE_SHADERS, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_DISPLAY_INFO, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_PIXEL_FILTER, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_REFRESH_CYCLE_ONLY_CHANGE_REFRESH_RATE, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_MURA_CORRECTION, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_LOOK, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_PERF_QUERY, 1, 0 );
+	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_FRAME_GENERATION, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_DONE, 0, 0 );
 
 	wlserver_send_gamescope_control( resource );
@@ -1415,7 +1442,7 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 
 static void create_gamescope_control( void )
 {
-	uint32_t version = 6;
+	uint32_t version = 7;
 	wl_global_create( wlserver.display, &gamescope_control_interface, version, NULL, gamescope_control_bind );
 }
 
@@ -1471,11 +1498,6 @@ static void create_gamescope_private( void )
 static void create_explicit_sync()
 {
 	new gamescope::WaylandServer::CLinuxDrmSyncobj( wlserver.display );
-}
-
-static void create_reshade()
-{
-	new gamescope::WaylandServer::CReshade( wlserver.display );
 }
 
 
@@ -1624,6 +1646,8 @@ void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle
 ///////////////////////
 
 #if HAVE_SESSION
+static void blank_unused_kms_devices();
+
 bool wlsession_active()
 {
 	return wlserver.wlr.session->active;
@@ -1634,6 +1658,10 @@ static void handle_session_active( struct wl_listener *listener, void *data )
 	// Releases delivered while another VT owns input never reach us.
 	if ( !wlserver.wlr.session->active )
 		wlserver.mapPressedHotkeyKeys.clear();
+
+	// Coming back from sleep, another GPU may have lit its display again.
+	if ( wlserver.wlr.session->active )
+		blank_unused_kms_devices();
 
 	GetBackend()->DirtyState( wlserver.wlr.session->active, wlserver.wlr.session->active );
 	wl_log.infof( "Session %s", wlserver.wlr.session->active ? "resumed" : "paused" );
@@ -1663,7 +1691,16 @@ void wlserver_set_output_info( const wlserver_output_info *info )
 	free(wlserver.output_info.description);
 	wlserver.output_info.description = strdup(info->description);
 	wlserver.output_info.phys_width = info->phys_width;
+	// Steam's default UI scaling becomes too small on sub-8-inch displays.
+	// A 16:9 8-inch display is approximately 100 mm tall, so clamp the
+	// reported height rather than doing a more expensive diagonal check.
 	wlserver.output_info.phys_height = info->phys_height;
+	if ( wlserver.output_info.phys_height > 0 && wlserver.output_info.phys_height < 100 )
+	{
+		wlserver.output_info.phys_width =
+			wlserver.output_info.phys_width * 100 / wlserver.output_info.phys_height;
+		wlserver.output_info.phys_height = 100;
+	}
 
 	if (wlserver.wlr.xwayland_servers.empty())
 		return;
@@ -1754,6 +1791,8 @@ bool wlsession_init( void ) {
 
 #if HAVE_SESSION
 
+static std::vector<struct wlr_device *> s_kmsDevices;
+
 static void kms_device_handle_change( struct wl_listener *listener, void *data )
 {
 	GetBackend()->DirtyState();
@@ -1762,27 +1801,83 @@ static void kms_device_handle_change( struct wl_listener *listener, void *data )
 	nudge_steamcompmgr();
 }
 
-int wlsession_open_kms( const char *device_name ) {
+static void blank_kms_device( struct wlr_device *device )
+{
+	drmModeRes *resources = drmModeGetResources( device->fd );
+	if ( !resources )
+		return;
+
+	for ( int i = 0; i < resources->count_crtcs; i++ )
+	{
+		if ( drmModeSetCrtc( device->fd, resources->crtcs[i], 0, 0, 0, nullptr, 0, nullptr ) != 0 )
+			wl_log.errorf_errno( "Failed to blank unused KMS device" );
+	}
+
+	drmModeFreeResources( resources );
+}
+
+static void blank_unused_kms_devices()
+{
+	for ( struct wlr_device *device : s_kmsDevices )
+	{
+		if ( device->dev != wlserver.wlr.device->dev )
+			blank_kms_device( device );
+	}
+}
+
+int wlsession_open_kms( const char *device_name, wlsession_kms_device_selector selector, const void *userdata ) {
 	if ( device_name != nullptr )
 	{
 		wlserver.wlr.device = wlr_session_open_file( wlserver.wlr.session, device_name );
 		if ( wlserver.wlr.device == nullptr )
 			return -1;
 	}
-	else
+
+	// Enumerate regardless of whether a device was named: we still want to know
+	// about the other GPUs so their displays can be turned off below.
+	struct wlr_device *devices[8] = {};
+	ssize_t n = wlr_session_find_gpus( wlserver.wlr.session, 8, devices );
+	if ( n < 0 )
+		n = 0;
+	s_kmsDevices.assign( devices, devices + n );
+
+	if ( wlserver.wlr.device == nullptr )
 	{
-		ssize_t n = wlr_session_find_gpus( wlserver.wlr.session, 1, &wlserver.wlr.device );
-		if ( n < 0 )
-		{
-			wl_log.errorf( "Failed to list GPUs" );
-			return -1;
-		}
 		if ( n == 0 )
 		{
 			wl_log.errorf( "No GPU detected" );
 			return -1;
 		}
+
+		// Pick the GPU that actually drives the display we were asked for,
+		// rather than whichever one enumerated first. On a hybrid or eGPU box
+		// those are routinely not the same device.
+		int best_priority = INT_MAX;
+
+		for ( ssize_t i = 0; i < n; i++ )
+		{
+			int priority = selector ? selector( devices[i]->fd, userdata ) : 0;
+			if ( priority < best_priority )
+			{
+				best_priority = priority;
+				wlserver.wlr.device = devices[i];
+			}
+		}
+
+		if ( wlserver.wlr.device == nullptr )
+		{
+			wl_log.infof( "No connected KMS connector found; falling back to the first GPU" );
+			wlserver.wlr.device = devices[0];
+		}
+		else
+		{
+			wl_log.infof( "Selected KMS device with connector priority %d", best_priority );
+		}
 	}
+
+	// A second GPU left driving a display flickers or holds a stale image
+	// behind us. Blank anything that is not the device we are using.
+	blank_unused_kms_devices();
 
 	wlserver.wlr.device_change_listener.notify = kms_device_handle_change;
 	wl_signal_add( &wlserver.wlr.device->events.change, &wlserver.wlr.device_change_listener );
@@ -1798,6 +1893,7 @@ void wlsession_close_kms()
 	}
 	wlr_session_close_file( wlserver.wlr.session, wlserver.wlr.device );
 	wlserver.wlr.device = nullptr;
+	s_kmsDevices.clear();
 }
 
 #endif
@@ -1948,6 +2044,7 @@ wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, s
 	{
 		pid_t nPid = 0;
 		wl_client_get_credentials( client, &nPid, nullptr, nullptr );
+		window->pid = nPid;
 		window->appID = get_appid_from_pid( nPid );
 	}
 	window->_window_types.emplace<steamcompmgr_xdg_win_t>();
@@ -2074,8 +2171,6 @@ bool wlserver_init( void ) {
 	wl_signal_add( &wlserver.wlr.compositor->events.new_surface, &new_surface_listener );
 
 	create_ime_manager( &wlserver );
-
-	create_reshade();
 
 	new gamescope::WaylandServer::CGamescopeActionBindingProtocol( wlserver.display );
 

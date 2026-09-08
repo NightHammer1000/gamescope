@@ -7,6 +7,11 @@
 
 class CVulkanTexture;
 
+namespace gamescope
+{
+	class CCommitBufferSync;
+}
+
 struct UpscaledTexture_t
 {
 	GamescopeUpscaleFilter eFilter{};
@@ -27,6 +32,7 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 	// For waitable:
 	int GetFD() final;
 	void OnPollIn() final;
+	void OnPollError() final { OnPollIn(); }
 	void Signal();
 	void OnPollHangUp() final;
 
@@ -39,6 +45,7 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 	bool ShouldPreemptivelyUpscale();
 
 	struct wlr_buffer *buf = nullptr;
+	std::shared_ptr<gamescope::CCommitBufferSync> bufferSync;
 	gamescope::Rc<CVulkanTexture> vulkanTex;
 	std::optional<UpscaledTexture_t> upscaledTexture;
 

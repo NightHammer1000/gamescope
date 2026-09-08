@@ -40,8 +40,6 @@
 #include "pipewire.hpp"
 #endif
 
-#include <wayland-client.h>
-
 using namespace std::literals;
 
 EStreamColorspace g_ForcedNV12ColorSpace = k_EStreamColorspace_Unknown;
@@ -50,7 +48,6 @@ extern gamescope::ConVar<bool> cv_shutdown_on_primary_child_death;
 
 const char *gamescope_optstring = nullptr;
 const char *g_pOriginalDisplay = nullptr;
-const char *g_pOriginalWaylandDisplay = nullptr;
 
 bool g_bAllowDeferredBackend = false;
 
@@ -79,12 +76,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "backend", required_argument, nullptr, 0 },
 
 	// nested mode options
-	{ "nested-unfocused-refresh", required_argument, nullptr, 'o' },
-	{ "borderless", no_argument, nullptr, 'b' },
-	{ "fullscreen", no_argument, nullptr, 'f' },
-	{ "grab", no_argument, nullptr, 'g' },
 	{ "force-grab-cursor", no_argument, nullptr, 0 },
-	{ "display-index", required_argument, nullptr, 0 },
 
 	// embedded mode options
 	{ "disable-layers", no_argument, nullptr, 0 },
@@ -95,25 +87,6 @@ const struct option *gamescope_options = (struct option[]){
 	{ "immediate-flips", no_argument, nullptr, 0 },
 	{ "framerate-limit", required_argument, nullptr, 0 },
 
-	// openvr options
-#if HAVE_OPENVR
-	{ "vr-overlay-key", required_argument, nullptr, 0 },
-	{ "vr-app-overlay-key", required_argument, nullptr, 0 },
-	{ "vr-overlay-explicit-name", required_argument, nullptr, 0 },
-	{ "vr-overlay-default-name", required_argument, nullptr, 0 },
-	{ "vr-overlay-icon", required_argument, nullptr, 0 },
-	{ "vr-overlay-show-immediately", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-control-bar", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-control-bar-keyboard", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-control-bar-close", no_argument, nullptr, 0 },
-	{ "vr-overlay-enable-click-stabilization", no_argument, nullptr, 0 },
-	{ "vr-overlay-modal", no_argument, nullptr, 0 },
-	{ "vr-overlay-physical-width", required_argument, nullptr, 0 },
-	{ "vr-overlay-physical-curvature", required_argument, nullptr, 0 },
-	{ "vr-overlay-physical-pre-curve-pitch", required_argument, nullptr, 0 },
-	{ "vr-scroll-speed", required_argument, nullptr, 0 },
-	{ "vr-session-manager", no_argument, nullptr, 0 },
-#endif
 
 	// wlserver options
 	{ "xwayland-count", required_argument, nullptr, 0 },
@@ -139,20 +112,19 @@ const struct option *gamescope_options = (struct option[]){
 	{ "force-composition-rotation", no_argument, nullptr, 0 },
 	{ "force-orientation", required_argument, nullptr, 0 },
 	{ "force-windows-fullscreen", no_argument, nullptr, 0 },
+	{ "custom-refresh-rates", required_argument, nullptr, 0 },
 
 	{ "disable-color-management", no_argument, nullptr, 0 },
 	{ "sdr-gamut-wideness", required_argument, nullptr, 0 },
 	{ "hdr-enabled", no_argument, nullptr, 0 },
 	{ "hdr-sdr-content-nits", required_argument, nullptr, 0 },
 	{ "hdr-itm-enabled", no_argument, nullptr, 0 },
+	{ "hdr-pq-internal-enable", no_argument, nullptr, 0 },
 	{ "hdr-itm-sdr-nits", required_argument, nullptr, 0 },
 	{ "hdr-itm-target-nits", required_argument, nullptr, 0 },
 	{ "hdr-debug-force-support", no_argument, nullptr, 0 },
 	{ "hdr-debug-force-output", no_argument, nullptr, 0 },
 	{ "hdr-debug-heatmap", no_argument, nullptr, 0 },
-
-	{ "reshade-effect", required_argument, nullptr, 0 },
-	{ "reshade-technique-idx", required_argument, nullptr, 0 },
 
 	// Steam Deck options
 	{ "mura-map", required_argument, nullptr, 0 },
@@ -164,7 +136,7 @@ const struct option *gamescope_options = (struct option[]){
 };
 
 const char usage[] =
-	"usage: gamescope [options...] -- [command...]\n"
+	"usage: telescope [options...] -- [command...]\n"
 	"\n"
 	"Options:\n"
 	"  --help                         show help message\n"
@@ -175,7 +147,7 @@ const char usage[] =
 	"  -r, --nested-refresh           game refresh rate (frames per second)\n"
 	"  -m, --max-scale                maximum scale factor\n"
 	"  -S, --scaler                   upscaler type (auto, integer, fit, fill, stretch)\n"
-	"  -F, --filter                   upscaler filter (linear, nearest, fsr, nis, pixel)\n"
+	"  -F, --filter                   upscaler filter (linear, nearest, fsr, nis, pixel, sgsr, bcas, xbr, anime4k)\n"
 	"                                     fsr => AMD FidelityFX™ Super Resolution 1.0\n"
 	"                                     nis => NVIDIA Image Scaling v1.0.3\n"
 	"  --sharpness, --fsr-sharpness   upscaler sharpness from 0 (max) to 20 (min)\n"
@@ -186,14 +158,7 @@ const char usage[] =
 #if HAVE_DRM
 	"                                     drm => use DRM backend (standalone display session)\n"
 #endif
-#if HAVE_SDL2
-	"                                     sdl => use SDL backend\n"
-#endif
-#if HAVE_OPENVR
-	"                                     openvr => use OpenVR backend (outputs as a VR overlay)\n"
-#endif
 	"                                     headless => use headless backend (no window, no DRM output)\n"
-	"                                     wayland => use Wayland backend\n"
 	"  --cursor                       path to default cursor image\n"
 	"  -R, --ready-fd                 notify FD when ready\n"
 	"  --rt                           Use realtime scheduling\n"
@@ -204,7 +169,7 @@ const char usage[] =
 	"  --prefer-vk-device             prefer Vulkan device for compositing (ex: 1002:7300)\n"
 	"  --force-composition-rotation   always rotate the output in the compositor instead of at scanout (autodetected otherwise)\n"
 	"  --force-orientation            rotate the internal display (left, right, normal, upsidedown)\n"
-	"  --force-windows-fullscreen     force windows inside of gamescope to be the size of the nested display (fullscreen)\n"
+	"  --force-windows-fullscreen     force windows inside of gamescope to be the size of the output (fullscreen)\n"
 	"  --cursor-scale-height          if specified, sets a base output height to linearly scale the cursor against.\n"
 	"  --virtual-connector-strategy   Specifies how we should make virtual connectors.\n"
 	"  --hdr-enabled                  enable HDR output (needs Gamescope WSI layer enabled for support from clients)\n"
@@ -212,21 +177,16 @@ const char usage[] =
 	"  --sdr-gamut-wideness           Set the 'wideness' of the gamut for SDR comment. 0 - 1.\n"
 	"  --hdr-sdr-content-nits         set the luminance of SDR content in nits. Default: 400 nits.\n"
 	"  --hdr-itm-enabled              enable SDR->HDR inverse tone mapping. only works for SDR input.\n"
+	"  --hdr-pq-internal-enable       enable PQ transform even on internal displays (e.g. Legion Go 2)\n"
 	"  --hdr-itm-sdr-nits             set the luminance of SDR content in nits used as the input for the inverse tone mapping process.\n"
 	"                                 Default: 100 nits, Max: 1000 nits\n"
 	"  --hdr-itm-target-nits          set the target luminace of the inverse tone mapping process.\n"
 	"                                 Default: 1000 nits, Max: 10000 nits\n"
 	"  --framerate-limit              Set a simple framerate limit. Used as a divisor of the refresh rate, rounds down eg 60 / 59 -> 60fps, 60 / 25 -> 30fps. Default: 0, disabled.\n"
+	"  --custom-refresh-rates         Set custom refresh rates for the output. eg: 60,90,110-120\n"
 	"  --mangoapp                     Launch with the mangoapp (mangohud) performance overlay enabled. You should use this instead of using mangohud on the game or gamescope.\n"
 	"  --adaptive-sync                Enable adaptive sync if available (variable rate refresh)\n"
-	"\n"
-	"Nested mode options:\n"
-	"  -o, --nested-unfocused-refresh game refresh rate when unfocused\n"
-	"  -b, --borderless               make the window borderless\n"
-	"  -f, --fullscreen               make the window fullscreen\n"
-	"  -g, --grab                     grab the keyboard\n"
-	"  --force-grab-cursor            always use relative mouse mode instead of flipping dependent on cursor visibility.\n"
-	"  --display-index                forces gamescope to use a specific display in nested mode."
+	"  --force-grab-cursor            always composite the cursor rather than deciding from cursor visibility\n"
 	"\n"
 	"Embedded mode options:\n"
 	"  -O, --prefer-output            list of connectors in order of preference (ex: DP-1,DP-2,DP-3,HDMI-A-1)\n"
@@ -234,25 +194,6 @@ const char usage[] =
 	"  --generate-drm-mode            DRM mode generation algorithm (cvt, fixed)\n"
 	"  --immediate-flips              Enable immediate flips, may result in tearing\n"
 	"\n"
-#if HAVE_OPENVR
-	"VR mode options:\n"
-	"  --vr-overlay-key                         Sets the SteamVR overlay key to this string\n"
-	"  --vr-app-overlay-key						Sets the SteamVR overlay key to use for child apps\n"
-	"  --vr-overlay-explicit-name               Force the SteamVR overlay name to always be this string\n"
-	"  --vr-overlay-default-name                Sets the fallback SteamVR overlay name when there is no window title\n"
-	"  --vr-overlay-icon                        Sets the SteamVR overlay icon to this file\n"
-	"  --vr-overlay-show-immediately            Makes our VR overlay take focus immediately\n"
-	"  --vr-overlay-enable-control-bar          Enables the SteamVR control bar\n"
-	"  --vr-overlay-enable-control-bar-keyboard Enables the SteamVR keyboard button on the control bar\n"
-	"  --vr-overlay-enable-control-bar-close    Enables the SteamVR close button on the control bar\n"
-	"  --vr-overlay-enable-click-stabilization  Enables the SteamVR click stabilization\n"
-	"  --vr-overlay-modal                       Makes our VR overlay appear as a modal\n"
-	"  --vr-overlay-physical-width              Sets the physical width of our VR overlay in metres\n"
-	"  --vr-overlay-physical-curvature          Sets the curvature of our VR overlay\n"
-	"  --vr-overlay-physical-pre-curve-pitch    Sets the pre-curve pitch of our VR overlay\n"
-	"  --vr-scrolls-speed                       Mouse scrolling speed of trackpad scroll in VR. Default: 8.0\n"
-	"\n"
-#endif
 	"Debug options:\n"
 	"  --disable-layers               disable libliftoff (hardware planes)\n"
 	"  --debug-layers                 debug libliftoff\n"
@@ -267,10 +208,6 @@ const char usage[] =
 	"  --hdr-debug-force-support      forces support for HDR, etc even if the display doesn't support it. HDR clients will be outputted as SDR still in that case.\n"
 	"  --hdr-debug-force-output       forces support and output to HDR10 PQ even if the output does not support it (will look very wrong if it doesn't)\n"
 	"  --hdr-debug-heatmap            displays a heatmap-style debug view of HDR luminence across the scene in nits."
-	"\n"
-	"Reshade shader options:\n"
-	"  --reshade-effect               sets the name of a reshade shader to use in either /usr/share/gamescope/reshade/Shaders or ~/.local/share/gamescope/reshade/Shaders\n"
-	"  --reshade-technique-idx        sets technique idx to use from the reshade effect\n"
 	"\n"
 	"Steam Deck options:\n"
 	"  --mura-map                     Set the mura compensation map to use for the display. Takes in a path to the mura map.\n"
@@ -295,18 +232,15 @@ std::atomic< bool > g_bRun{true};
 int g_nNestedWidth = 0;
 int g_nNestedHeight = 0;
 int g_nNestedRefresh = 0;
-int g_nNestedUnfocusedRefresh = 0;
-int g_nNestedDisplayIndex = 0;
 
 uint32_t g_nOutputWidth = 0;
 uint32_t g_nOutputHeight = 0;
 int g_nOutputRefresh = 0;
+long g_nsVsync = 0;
 bool g_bOutputHDREnabled = false;
 
-bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
 
-bool g_bGrabbed = false;
 
 float g_mouseSensitivity = 1.0;
 
@@ -319,7 +253,6 @@ int g_upscaleFilterSharpness = 2;
 
 gamescope::GamescopeModeGeneration g_eGamescopeModeGeneration = gamescope::GAMESCOPE_MODE_GENERATE_CVT;
 
-bool g_bBorderlessOutputWindow = false;
 
 int g_nXWaylandCount = 1;
 bool g_bNoTouchPointerEmulation = true;
@@ -418,6 +351,14 @@ static enum GamescopeUpscaleFilter parse_upscaler_filter(const char *str)
 		return GamescopeUpscaleFilter::NIS;
 	} else if (strcmp(str, "pixel") == 0) {
 		return GamescopeUpscaleFilter::PIXEL;
+	} else if (strcmp(str, "sgsr") == 0) {
+		return GamescopeUpscaleFilter::SGSR;
+	} else if (strcmp(str, "bcas") == 0) {
+		return GamescopeUpscaleFilter::BCAS;
+	} else if (strcmp(str, "xbr") == 0) {
+		return GamescopeUpscaleFilter::XBR;
+	} else if (strcmp(str, "anime4k") == 0) {
+		return GamescopeUpscaleFilter::ANIME4K;
 	} else {
 		fprintf( stderr, "gamescope: invalid value for --filter\n" );
 		exit(1);
@@ -432,18 +373,8 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
 	} else if (strcmp(str, "drm") == 0) {
 		return gamescope::GamescopeBackend::DRM;
 #endif
-#if HAVE_SDL2
-	} else if (strcmp(str, "sdl") == 0) {
-		return gamescope::GamescopeBackend::SDL;
-#endif
-#if HAVE_OPENVR
-	} else if (strcmp(str, "openvr") == 0) {
-		return gamescope::GamescopeBackend::OpenVR;
-#endif
 	} else if (strcmp(str, "headless") == 0) {
 		return gamescope::GamescopeBackend::Headless;
-	} else if (strcmp(str, "wayland") == 0) {
-		return gamescope::GamescopeBackend::Wayland;
 	} else {
 		fprintf( stderr, "gamescope: invalid value for --backend\n" );
 		exit(1);
@@ -452,12 +383,9 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
 
 static enum gamescope::GamescopeBackend auto_select_backend()
 {
-	if ( getenv( "WAYLAND_DISPLAY" ) != NULL )
-		return gamescope::GamescopeBackend::Wayland;
-	else if ( getenv( "DISPLAY" ) != NULL )
-		return gamescope::GamescopeBackend::SDL;
-	else
-		return gamescope::GamescopeBackend::DRM;
+	// Telescope is a DRM session compositor. There is no nested fallback by design;
+	// ask for "headless" explicitly if you want a display-less run.
+	return gamescope::GamescopeBackend::DRM;
 }
 
 static int parse_integer(const char *str, const char *optionName)
@@ -486,6 +414,33 @@ static float parse_float(const char *str, const char *optionName)
 		fprintf( stderr, "gamescope: invalid value for --%s, \"%s\" could not be interpreted as a real number\n", optionName, str );
 		exit(1);
 	}
+}
+
+std::vector<uint32_t> g_customRefreshRates;
+// eg: 60,60,90,110-120
+static std::vector<uint32_t> parse_custom_refresh_rates( const char *str )
+{
+	std::vector<uint32_t> rates;
+	char *token = strtok( strdup(str), ",");
+	while (token)
+	{
+		char *dash = strchr(token, '-');
+		if (dash)
+		{
+			uint32_t start = atoi(token);
+			uint32_t end = atoi(dash + 1);
+			for (uint32_t i = start; i <= end; i++)
+			{
+				rates.push_back(i);
+			}
+		}
+		else
+		{
+			rates.push_back(atoi(token));
+		}
+		token = strtok(nullptr, ",");
+	}
+	return rates;
 }
 
 struct sigaction handle_signal_action = {};
@@ -544,38 +499,6 @@ static EStreamColorspace parse_colorspace_string( const char *pszStr )
 
 
 
-static bool g_bSupportsWaylandPresentationTime = false;
-static constexpr wl_registry_listener s_registryListener = {
-    .global = [](void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
-        if (interface == "wp_presentation"sv)
-            g_bSupportsWaylandPresentationTime = true;
-    },
-
-    .global_remove = [](void* data, wl_registry* registry, uint32_t name) {
-    },
-};
-
-static bool CheckWaylandPresentationTime()
-{
-	wl_display *display = wl_display_connect(g_pOriginalWaylandDisplay);
-	if (!display) {
-		fprintf(stderr, "Failed to connect to wayland socket: %s.\n", g_pOriginalWaylandDisplay);
-        exit(1);
-        return false;
-	}
-	wl_registry *registry = wl_display_get_registry(display);
-
-    wl_registry_add_listener(registry, &s_registryListener, nullptr);
-
-	wl_display_dispatch(display);
-	wl_display_roundtrip(display);
-
-	wl_registry_destroy(registry);
-	wl_display_disconnect(display);
-
-    return g_bSupportsWaylandPresentationTime;
-}
-
 #if 0
 static bool IsInDebugSession()
 {
@@ -608,6 +531,7 @@ static bool IsInDebugSession()
 #endif
 
 bool steamMode = false;
+bool disableInternalPq = true;
 bool g_bLaunchMangoapp = false;
 
 static void UpdateCompatEnvVars()
@@ -671,7 +595,7 @@ static void UpdateCompatEnvVars()
 	// Legacy support for SteamOS.
 	setenv( "XWAYLAND_FORCE_ENABLE_EXTRA_MODES", "1", 1 );
 
-	// Don't minimise stuff on focus loss with SDL.
+	// Don't minimise stuff on focus loss for SDL games running under us.
 	setenv( "SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0", 1 );
 
 	const char *pszMangoConfigPath = getenv( "MANGOHUD_CONFIGFILE" );
@@ -754,9 +678,6 @@ int main(int argc, char **argv)
 			case 'H':
 				g_nPreferredOutputHeight = parse_integer( optarg, "output-height" );
 				break;
-			case 'o':
-				g_nNestedUnfocusedRefresh = gamescope::ConvertHztomHz( parse_integer( optarg, "nested-unfocused-refresh" ) );
-				break;
 			case 'm':
 				g_flMaxWindowScale = parse_float( optarg, "max-scale" );
 				break;
@@ -766,17 +687,8 @@ int main(int argc, char **argv)
 			case 'F':
 				g_wantedUpscaleFilter = parse_upscaler_filter(optarg);
 				break;
-			case 'b':
-				g_bBorderlessOutputWindow = true;
-				break;
-			case 'f':
-				g_bFullscreen = true;
-				break;
 			case 'O':
 				g_sOutputName = optarg;
-				break;
-			case 'g':
-				g_bGrabbed = true;
 				break;
 			case 's':
 				g_mouseSensitivity = parse_float( optarg, "mouse-sensitivity" );
@@ -801,6 +713,10 @@ int main(int argc, char **argv)
 					g_bForceDisableColorMgmt = true;
 				} else if (strcmp(opt_name, "xwayland-count") == 0) {
 					g_nXWaylandCount = parse_integer( optarg, opt_name );
+					if ( g_nXWaylandCount < 1 ) {
+						fprintf( stderr, "gamescope: invalid value for --xwayland-count, must be at least 1\n" );
+						exit(1);
+					}
 				} else if (strcmp(opt_name, "xwayland-force-touch-pointer-emulation") == 0) {
 					g_bNoTouchPointerEmulation = false;
 				} else if (strcmp(opt_name, "composite-debug") == 0) {
@@ -816,6 +732,8 @@ int main(int argc, char **argv)
 					g_bForceCompositionRotation = true;
 				} else if (strcmp(opt_name, "force-orientation") == 0) {
 					g_DesiredInternalOrientation = force_orientation( optarg );
+				} else if (strcmp(opt_name, "custom-refresh-rates") == 0) {
+					g_customRefreshRates = parse_custom_refresh_rates( optarg );
 				} else if (strcmp(opt_name, "sharpness") == 0 ||
 						   strcmp(opt_name, "fsr-sharpness") == 0) {
 					g_upscaleFilterSharpness = parse_integer( optarg, opt_name );
@@ -831,8 +749,6 @@ int main(int argc, char **argv)
 					cv_tearing_enabled = true;
 				} else if (strcmp(opt_name, "force-grab-cursor") == 0) {
 					g_bForceRelativeMouse = true;
-				} else if (strcmp(opt_name, "display-index") == 0) {
-					g_nNestedDisplayIndex = parse_integer( optarg, opt_name );
 				} else if (strcmp(opt_name, "adaptive-sync") == 0) {
 					cv_adaptive_sync = true;
 				} else if (strcmp(opt_name, "expose-wayland") == 0) {
@@ -866,13 +782,9 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// Steam preloads its overlay into us, but only the SDL backend can draw it.
+	// Steam preloads its overlay into us, but no backend we ship can draw it.
 	// A ConVar or script override comes too late to unload it.
-	gamescope::GamescopeBackend eLaunchBackend = eCurrentBackend;
-	if ( eLaunchBackend == gamescope::GamescopeBackend::Auto )
-		eLaunchBackend = auto_select_backend();
-	if ( eLaunchBackend != gamescope::GamescopeBackend::SDL )
-		gamescope::Process::RestartWithoutSteamOverlay( argv );
+	gamescope::Process::RestartWithoutSteamOverlay( argv );
 
 	// Print this after the re-exec, so we only announce ourselves once.
 	gamescope::PrintVersion();
@@ -937,8 +849,6 @@ int main(int argc, char **argv)
 	g_mainThread = pthread_self();
 
 	g_pOriginalDisplay = getenv("DISPLAY");
-	g_pOriginalWaylandDisplay = getenv("WAYLAND_DISPLAY");
-
 	// Allow overriding the selected backend (even the backend
 	// requested on the command line) in a startup script.
 	auto backendOverride = parse_backend_name( gamescope::cv_backend.Get().c_str() );
@@ -952,25 +862,6 @@ int main(int argc, char **argv)
 		eCurrentBackend = auto_select_backend();
 	}
 
-	if ( g_pOriginalWaylandDisplay != NULL )
-	{
-        if (CheckWaylandPresentationTime())
-        {
-            // Default to SDL_VIDEODRIVER wayland under Wayland and force enable vk_khr_present_wait
-            // (not enabled by default in Mesa because instance does not know if Wayland
-            //  compositor supports wp_presentation, but we can check that ourselves.)
-            setenv("vk_khr_present_wait", "true", 0);
-            setenv("SDL_VIDEODRIVER", "wayland", 0);
-        }
-        else
-        {
-            fprintf(stderr,
-                "Your Wayland compositor does NOT support wp_presentation/presentation-time which is required for VK_KHR_present_wait and VK_KHR_present_id.\n"
-                "Please complain to your compositor vendor for support. Falling back to X11 window with less accurate present wait.\n");
-            setenv("SDL_VIDEODRIVER", "x11", 1);
-        }
-	}
-
 	g_ForcedNV12ColorSpace = parse_colorspace_string( getenv( "GAMESCOPE_NV12_COLORSPACE" ) );
 
 	switch ( eCurrentBackend )
@@ -980,27 +871,10 @@ int main(int argc, char **argv)
 			gamescope::IBackend::Set<gamescope::CDRMBackend>();
 			break;
 #endif
-#if HAVE_SDL2
-		case gamescope::GamescopeBackend::SDL:
-			gamescope::IBackend::Set<gamescope::CSDLBackend>();
-			break;
-#endif
-#if HAVE_OPENVR
-		case gamescope::GamescopeBackend::OpenVR:
-			gamescope::IBackend::Set<gamescope::COpenVRBackend>();
-			break;
-#endif
 		case gamescope::GamescopeBackend::Headless:
 			gamescope::IBackend::Set<gamescope::CHeadlessBackend>();
 			break;
 
-		case gamescope::GamescopeBackend::Wayland:
-			gamescope::IBackend::Set<gamescope::CWaylandBackend>();
-#if HAVE_SDL2
-			if ( !GetBackend() )
-				gamescope::IBackend::Set<gamescope::CSDLBackend>();
-#endif
-			break;
 		default:
 			abort();
 	}

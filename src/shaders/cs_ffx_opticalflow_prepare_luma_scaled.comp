@@ -1,0 +1,89 @@
+// Gamescope adapter for FidelityFX Optical Flow's prepare-luma pass.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
+// Copyright (C) 2026 Gamescope contributors
+// SPDX-License-Identifier: MIT
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#include "ffx_core.h"
+
+layout(set = 0, binding = 0) uniform texture2D inputColor;
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimage2D outputLuma;
+
+layout(set = 0, binding = 2, std140) uniform OpticalFlowConstants
+{
+    ivec2 targetSize;
+    uint pyramidLevel;
+    uint pyramidLevelCount;
+    uint frameIndex;
+    uint transferFunction;
+    vec2 minMaxLuminance;
+    ivec2 sourceSize;
+} constants;
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+float perceivedLuminance(float luminance)
+{
+    if (luminance <= 216.0 / 24389.0)
+        return luminance * (24389.0 / 27.0) * 0.01;
+    return (pow(luminance, 1.0 / 3.0) * 116.0 - 16.0) * 0.01;
+}
+
+float luminance(vec3 color)
+{
+    if (constants.transferFunction == 1u)
+    {
+        const vec3 linear = ffxLinearFromPQ(color) * (10000.0 / constants.minMaxLuminance.y);
+        return perceivedLuminance(dot(linear, vec3(0.2627, 0.6780, 0.0593)));
+    }
+    if (constants.transferFunction == 2u)
+    {
+        const vec3 linear = (color - constants.minMaxLuminance.x / 80.0) /
+            ((constants.minMaxLuminance.y - constants.minMaxLuminance.x) / 80.0);
+        return perceivedLuminance(dot(linear, vec3(0.2126, 0.7152, 0.0722)));
+    }
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 sampleBilinear(vec2 sourcePosition)
+{
+    const vec2 baseFloat = floor(sourcePosition - 0.5);
+    const ivec2 base = ivec2(baseFloat);
+    const vec2 fraction = sourcePosition - 0.5 - baseFloat;
+    const ivec2 maximum = constants.sourceSize - 1;
+    const vec3 c00 = texelFetch(inputColor, clamp(base, ivec2(0), maximum), 0).rgb;
+    const vec3 c10 = texelFetch(inputColor, clamp(base + ivec2(1, 0), ivec2(0), maximum), 0).rgb;
+    const vec3 c01 = texelFetch(inputColor, clamp(base + ivec2(0, 1), ivec2(0), maximum), 0).rgb;
+    const vec3 c11 = texelFetch(inputColor, clamp(base + ivec2(1, 1), ivec2(0), maximum), 0).rgb;
+    return mix(mix(c00, c10, fraction.x), mix(c01, c11, fraction.x), fraction.y);
+}
+
+void main()
+{
+    for (int y = 0; y < 2; ++y)
+    for (int x = 0; x < 2; ++x)
+    {
+        const ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy) * 2 + ivec2(x, y);
+        if (any(greaterThanEqual(outputPosition, constants.targetSize)))
+            continue;
+
+        vec3 sourceColor;
+        if (all(equal(constants.sourceSize, constants.targetSize)))
+        {
+            // Keep the full-resolution path to one source fetch per pixel.
+            sourceColor = texelFetch(inputColor, outputPosition, 0).rgb;
+        }
+        else
+        {
+            const vec2 sourcePosition = (vec2(outputPosition) + 0.5) *
+                vec2(constants.sourceSize) / vec2(constants.targetSize);
+            sourceColor = sampleBilinear(sourcePosition);
+        }
+        imageStore(outputLuma, outputPosition,
+            uvec4(uint(clamp(luminance(sourceColor), 0.0, 1.0) * 255.0), 0, 0, 0));
+    }
+}

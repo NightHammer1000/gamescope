@@ -32,6 +32,8 @@ struct mangoapp_msg_v1 {
     bool bAppWantsHDR : 1;
     bool bSteamFocused : 1;
     char engineName[40];
+    uint64_t frameGenerationOutputFrametimeNs; // completed output flip interval, or UINT64_MAX
+    uint8_t frameGenerationEnabled; // 0 disables the frame generation HUD additions
     
     // WARNING: Always ADD fields, never remove or repurpose fields
 } __attribute__((packed)) mangoapp_msg_v1;
@@ -46,7 +48,9 @@ void init_mangoapp(){
     inited = true;
 }
 
-void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns ) {
+static void mangoapp_send_update( uint64_t visible_frametime, uint64_t app_frametime_ns,
+    uint64_t latency_ns, uint64_t frame_generation_output_frametime_ns,
+    bool frame_generation_enabled ) {
     if (!inited)
         init_mangoapp();
 
@@ -67,7 +71,14 @@ void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uin
         engine->copy(mangoapp_msg_v1.engineName, sizeof(mangoapp_msg_v1.engineName) / sizeof(char));
     else
         std::string("gamescope").copy(mangoapp_msg_v1.engineName, sizeof(mangoapp_msg_v1.engineName) / sizeof(char));
+    mangoapp_msg_v1.frameGenerationOutputFrametimeNs = frame_generation_output_frametime_ns;
+    mangoapp_msg_v1.frameGenerationEnabled = frame_generation_enabled;
     msgsnd(msgid, &mangoapp_msg_v1, sizeof(mangoapp_msg_v1) - sizeof(mangoapp_msg_v1.hdr.msg_type), IPC_NOWAIT);
+}
+
+void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns ) {
+    mangoapp_send_update( visible_frametime, app_frametime_ns, latency_ns, uint64_t(~0ull),
+        steamcompmgr_frame_generation_enabled_for_focus() );
 }
 
 extern uint64_t g_uCurrentBasePlaneCommitID;
@@ -75,26 +86,68 @@ extern bool g_bCurrentBasePlaneIsFifo;
 extern uint32_t g_uCurrentBasePlaneAppID;
 extern gamescope::ConVar<bool> cv_mangoapp_use_output_timing;
 
-void mangoapp_output_update( uint64_t vblanktime )
+void mangoapp_output_update( uint64_t vblanktime, uint64_t frameGenerationOutputId )
 {
+	const bool frameGenerationEnabled = steamcompmgr_frame_generation_enabled_for_focus();
+	static bool s_bFrameGenerationEnabled = false;
+	static uint64_t s_uLastOutputVBlankTime = 0;
+	static uint64_t s_uLastFrameGenerationOutputId = 0;
+	const bool frameGenerationChanged =
+		s_bFrameGenerationEnabled != frameGenerationEnabled;
+	if ( frameGenerationChanged )
+	{
+		s_bFrameGenerationEnabled = frameGenerationEnabled;
+		s_uLastOutputVBlankTime = 0;
+		s_uLastFrameGenerationOutputId = 0;
+	}
+
 	static uint64_t s_uLastBasePlaneCommitID = 0;
-	if ( s_uLastBasePlaneCommitID != g_uCurrentBasePlaneCommitID )
+	const bool basePlaneChanged =
+		s_uLastBasePlaneCommitID != g_uCurrentBasePlaneCommitID;
+	const bool outputChanged = frameGenerationEnabled &&
+		( frameGenerationOutputId != 0
+			? frameGenerationOutputId != s_uLastFrameGenerationOutputId
+			: basePlaneChanged );
+	uint64_t outputFrametime = uint64_t(~0ull);
+	if ( outputChanged )
+	{
+		if ( s_uLastOutputVBlankTime > 0 && s_uLastOutputVBlankTime <= vblanktime )
+			outputFrametime = vblanktime - s_uLastOutputVBlankTime;
+		s_uLastOutputVBlankTime = vblanktime;
+		s_uLastFrameGenerationOutputId = frameGenerationOutputId;
+	}
+
+	if ( basePlaneChanged )
 	{
 		static uint64_t s_uLastBasePlaneUpdateVBlankTime = vblanktime;
         uint64_t last_frametime = s_uLastBasePlaneUpdateVBlankTime;
-        uint64_t frametime = vblanktime - last_frametime;
+		const uint64_t frametime = last_frametime <= vblanktime
+			? vblanktime - last_frametime
+			: uint64_t(~0ull);
 		s_uLastBasePlaneUpdateVBlankTime = vblanktime;
 		s_uLastBasePlaneCommitID = g_uCurrentBasePlaneCommitID;
-        if ( last_frametime > vblanktime )
-            return;
 
-		mangoapp_update( frametime, uint64_t(~0ull), uint64_t(~0ull) );
+		mangoapp_send_update( frametime, uint64_t(~0ull), uint64_t(~0ull),
+			outputChanged
+				? outputFrametime
+				: uint64_t(~0ull),
+			frameGenerationEnabled );
 
-        if ( cv_mangoapp_use_output_timing )
+		if ( frametime != uint64_t(~0ull) && cv_mangoapp_use_output_timing )
         {
             wlserver_lock();
             wlserver_app_presented( g_uCurrentBasePlaneAppID, frametime );
             wlserver_unlock();
         }
+	}
+	else if ( outputChanged )
+	{
+		mangoapp_send_update( uint64_t(~0ull), uint64_t(~0ull), uint64_t(~0ull),
+			outputFrametime, true );
+	}
+	else if ( frameGenerationChanged )
+	{
+		mangoapp_send_update( uint64_t(~0ull), uint64_t(~0ull), uint64_t(~0ull),
+			uint64_t(~0ull), frameGenerationEnabled );
 	}
 }

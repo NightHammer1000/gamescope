@@ -2,6 +2,7 @@
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "commit.h"
+#include "CommitBufferSync.h"
 
 #include "gpuvis_trace_utils.h"
 
@@ -28,7 +29,6 @@ commit_t::~commit_t()
         wlserver_presentation_feedback_discard(surf, presentation_feedbacks);
         // presentation_feedbacks cleared by wlserver_presentation_feedback_discard
     }
-    wlr_buffer_unlock( buf );
     wlserver_unlock();
 }
 
@@ -57,6 +57,30 @@ void commit_t::OnPollIn()
         std::unique_lock lock( m_WaitableCommitStateMutex );
         if ( !CloseFenceInternal() )
             return;
+    }
+
+    if ( bufferSync && bufferSync->IsAcquireFallback() )
+    {
+        bufferSync->MarkAcquireFallbackReady();
+    }
+    else if ( bufferSync && bufferSync->UsesSyncFileInterop() )
+    {
+        std::pair<int32_t, bool> nextEvent = gamescope::CAcquireTimelinePoint::k_InvalidEvent;
+        const gamescope::CCommitBufferSync::AcquireStatus status = bufferSync->PrepareAcquire();
+        if ( status == gamescope::CCommitBufferSync::AcquireStatus::Pending )
+            nextEvent = bufferSync->CreateAcquireAvailabilityEvent();
+        else if ( status == gamescope::CCommitBufferSync::AcquireStatus::Failed )
+        {
+            bufferSync->UseAcquireFallback();
+            nextEvent = bufferSync->DuplicateBaselineWaitFd();
+        }
+
+        if ( nextEvent.first >= 0 && !nextEvent.second )
+        {
+            SetFence( nextEvent.first, m_bMangoNudge, m_pDoneCommits );
+            g_ImageWaiter.AddWaitable( this );
+            return;
+        }
     }
 
     Signal();

@@ -1,0 +1,8 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VKR_TARGET_FORMAT rgba16f
+#define FSR_EASU_USE_FP16 0
+#include "cs_easu_common.h"

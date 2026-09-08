@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Choose which session the display manager offers by default.
+#
+# Only touches the user's AccountsService entry -- it does not start, stop or
+# restart anything. Log out for it to take effect.
+
+set -euo pipefail
+
+usage() {
+	cat <<'USAGE'
+usage: telescope-session-select [session]
+
+  telescope-session   boot into the Telescope gamemode session
+  <other>             any name under /usr/share/wayland-sessions or
+                      /usr/share/xsessions (e.g. plasma, gnome)
+
+With no argument, prints the sessions available and which one is current.
+USAGE
+}
+
+list_sessions() {
+	# Only hand find directories that exist: a missing one makes it exit
+	# non-zero, which under set -e + pipefail would kill us mid-listing.
+	local dirs=() d
+	for d in /usr/share/wayland-sessions /usr/share/xsessions; do
+		[ -d "$d" ] && dirs+=("$d")
+	done
+	[ ${#dirs[@]} -eq 0 ] && return 0
+
+	find "${dirs[@]}" -maxdepth 1 -name '*.desktop' 2>/dev/null \
+		| sed 's|.*/||; s|\.desktop$||' | sort -u
+}
+
+current_session() {
+	local user_file="/var/lib/AccountsService/users/${USER}"
+	if [ -r "$user_file" ]; then
+		sed -n 's/^Session=//p' "$user_file" | tail -1
+	fi
+}
+
+case "${1:-}" in
+	-h|--help) usage; exit 0 ;;
+esac
+
+if [ $# -eq 0 ]; then
+	printf 'available sessions:\n'
+	list_sessions | sed 's/^/  /'
+	cur=$(current_session)
+	printf 'current: %s\n' "${cur:-(unset)}"
+	exit 0
+fi
+
+session="$1"
+
+# "desktop" is a role, not a session name -- it is what Steam's Switch to
+# Desktop button asks for. Resolve it to a real session: an explicit
+# TELESCOPE_DESKTOP_SESSION if set, otherwise the first installed session that
+# is not one of ours.
+if [ "$session" = "desktop" ]; then
+	if [ -n "${TELESCOPE_DESKTOP_SESSION:-}" ]; then
+		session="$TELESCOPE_DESKTOP_SESSION"
+	else
+		session=$(list_sessions | grep -v '^telescope' | head -1 || true)
+	fi
+	if [ -z "$session" ]; then
+		printf 'telescope-session-select: no desktop session installed.\n' >&2
+		printf 'Install one, or set TELESCOPE_DESKTOP_SESSION to its name.\n' >&2
+		exit 1
+	fi
+fi
+
+if ! list_sessions | grep -qx "$session"; then
+	printf 'telescope-session-select: no session named %s\n\n' "$session" >&2
+	printf 'available:\n' >&2
+	list_sessions | sed 's/^/  /' >&2
+	exit 1
+fi
+
+if ! command -v pkexec >/dev/null 2>&1; then
+	printf 'telescope-session-select: pkexec is required to change the session\n' >&2
+	exit 1
+fi
+
+# AccountsService is what every display manager actually reads.
+pkexec sh -c "
+	set -eu
+	f=/var/lib/AccountsService/users/${USER}
+	mkdir -p /var/lib/AccountsService/users
+	[ -f \"\$f\" ] || printf '[User]\n' > \"\$f\"
+	if grep -q '^Session=' \"\$f\"; then
+		sed -i 's|^Session=.*|Session=${session}|' \"\$f\"
+	else
+		sed -i '/^\[User\]/a Session=${session}' \"\$f\"
+	fi
+"
+
+printf 'session set to %s -- log out for it to take effect\n' "$session"

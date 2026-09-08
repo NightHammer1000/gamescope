@@ -10,7 +10,10 @@ dep_xres = dependency('xres')
 dep_xmu = dependency('xmu')
 dep_xi = dependency('xi')
 
-drm_dep = dependency('libdrm', version: '>= 2.4.113', required: get_option('drm_backend'))
+# Telescope is a DRM session compositor: a build without it is not this project.
+# The HAVE_DRM guards stay, deliberately -- rewriting them would cost upstream merges.
+drm_dep = dependency('libdrm', version: '>= 2.4.113', required: true)
+gbm_dep = dependency('gbm', version: '>= 21.3', required: true)
 eis_dep = dependency('libeis-1.0', required : get_option('input_emulation'))
 
 wayland_server = dependency('wayland-server', version: '>=1.21')
@@ -19,7 +22,6 @@ xkbcommon = dependency('xkbcommon')
 thread_dep = dependency('threads')
 cap_dep = dependency('libcap', required: get_option('rt_cap'))
 epoll_dep = dependency('epoll-shim', required: false)
-sdl2_dep = dependency('SDL2', required: get_option('sdl2_backend'))
 avif_dep = dependency('libavif', version: '>=1.0.0', required: get_option('avif_screenshots'))
 pixman_dep = dependency('pixman-1')
 udev_dep = dependency('libudev')
@@ -61,34 +63,178 @@ endif
 
 shader_src = [
   'shaders/cs_composite_blit.comp',
+  'shaders/cs_composite_blit_rgb10a2.comp',
   'shaders/cs_composite_blur.comp',
   'shaders/cs_composite_blur_cond.comp',
   'shaders/cs_composite_rcas.comp',
+  'shaders/cs_composite_rcas_fp16.comp',
+  'shaders/cs_composite_rcas_rgba16f.comp',
+  'shaders/cs_composite_rcas_rgb10a2.comp',
   'shaders/cs_easu.comp',
   'shaders/cs_easu_fp16.comp',
+  'shaders/cs_easu_rgba16f.comp',
+  'shaders/cs_easu_fp16_rgba16f.comp',
   'shaders/cs_gaussian_blur_horizontal.comp',
   'shaders/cs_nis.comp',
   'shaders/cs_nis_fp16.comp',
+  'shaders/cs_sgsr.comp',
+  'shaders/cs_xbr.comp',
+  'shaders/cs_bicubic.comp',
+  'shaders/cs_bicubic_rgba16f.comp',
+  'shaders/cs_composite_cas.comp',
+  'shaders/cs_composite_cas_rgba16f.comp',
+  'shaders/cs_composite_cas_rgb10a2.comp',
+  'shaders/cs_anime4k_conv0.comp',
+  'shaders/cs_anime4k_conv1.comp',
+  'shaders/cs_anime4k_conv2.comp',
+  'shaders/cs_anime4k_conv3.comp',
+  'shaders/cs_anime4k_d2s.comp',
   'shaders/cs_rgb_to_nv12.comp',
 ]
 
 spirv_shaders = glsl_generator.process(shader_src)
 
-reshade_src = [
-  'reshade/source/effect_codegen_spirv.cpp',
-  'reshade/source/effect_expression.cpp',
-  'reshade/source/effect_lexer.cpp',
-  'reshade/source/effect_parser_exp.cpp',
-  'reshade/source/effect_parser_stmt.cpp',
-  'reshade/source/effect_preprocessor.cpp',
-  'reshade/source/effect_symbol_table.cpp',
+# FidelityFX SDK 1.1.4 is the last upstream SDK release with maintained
+# Vulkan/GLSL frame-generation shaders. Keep these as standalone shader
+# modules; Gamescope owns resource allocation and scheduling.
+ffx_gpu_path = meson.current_source_dir() / '../subprojects/FidelityFX-SDK/sdk/include/FidelityFX/gpu'
+ffx_shader_path = meson.current_source_dir() / '../subprojects/FidelityFX-SDK/sdk/src/backends/vk/shaders/opticalflow'
+ffx_fi_shader_path = meson.current_source_dir() / '../subprojects/FidelityFX-SDK/sdk/src/backends/vk/shaders/frameinterpolation'
+ffx_opticalflow_shader_names = [
+  'ffx_opticalflow_prepare_luma_pass',
+  'ffx_opticalflow_compute_luminance_pyramid_pass',
+  'ffx_opticalflow_generate_scd_histogram_pass',
+  'ffx_opticalflow_compute_scd_divergence_pass',
+  'ffx_opticalflow_compute_optical_flow_advanced_pass_v5',
+  'ffx_opticalflow_filter_optical_flow_pass_v5',
+  'ffx_opticalflow_scale_optical_flow_advanced_pass_v5',
 ]
 
-reshade_include = include_directories([
-  'reshade/source',
-  'reshade/include',
-  '../thirdparty/SPIRV-Headers/include/spirv/unified1'
-])
+ffx_spirv_shaders = []
+foreach shader_name : ffx_opticalflow_shader_names
+  ffx_spirv_shaders += custom_target(
+    shader_name + '.h',
+    output: shader_name + '.h',
+    command: [
+      glsl_compiler,
+      '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+      '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+      ffx_shader_path / (shader_name + '.glsl'),
+      '--vn', shader_name, '-o', '@OUTPUT@',
+      '--depfile', '@DEPFILE@', '--quiet',
+    ],
+    depfile: shader_name + '.h.d',
+  )
+endforeach
+
+ffx_frameinterpolation_shader_names = [
+  'ffx_frameinterpolation_optical_flow_vector_field_pass',
+  'ffx_frameinterpolation_compute_inpainting_pyramid_pass',
+  'ffx_frameinterpolation_inpainting_pass',
+]
+
+foreach shader_name : ffx_frameinterpolation_shader_names
+  ffx_spirv_shaders += custom_target(
+    shader_name + '.h',
+    output: shader_name + '.h',
+    command: [
+      glsl_compiler,
+      '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+      '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+      ffx_fi_shader_path / (shader_name + '.glsl'),
+      '--vn', shader_name, '-o', '@OUTPUT@',
+      '--depfile', '@DEPFILE@', '--quiet',
+    ],
+    depfile: shader_name + '.h.d',
+  )
+endforeach
+
+ffx_midpoint_shader_name = 'cs_ffx_frameinterpolation_midpoint'
+ffx_spirv_shaders += custom_target(
+  ffx_midpoint_shader_name + '.h',
+  output: ffx_midpoint_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_midpoint_shader_name + '.comp'),
+    '--vn', ffx_midpoint_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_midpoint_shader_name + '.h.d',
+)
+
+ffx_gui_mask_shader_name = 'cs_ffx_frameinterpolation_gui_mask'
+ffx_spirv_shaders += custom_target(
+  ffx_gui_mask_shader_name + '.h',
+  output: ffx_gui_mask_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_gui_mask_shader_name + '.comp'),
+    '--vn', ffx_gui_mask_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_gui_mask_shader_name + '.h.d',
+)
+
+ffx_scaled_luma_shader_name = 'cs_ffx_opticalflow_prepare_luma_scaled'
+ffx_spirv_shaders += custom_target(
+  ffx_scaled_luma_shader_name + '.h',
+  output: ffx_scaled_luma_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_scaled_luma_shader_name + '.comp'),
+    '--vn', ffx_scaled_luma_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_scaled_luma_shader_name + '.h.d',
+)
+
+# The dot-product SAD search needs GL_EXT_integer_dot_product, which older
+# glslang builds (Ubuntu 24.04) do not know. Probe, and fall back to the
+# regular search pass at build time; runtime already gates on device support.
+ffx_have_dot_search = run_command(
+  'sh', '-c',
+  'printf "#version 460\n#extension GL_EXT_integer_dot_product : require\nvoid main(){}\n" | ' +
+  glsl_compiler.full_path() + ' --stdin -S comp --target-env vulkan1.3 -V -o /dev/null',
+  check: false,
+).returncode() == 0
+
+ffx_dot_search_shader_name = 'cs_ffx_opticalflow_compute_optical_flow_dot'
+if ffx_have_dot_search
+  ffx_spirv_shaders += custom_target(
+    ffx_dot_search_shader_name + '.h',
+    output: ffx_dot_search_shader_name + '.h',
+    command: [
+      glsl_compiler,
+      '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+      '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+      meson.current_source_dir() / 'shaders' / (ffx_dot_search_shader_name + '.comp'),
+      '--vn', ffx_dot_search_shader_name, '-o', '@OUTPUT@',
+      '--depfile', '@DEPFILE@', '--quiet',
+    ],
+    depfile: ffx_dot_search_shader_name + '.h.d',
+  )
+endif
+
+ffx_vector_field_shader_name = 'cs_ffx_frameinterpolation_vector_field'
+ffx_spirv_shaders += custom_target(
+  ffx_vector_field_shader_name + '.h',
+  output: ffx_vector_field_shader_name + '.h',
+  command: [
+    glsl_compiler,
+    '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+    '-DFFX_GPU=1', '-DFFX_GLSL=1', '-I' + ffx_gpu_path,
+    meson.current_source_dir() / 'shaders' / (ffx_vector_field_shader_name + '.comp'),
+    '--vn', ffx_vector_field_shader_name, '-o', '@OUTPUT@',
+    '--depfile', '@DEPFILE@', '--quiet',
+  ],
+  depfile: ffx_vector_field_shader_name + '.h.d',
+)
 
 sol2_include = include_directories(['../thirdparty'])
 
@@ -96,17 +242,20 @@ required_wlroots_features = ['xwayland']
 
 src = [
   'Backends/HeadlessBackend.cpp',
-  'Backends/WaylandBackend.cpp',
   'Utils/DirHelpers.cpp',
   'Utils/TempFiles.cpp',
   'Utils/Version.cpp',
   'Utils/Process.cpp',
   'Script/Script.cpp',
   'BufferMemo.cpp',
+  'CommitBufferSync.cpp',
+  'DmabufSync.cpp',
   'steamcompmgr.cpp',
   'convar.cpp',
   'convar_script.cpp',
   'commit.cpp',
+  'frame_generation_config.cpp',
+  'frame_generation_vulkan.cpp',
   'color_helpers.cpp',
   'main.cpp',
   'edid.cpp',
@@ -117,7 +266,6 @@ src = [
   'ime.cpp',
   'mangoapp.cpp',
   'Timeline.cpp',
-  'reshade_effect_manager.cpp',
   'backend.cpp',
   'x11cursor.cpp',
   'InputEmulation.cpp',
@@ -130,6 +278,9 @@ libinput_dep = dependency('libinput', required: true)
 gamescope_cpp_args = []
 if drm_dep.found()
   src += 'Backends/DRMBackend.cpp'
+  src += 'Backends/DRMGbmScanout.cpp'
+  src += 'Backends/DRMVendorQuirks.cpp'
+  src += 'Backends/ScanoutModifiers.cpp'
   src += 'modegen.cpp'
   required_wlroots_features += 'libinput_backend'
   liftoff_dep = dependency(
@@ -142,27 +293,21 @@ else
   liftoff_dep = dependency('', required: false)
 endif
 
-if sdl2_dep.found()
-  src += 'Backends/SDLBackend.cpp'
-endif
-
 gamescope_cpp_args += '-DHAVE_DRM=@0@'.format(drm_dep.found().to_int())
-gamescope_cpp_args += '-DHAVE_SDL2=@0@'.format(sdl2_dep.found().to_int())
+gamescope_cpp_args += '-DHAVE_GBM=@0@'.format((drm_dep.found() and gbm_dep.found()).to_int())
 gamescope_cpp_args += '-DHAVE_AVIF=@0@'.format(avif_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBCAP=@0@'.format(cap_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBEIS=@0@'.format(eis_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_SCRIPTING=1'
+gamescope_cpp_args += '-DHAVE_FFX_DOT_SEARCH=@0@'.format(ffx_have_dot_search.to_int())
 
 src += spirv_shaders
+src += ffx_spirv_shaders
 src += protocols_server_src
 src += protocols_client_src
 
 if pipewire_dep.found()
   src += 'pipewire.cpp'
-endif
-
-if openvr_dep.found()
-  src += 'Backends/OpenVRBackend.cpp'
 endif
 
 foreach feat : required_wlroots_features
@@ -189,16 +334,16 @@ gamescope_version = configure_file(
 )
 
   executable(
-    'gamescope',
-    src, reshade_src, gamescope_version,
-    include_directories : [reshade_include, sol2_include],
+    'telescope',
+    src, gamescope_version,
+    include_directories : [sol2_include],
     dependencies: [
       dep_wayland, dep_x11, dep_xdamage, dep_xcomposite, dep_xrender, dep_xext, dep_xfixes,
-      dep_xxf86vm, dep_xres, glm_dep, drm_dep, wayland_server,
-      xkbcommon, thread_dep, sdl2_dep, wlroots_dep,
+      dep_xxf86vm, dep_xres, glm_dep, drm_dep, gbm_dep, wayland_server,
+      xkbcommon, thread_dep, wlroots_dep,
       vulkan_dep, liftoff_dep, dep_xtst, dep_xmu, cap_dep, epoll_dep, pipewire_dep, librt_dep,
-      stb_dep, displayinfo_dep, openvr_dep, dep_xcursor, avif_dep, dep_xi,
-      libdecor_dep, eis_dep, luajit_dep, libinput_dep, pixman_dep, udev_dep,
+      stb_dep, displayinfo_dep, dep_xcursor, avif_dep, dep_xi,
+      eis_dep, luajit_dep, libinput_dep, pixman_dep, udev_dep,
     ],
     install: true,
     cpp_args: gamescope_cpp_args,
@@ -213,18 +358,18 @@ gamescope_core_src = [
 ]
 
 if pipewire_dep.found()
-  executable( 'gamescopestream', ['Apps/gamescopestream.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [ pipewire_dep, dep_wayland, libdecor_dep, cap_dep ], install: true )
+  executable( 'telescopestream', ['Apps/telescopestream.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [ pipewire_dep, dep_wayland, libdecor_dep, cap_dep ], install: true )
 endif
 
-executable('gamescopereaper', ['Apps/gamescopereaper.cpp', gamescope_core_src], gamescope_version, dependencies: [cap_dep], install:true )
+executable('telescopereaper', ['Apps/telescopereaper.cpp', gamescope_core_src], gamescope_version, dependencies: [cap_dep], install:true )
 
 benchmark_dep = dependency('benchmark', required: get_option('benchmark'), disabler: true)
-executable('gamescope_color_microbench', ['color_bench.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[benchmark_dep, glm_dep, cap_dep])
+executable('telescope_color_microbench', ['color_bench.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[benchmark_dep, glm_dep, cap_dep])
 
-executable('gamescope_color_tests', ['color_tests.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[glm_dep, cap_dep])
+executable('telescope_color_tests', ['color_tests.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[glm_dep, cap_dep])
 
-executable('gamescopectl', ['Apps/gamescopectl.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
+executable('telescopectl', ['Apps/telescopectl.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
 
-executable('gamescope-type', ['Apps/gamescope_type.c'], protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
+executable('telescope-type', ['Apps/telescope_type.c'], protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
 
-executable('gamescope_hotkey_example', ['Apps/gamescope_hotkey_example.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, xkbcommon, cap_dep], install: false )
+executable('telescope_hotkey_example', ['Apps/telescope_hotkey_example.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, xkbcommon, cap_dep], install: false )

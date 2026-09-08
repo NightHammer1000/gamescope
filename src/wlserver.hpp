@@ -214,6 +214,7 @@ struct wlserver_pointer {
 	struct wlr_pointer *wlr;
 	
 	struct wl_listener motion;
+	struct wl_listener motion_absolute;
 	struct wl_listener button;
 	struct wl_listener axis;
 	struct wl_listener frame;
@@ -234,7 +235,8 @@ struct wlserver_touch {
 void xwayland_surface_commit(struct wlr_surface *wlr_surface);
 
 bool wlsession_init( void );
-int wlsession_open_kms( const char *device_name );
+using wlsession_kms_device_selector = int (*)( int fd, const void *userdata );
+int wlsession_open_kms( const char *device_name, wlsession_kms_device_selector selector, const void *userdata );
 void wlsession_close_kms();
 
 bool wlserver_init( void );

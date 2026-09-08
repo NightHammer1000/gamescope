@@ -1,0 +1,169 @@
+// This file is part of the FidelityFX SDK integration in Gamescope.
+//
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
+// Copyright (C) 2026 Gamescope contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+// Optical-flow-only adaptation of FidelityFX Frame Interpolation. Gamescope has
+// no game motion vectors, depth, reconstruction data, distortion field, or
+// HUD-less backbuffer, so those paths are intentionally absent.
+
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_shader_image_load_formatted : require
+
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_OPTICAL_FLOW_MOTION_VECTOR_FIELD_X 0
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_OPTICAL_FLOW_MOTION_VECTOR_FIELD_Y 1
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_PREVIOUS_INTERPOLATION_SOURCE      2
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE       3
+#define FFX_FRAMEINTERPOLATION_BIND_SRV_OPTICAL_FLOW_SCENE_CHANGE_DETECTION 4
+#define FFX_FRAMEINTERPOLATION_BIND_UAV_OUTPUT                             5
+#define FFX_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION                  6
+
+layout(std430, binding = 7) buffer FrameGenerationTelemetry
+{
+    uint sceneCutCopies;
+} rw_telemetry;
+
+layout(set = 0, binding = 8) uniform texture2D r_current_gui_mask;
+
+#include "frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h"
+#include "frameinterpolation/ffx_frameinterpolation_common.h"
+
+#define GAMESCOPE_FRAME_GENERATION_GUI_CORRECTION (1u << 28)
+#define GAMESCOPE_FRAME_GENERATION_DEBUG_GUI      (1u << 29)
+#define GAMESCOPE_FRAME_GENERATION_DEBUG_FLOW     (1u << 31)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+bool uvInside(vec2 uv)
+{
+    return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)));
+}
+
+float colorResidual(vec3 a, vec3 b)
+{
+    const vec3 luma = vec3(0.2126, 0.7152, 0.0722);
+    const float la = dot(max(a, vec3(0.0)), luma) + 1.0e-4;
+    const float lb = dot(max(b, vec3(0.0)), luma) + 1.0e-4;
+    return clamp(abs(la - lb) / max(la, lb), 0.0, 1.0);
+}
+
+// Keep SDR in its existing encoded representation. HDR uses scRGB as the
+// compositor's FP16 linear working representation so warping, blending and
+// inpainting do not operate on PQ code values.
+vec3 toWorkingColor(vec3 rawColor)
+{
+    if (BackBufferTransferFunction() == 1u)
+        return ffxLinearFromPQ(rawColor) * (10000.0 / 80.0);
+    return rawColor;
+}
+
+float sampleGuiMask(vec2 uv)
+{
+	const vec4 gatheredMask = textureGather(
+		sampler2D(r_current_gui_mask, s_LinearClamp),
+		clamp(uv, vec2(0.0), vec2(1.0)));
+	return max(max(gatheredMask.x, gatheredMask.y),
+		max(gatheredMask.z, gatheredMask.w));
+}
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, DisplaySize())))
+        return;
+
+    if (HasSceneChanged() || Reset())
+    {
+        if (HasSceneChanged() && all(equal(pixel, ivec2(0))))
+            atomicAdd(rw_telemetry.sceneCutCopies, 1u);
+        StoreFrameinterpolationOutput(pixel,
+            vec4(toWorkingColor(LoadCurrentBackbuffer(pixel)), 0.0));
+        return;
+    }
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(DisplaySize());
+    VectorFieldEntry field;
+    SampleOpticalFlowMotionVectorField(uv, field);
+
+    if ((GetDispatchFlags() & GAMESCOPE_FRAME_GENERATION_DEBUG_FLOW) != 0u)
+    {
+        const vec2 motionPixels = field.fMotionVector * vec2(DisplaySize());
+        const vec2 encodedMotion = clamp(vec2(0.5) + motionPixels / 64.0, vec2(0.0), vec2(1.0));
+        StoreFrameinterpolationOutput(pixel,
+            vec4(encodedMotion, clamp(field.uHighPriorityFactor, 0.0, 1.0), 0.0));
+        return;
+    }
+
+    // FidelityFX constructs a half-frame field. Its positive direction reaches
+    // into the previous image and its negative direction reaches into current.
+    const vec2 previousUv = uv + field.fMotionVector;
+    const vec2 currentUv = uv - field.fMotionVector;
+    const bool previousValid = uvInside(previousUv);
+    const bool currentValid = uvInside(currentUv);
+
+    vec3 previousColor = toWorkingColor(
+        SamplePreviousBackbuffer(clamp(previousUv, vec2(0.0), vec2(1.0))));
+    vec3 currentColor = toWorkingColor(
+        SampleCurrentBackbuffer(clamp(currentUv, vec2(0.0), vec2(1.0))));
+
+    float blend = 0.5;
+    if (!previousValid && currentValid)
+        blend = 1.0;
+    else if (previousValid && !currentValid)
+        blend = 0.0;
+
+    const vec3 midpoint = mix(previousColor, currentColor, blend);
+    const float residual = colorResidual(previousColor, currentColor);
+    const float coverage = clamp(field.uHighPriorityFactor, 0.0, 1.0);
+    const float missingCoverage = residual * (1.0 - coverage);
+    const float outOfBounds = float(!previousValid && !currentValid);
+    const float oneSidedResidual = float(previousValid != currentValid) * residual;
+    float inpaintingWeight = max(outOfBounds, max(missingCoverage, oneSidedResidual));
+
+    vec3 outputColor = midpoint;
+    if ((GetDispatchFlags() &
+        (GAMESCOPE_FRAME_GENERATION_GUI_CORRECTION | GAMESCOPE_FRAME_GENERATION_DEBUG_GUI)) != 0u)
+    {
+        const float screenGuiMask = sampleGuiMask(uv);
+        const float previousWarpGuiMask = sampleGuiMask(previousUv);
+        const float currentWarpGuiMask = sampleGuiMask(currentUv);
+        const float guiMask = smoothstep(0.30, 0.58,
+            max(screenGuiMask, max(previousWarpGuiMask, currentWarpGuiMask)));
+        const vec3 currentScreen = toWorkingColor(SampleCurrentBackbuffer(uv));
+        if ((GetDispatchFlags() & GAMESCOPE_FRAME_GENERATION_DEBUG_GUI) != 0u)
+        {
+            // Overlay the mask on valid source color instead of presenting a
+            // nearly empty scanout buffer. Besides providing scene context,
+            // this avoids edge/padding artifacts on direct-scanout hardware.
+            const vec3 debugColor = mix(currentScreen * 0.18,
+                vec3(1.0, 0.0, 1.0), guiMask);
+            StoreFrameinterpolationOutput(pixel, vec4(debugColor, 0.0));
+            return;
+        }
+        outputColor = mix(outputColor, currentScreen, guiMask);
+        inpaintingWeight *= 1.0 - guiMask;
+    }
+
+    StoreFrameinterpolationOutput(pixel, vec4(outputColor, inpaintingWeight));
+}

@@ -27,6 +27,7 @@ namespace gamescope
 
         virtual void OnPollIn() {}
         virtual void OnPollOut() {}
+        virtual void OnPollError() {}
         virtual void OnPollHangUp()
         {
             g_WaitableLog.errorf( "IWaitable hung up. Aborting." );
@@ -39,6 +40,8 @@ namespace gamescope
                 this->OnPollIn();
             if ( nEvents & EPOLLOUT )
                 this->OnPollOut();
+            if ( nEvents & EPOLLERR )
+                this->OnPollError();
             if ( nEvents & EPOLLHUP )
                 this->OnPollHangUp();
         }
@@ -182,6 +185,11 @@ namespace gamescope
             ArmTimer( 0ul, false );
         }
 
+        void OnPollIn()
+        {
+            IWaitable::Drain(m_nFD);
+        }
+
         int GetFD()
         {
             return m_nFD;
@@ -200,6 +208,7 @@ namespace gamescope
 
         void OnPollIn() final
         {
+            ITimerWaitable::OnPollIn();
             m_fnPollFunc();
         }
     private:
@@ -485,4 +494,3 @@ namespace gamescope
 
 
 }
-

@@ -79,69 +79,6 @@ namespace gamescope
         //assert( !HasLiveReferences() );
     }
 
-    uint32_t CBaseBackendFb::IncRef()
-    {
-        uint32_t uRefCount = IBackendFb::IncRef();
-        if ( m_pClientBuffer && !uRefCount )
-        {
-            wlserver_lock();
-            wlr_buffer_lock( m_pClientBuffer );
-            wlserver_unlock( false );
-        }
-        return uRefCount;
-    }
-    uint32_t CBaseBackendFb::DecRef()
-    {
-        wlr_buffer *pClientBuffer = m_pClientBuffer;
-
-        std::shared_ptr<CReleaseTimelinePoint> pReleasePoint = std::move( m_pReleasePoint );
-        m_pReleasePoint = nullptr;
-
-        uint32_t uRefCount = IBackendFb::DecRef();
-        if ( uRefCount )
-        {
-            if ( pReleasePoint )
-                m_pReleasePoint = std::move( pReleasePoint );
-        }
-        else if ( pClientBuffer )
-        {
-            wlserver_lock();
-            wlr_buffer_unlock( pClientBuffer );
-            wlserver_unlock();
-        }
-        return uRefCount;
-    }
-
-    void CBaseBackendFb::SetBuffer( wlr_buffer *pClientBuffer )
-    {
-        if ( m_pClientBuffer == pClientBuffer )
-            return;
-
-        assert( m_pClientBuffer == nullptr );
-        m_pClientBuffer = pClientBuffer;
-        if ( GetRefCount() )
-        {
-            wlserver_lock();
-            wlr_buffer_lock( m_pClientBuffer );
-            wlserver_unlock( false );
-        }
-
-        m_pReleasePoint = nullptr;
-    }
-
-    void CBaseBackendFb::SetReleasePoint( std::shared_ptr<CReleaseTimelinePoint> pReleasePoint )
-    {
-        m_pReleasePoint = pReleasePoint;
-
-        if ( m_pClientBuffer && GetRefCount() )
-        {
-            wlserver_lock();
-            wlr_buffer_unlock( m_pClientBuffer );
-            wlserver_unlock();
-            m_pClientBuffer = nullptr;
-        }
-    }
-
     /////////////////////////
     // CBaseBackendConnector
     /////////////////////////

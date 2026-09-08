@@ -1,0 +1,39 @@
+#!/bin/bash
+# Display-manager entry point. Sets up the environment the session needs, then
+# hands off to the templated user unit and waits.
+#
+# Modelled on ChimeraOS gamescope-session-plus (MIT, © 2020-2023 Joaquín
+# Ignacio Aramendía). Adapted for Telescope.
+
+declare -r CLIENT=$1
+
+if [ -z "$CLIENT" ]; then
+	echo "usage: telescope-session <client>   (e.g. steam)" >&2
+	exit 1
+fi
+
+# Window managers set this to wayland, but everything inside Telescope talks
+# X11 via Xwayland.
+export XDG_SESSION_TYPE=x11
+
+# Word splitting is the point: this is a list of variable names.
+# shellcheck disable=SC2046
+dbus-update-activation-environment --systemd DESKTOP_SESSION $(env | grep ^XDG_ | cut -d = -f 1)
+
+# Stop xdg-desktop-portal finding implementations it cannot start: the dbus
+# environment has no DISPLAY yet, so they crash and then unrelated portal calls
+# hang (SDL talking to the realtime portal, for one).
+systemctl --user set-environment XDG_DESKTOP_PORTAL_DIR=""
+
+# These leak in from the display manager and stop the session starting.
+systemctl --user unset-environment DISPLAY XAUTHORITY
+
+# CLIENT is expanded now on purpose -- it cannot change, and the trap must
+# not depend on the variable still being set at signal time.
+# shellcheck disable=SC2064
+trap "systemctl --user stop telescope-session@${CLIENT}.service" HUP INT TERM
+
+systemctl --user --wait start telescope-session@${CLIENT}.service &
+wait
+
+systemctl --user unset-environment XDG_DESKTOP_PORTAL_DIR

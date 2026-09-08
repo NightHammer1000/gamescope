@@ -3,6 +3,7 @@
 #include <getopt.h>
 
 #include <atomic>
+#include <vector>
 
 extern const char *gamescope_optstring;
 extern const struct option *gamescope_options;
@@ -12,25 +13,23 @@ extern std::atomic< bool > g_bRun;
 extern int g_nNestedWidth;
 extern int g_nNestedHeight;
 extern int g_nNestedRefresh; // mHz
-extern int g_nNestedUnfocusedRefresh; // mHz
-extern int g_nNestedDisplayIndex;
 
 extern uint32_t g_nOutputWidth;
 extern uint32_t g_nOutputHeight;
 extern bool g_bForceRelativeMouse;
 extern int g_nOutputRefresh; // mHz
+extern long g_nsVsync;       // ns
 extern bool g_bOutputHDREnabled;
 extern bool g_bForceInternal;
 
 extern bool g_bForceCompositionRotation;
 extern uint32_t g_uOutputRotation;
 
-extern bool g_bFullscreen;
 
-extern bool g_bGrabbed;
 
 extern float g_mouseSensitivity;
 extern const char *g_sOutputName;
+extern std::vector<uint32_t> g_customRefreshRates;
 
 enum class GamescopeUpscaleFilter : uint32_t
 {
@@ -39,6 +38,10 @@ enum class GamescopeUpscaleFilter : uint32_t
     FSR,
     NIS,
     PIXEL,
+    SGSR,
+    BCAS,
+    XBR,
+    ANIME4K,
 
     FROM_VIEW = 0xF, // internal
 };
@@ -65,7 +68,6 @@ extern GamescopeUpscaleFilter g_wantedUpscaleFilter;
 extern GamescopeUpscaleScaler g_wantedUpscaleScaler;
 extern int g_upscaleFilterSharpness;
 
-extern bool g_bBorderlessOutputWindow;
 
 extern bool g_bExposeWayland;
 

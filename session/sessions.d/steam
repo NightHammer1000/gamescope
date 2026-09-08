@@ -1,0 +1,50 @@
+#!/bin/bash
+# Steam client configuration for the Telescope session.
+#
+# From ChimeraOS gamescope-session-steam (MIT, © 2020-2023 Joaquín Ignacio
+# Aramendía). STEAM_GAMESCOPE_* names are what Steam reads; they stay as-is.
+
+short_session_recover() {
+	mkdir -p ~/.local/share/Steam
+	# Caches known to stop Steam starting if they are corrupt.
+	rm -rf --one-file-system ~/.local/share/Steam/config/widevine
+}
+
+post_telescope_start() {
+	command -v steam-tweaks >/dev/null && steam-tweaks
+}
+
+export STEAM_GAMESCOPE_VRR_SUPPORTED=1
+export STEAM_MANGOAPP_PRESETS_SUPPORTED=1
+export STEAM_USE_MANGOAPP=1
+export STEAM_USE_DYNAMIC_VRS=1
+export STEAM_GAMESCOPE_HAS_TEARING_SUPPORT=1
+export STEAM_GAMESCOPE_TEARING_SUPPORTED=1
+export STEAM_GAMESCOPE_HDR_SUPPORTED=1
+export STEAM_ENABLE_VOLUME_HANDLER=1
+export SRT_URLOPEN_PREFER_STEAM=1
+export STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1
+export STEAM_MULTIPLE_XWAYLANDS=1
+export STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1
+export STEAM_GAMESCOPE_NIS_SUPPORTED=1
+export STEAM_ALLOW_DRIVE_UNMOUNT=1
+export STEAM_DISABLE_MANGOAPP_ATOM_WORKAROUND=1
+export STEAM_MANGOAPP_HORIZONTAL_SUPPORTED=1
+export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
+export STEAM_GAMESCOPE_COLOR_MANAGED=1
+export STEAM_GAMESCOPE_VIRTUAL_WHITE=1
+
+# Steam gets killed immediately on reboot/shutdown without these.
+export STEAMOS_STEAM_REBOOT_SENTINEL="/tmp/steamos-reboot-sentinel"
+export REBOOT_SENTINEL=$STEAMOS_STEAM_REBOOT_SENTINEL
+export STEAMOS_STEAM_SHUTDOWN_SENTINEL="/tmp/steamos-shutdown-sentinel"
+export SHUTDOWN_SENTINEL=$STEAMOS_STEAM_SHUTDOWN_SENTINEL
+
+# Steam's on-screen keyboard for Qt/GTK apps.
+export QT_IM_MODULE=steam
+export GTK_IM_MODULE=Steam
+
+export CURSOR_FILE="${HOME}/.local/share/Steam/tenfoot/resource/images/cursors/arrow.png"
+export CLIENTCMD="steam -gamepadui -steamos3 -steampal -steamdeck"
+
+command -v steam_notif_daemon >/dev/null && steam_notif_daemon &

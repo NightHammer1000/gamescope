@@ -24,6 +24,7 @@ struct wlr_dmabuf_attributes;
 struct FrameInfo_t;
 
 extern bool steamMode;
+extern bool disableInternalPq;
 
 namespace gamescope
 {
@@ -278,16 +279,7 @@ namespace gamescope
     class IBackendFb : public IRcObject
     {
     public:
-        virtual void SetBuffer( wlr_buffer *pClientBuffer ) = 0;
-        virtual void SetReleasePoint( std::shared_ptr<CReleaseTimelinePoint> pReleasePoint ) = 0;
-
         virtual IBackendFb *EnsureImported() = 0;
-    };
-
-    class IBackendPlane
-    {
-    public:
-        virtual ~IBackendPlane() = default;
     };
 
     class CBaseBackendFb : public IBackendFb
@@ -296,17 +288,7 @@ namespace gamescope
         CBaseBackendFb();
         virtual ~CBaseBackendFb();
 
-        uint32_t IncRef() override;
-        uint32_t DecRef() override;
-
-        void SetBuffer( wlr_buffer *pClientBuffer ) override;
-        void SetReleasePoint( std::shared_ptr<CReleaseTimelinePoint> pReleasePoint ) override;
-
         virtual IBackendFb *EnsureImported() override { return this; };
-
-    private:
-        wlr_buffer *m_pClientBuffer = nullptr;
-        std::shared_ptr<CReleaseTimelinePoint> m_pReleasePoint;
     };
 
     class IBackend
@@ -340,6 +322,16 @@ namespace gamescope
         // shared_ptr owns the structure.
         // Rc manages acquire/release of buffer to/from client while imported.
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) = 0;
+
+        // Backends may own scanout memory placement and expose buffers for Vulkan
+        // to import rather than asking Vulkan to allocate exportable images.
+        virtual bool UsesBackendAllocatedScanout() const { return false; }
+        // When true, CreateScanoutDmabuf failing is fatal: Vulkan-allocated
+        // memory is not considered a safe scanout fallback.
+        virtual bool RequiresBackendAllocatedScanout() const { return false; }
+        virtual bool CreateScanoutDmabuf( uint32_t /*uWidth*/, uint32_t /*uHeight*/, uint32_t /*uDrmFormat*/,
+                                          std::span<const uint64_t> /*ulModifiers*/,
+                                          wlr_dmabuf_attributes * /*pDmaBuf*/ ) { return false; }
 
         virtual bool UsesModifiers() const = 0;
         virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const = 0;
@@ -395,9 +387,6 @@ namespace gamescope
 
         virtual void NotifyPhysicalInput( InputType eInputType ) = 0;
 
-        virtual bool SupportsVROverlayForwarding() = 0;
-        virtual void ForwardFramebuffer( std::shared_ptr<IBackendPlane> &pPlane, IBackendFb *pFramebuffer, const void *pData ) = 0;
-
         virtual bool NewlyInitted() = 0;
 
         virtual bool ShouldFitWindows() = 0;
@@ -433,9 +422,6 @@ namespace gamescope
         virtual std::shared_ptr<IBackendConnector> CreateVirtualConnector( uint64_t ulVirtualConnectorKey ) override;
 
         virtual void NotifyPhysicalInput( InputType eInputType ) override {}
-
-        virtual bool SupportsVROverlayForwarding() override { return false; }
-        virtual void ForwardFramebuffer( std::shared_ptr<IBackendPlane> &pPlane, IBackendFb *pFramebuffer, const void *pData ) override {}
 
         virtual bool NewlyInitted() override { return false; }
 
